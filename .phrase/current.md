@@ -62,12 +62,12 @@ task023 [x] goal:persistent startup detects unreferenced table/blob files and ha
 task024 [x] goal:SSTable reads use partitioned filters/indexes so point/range/prefix reads avoid unnecessary whole-table scans | scope:src/filter.rs,src/table.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test + git diff --check
 task025 [x] goal:search-policy code is wired into table/block candidate lookup without changing read results | scope:src/search.rs,src/table.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test + git diff --check
 task026 [x] goal:v1 protocol acceptance audit identifies remaining gaps and the next measured slice | scope:.phrase/protocol,trine source,tests | verify:manual audit + cargo fmt --check + cargo clippy + cargo test + git diff --check
-task027 [ ] goal:persistent open takes an exclusive database directory lock and releases it safely | scope:src/db.rs,src/recovery.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test + git diff --check
+task027 [x] goal:persistent open takes an exclusive database directory lock and releases it safely | scope:src/db.rs,src/recovery.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test + git diff --check
+task028 [ ] goal:table metadata records compaction levels and read ordering remains correct across levels | scope:src/manifest.rs,src/table.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test + git diff --check
 ```
 
 ## Known Blockers
 
-- Persistent process locking is not implemented yet.
 - Leveled/background compaction is not implemented yet; current compaction is
   manual and table-list based.
 - Required metrics, cache behavior, benchmark output, and durability docs are
@@ -82,4 +82,5 @@ task027 [ ] goal:persistent open takes an exclusive database directory lock and 
 - Partitioned filter/index validation results.
 - Search-policy dispatch validation results.
 - V1 acceptance audit results.
-- Remaining blocker category after task026.
+- Process-lock validation results.
+- Remaining blocker category after task027.

@@ -40,6 +40,7 @@ pub(crate) struct DbInner {
     last_sequence: AtomicU64,
     closed: AtomicBool,
     writer: Mutex<()>,
+    process_lock: Mutex<Option<recovery::ProcessLock>>,
     keyspaces: RwLock<BTreeMap<String, Arc<KeyspaceState>>>,
     snapshots: Arc<SnapshotTracker>,
     manifest: Option<Mutex<ManifestStore>>,
@@ -130,6 +131,7 @@ impl Db {
                 last_sequence: AtomicU64::new(Sequence::ZERO.get()),
                 closed: AtomicBool::new(false),
                 writer: Mutex::new(()),
+                process_lock: Mutex::new(None),
                 keyspaces: RwLock::new(BTreeMap::new()),
                 snapshots: Arc::new(SnapshotTracker::default()),
                 manifest: None,
@@ -153,6 +155,12 @@ impl Db {
         } else {
             return Err(Error::invalid_options("database path does not exist"));
         }
+
+        let process_lock = if options.read_only {
+            None
+        } else {
+            Some(recovery::ProcessLock::acquire(path)?)
+        };
 
         if options.read_only {
             recovery::repair_safe_temporary_files(path, FailOnCorruptionPolicy::FailClosed)?;
@@ -187,6 +195,7 @@ impl Db {
                 last_sequence: AtomicU64::new(Sequence::ZERO.get()),
                 closed: AtomicBool::new(false),
                 writer: Mutex::new(()),
+                process_lock: Mutex::new(process_lock),
                 keyspaces: RwLock::new(keyspaces),
                 snapshots: Arc::new(SnapshotTracker::default()),
                 manifest: Some(Mutex::new(manifest)),
@@ -429,6 +438,15 @@ impl Db {
 
     pub fn close(&self) {
         self.inner.closed.store(true, Ordering::Release);
+        // The directory lock is released only after the writer coordinator is
+        // idle. Otherwise a second process could open while this one is still
+        // publishing files for a commit, flush, or compaction.
+        let Ok(_writer) = self.inner.writer.lock() else {
+            return;
+        };
+        if let Ok(mut process_lock) = self.inner.process_lock.lock() {
+            process_lock.take();
+        }
     }
 
     pub(crate) fn ensure_open(&self) -> Result<()> {

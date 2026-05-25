@@ -244,6 +244,98 @@ fn persistent_manifest_keeps_keyspace_options_across_reopen() {
 }
 
 #[test]
+fn persistent_writer_open_fails_when_directory_lock_is_held() {
+    let path = temp_db_path("writer-lock-held");
+    let options = DbOptions::persistent(&path);
+    let lock_path = path.join("LOCK");
+
+    let db = Db::open(options.clone()).expect("first writer opens");
+    assert!(lock_path.exists());
+
+    let message =
+        corruption_message(Db::open(options.clone()).expect_err("second writer must fail closed"));
+    assert!(message.contains("database lock is already held"));
+    assert!(
+        lock_path.exists(),
+        "failed writer open should leave the owner lock untouched"
+    );
+
+    db.close();
+    assert!(
+        !lock_path.exists(),
+        "close should release the writer directory lock"
+    );
+
+    let reopened = Db::open(options).expect("writer reopens after close");
+    drop(reopened);
+    assert!(
+        !lock_path.exists(),
+        "dropping the final writer handle should release the directory lock"
+    );
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_writer_open_fails_closed_on_existing_lock_file() {
+    let path = temp_db_path("writer-lock-stale");
+    let options = DbOptions::persistent(&path);
+    let lock_path = path.join("LOCK");
+    write_file(&lock_path, b"pid=stale\n");
+
+    let message =
+        corruption_message(Db::open(options).expect_err("existing lock file must fail closed"));
+    assert!(message.contains("database lock is already held"));
+    assert_eq!(
+        fs::read(&lock_path).expect("stale lock remains readable"),
+        b"pid=stale\n"
+    );
+    assert!(!recovery::recovery_report_path(&path).exists());
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_read_only_open_does_not_take_writer_lock() {
+    let path = temp_db_path("read-only-no-writer-lock");
+    let options = DbOptions::persistent(&path);
+    let lock_path = path.join("LOCK");
+
+    {
+        let db = Db::open(options.clone()).expect("writer opens");
+        let keyspace = db
+            .keyspace("default", KeyspaceOptions::default())
+            .expect("keyspace opens");
+        keyspace.insert(b"a", b"a1").expect("write row");
+        db.persist(DurabilityMode::Flush).expect("flush WAL");
+    }
+
+    let mut read_only_options = options.clone();
+    read_only_options.read_only = true;
+    read_only_options.create_if_missing = false;
+    let read_only_db = Db::open(read_only_options).expect("read-only open succeeds");
+    assert!(
+        !lock_path.exists(),
+        "read-only open should not take the writer directory lock"
+    );
+
+    let writer = Db::open(options).expect("writer opens while read-only handle exists");
+    assert!(lock_path.exists());
+
+    let keyspace = read_only_db
+        .keyspace("default", KeyspaceOptions::default())
+        .expect("read-only keyspace opens");
+    assert_eq!(
+        keyspace.get(b"a").expect("read-only row reads"),
+        Some(b"a1".to_vec())
+    );
+
+    drop(writer);
+    drop(read_only_db);
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
 fn persistent_recovery_fails_closed_on_safe_temporary_files_by_default() {
     let path = temp_db_path("recovery-temp-fail-closed");
     let options = DbOptions::persistent(&path);

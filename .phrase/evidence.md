@@ -1142,3 +1142,45 @@ Record only evidence that can change planning or durable decisions.
 - Implement persistent process locking as the next measured slice, failing
   closed on a second simultaneous opener and releasing the lock when the last
   database handle drops.
+
+## 2026-05-25: Persistent Writer Lock Passed
+
+### Observation
+
+- Write-mode persistent open now creates a `LOCK` file before recovery,
+  manifest, table, blob, or WAL work begins.
+- A second write-mode opener, or an existing `LOCK` file, fails closed and
+  leaves the lock evidence untouched for operator review.
+- The lock owner marker is removed by `close()` after the writer coordinator is
+  idle, and also by dropping the final database handle.
+- Read-only open follows the protocol exception and does not take the writer
+  directory lock.
+- Tests cover simultaneous write open rejection, stale lock fail-closed
+  handling, close/drop release, and read-only coexistence with a writer.
+
+### Interpretation
+
+- Task027 is complete for the current single-process test harness and standard
+  filesystem semantics: write-mode startup owns the database directory before
+  recovery can mutate or publish state.
+- Existing `LOCK` files are intentionally not treated as safe temporary files;
+  stale crash markers require deliberate operator action.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+- `git diff --check`
+
+### Remaining Blockers
+
+- Leveled/background compaction.
+- Required metrics and cache behavior.
+- Required benchmark outputs.
+- Durability documentation.
+
+### Recommended Next Action
+
+- Start the leveled compaction work with an explicit table-level metadata slice,
+  then verify that reads preserve newest-before-older ordering across levels.
