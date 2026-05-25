@@ -1520,3 +1520,46 @@ Record only evidence that can change planning or durable decisions.
 - Treat Phase 3 as complete. Start the next phase only after choosing a fresh
   phase goal from release readiness, API polish, external integration, or
   production-hardening evidence.
+
+## 2026-05-25: Usage Documentation Passed
+
+### Observation
+
+- `README.md` now gives the repository entry point, minimal API example,
+  verification commands, and links to usage, durability, and benchmark docs.
+- `docs/usage.md` covers opening in-memory and persistent databases, keyspace
+  options, point writes/reads, batches, range and prefix scans, snapshots,
+  optimistic transactions, durability modes, flush/compaction, stats, read-only
+  open, and recovery boundaries.
+- `examples/quickstart.rs` runs through the main public API path and validates
+  persistence by flushing, syncing, reopening, and reading back data.
+- While validating the example, the handle lifetime rule was made explicit:
+  `Keyspace` keeps the database open, so callers should release keyspace
+  handles before reopening the same directory in one process.
+- The crate-level docs in `src/lib.rs` now describe the completed v1 API instead
+  of the old scaffold phase.
+
+### Interpretation
+
+- Phase 4 satisfies the usage-documentation acceptance gate.
+- The docs give users a verification path instead of relying only on prose.
+
+### Verification
+
+- `cargo run --example quickstart`
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+- `git diff --check`
+- forbidden terminology scan over source, tests, phase notes, benchmark files,
+  docs, README, and examples
+
+### Remaining Blockers
+
+- None recorded for Phase 4.
+
+### Recommended Next Action
+
+- Choose the next phase from fresh evidence. API polish, release packaging,
+  integration examples, or production-hardening audits are the likely next
+  candidates.

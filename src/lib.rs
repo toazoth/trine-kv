@@ -1,8 +1,8 @@
 //! Trine KV is an embedded LSM MVCC key-value database.
 //!
-//! This crate is currently in its scaffold phase. The public modules mirror the
-//! accepted v1 protocol so implementation slices can land behind stable
-//! boundaries.
+//! The v1 API exposes in-memory and persistent databases, named keyspaces,
+//! atomic write batches, snapshots, optimistic transactions, range/prefix
+//! iteration, WAL recovery, `SSTable` flush/compaction, and live stats.
 
 #![allow(clippy::missing_errors_doc, clippy::module_name_repetitions)]
 

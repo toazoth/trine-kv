@@ -56,3 +56,20 @@ accepted contracts silently.
 **Acceptance Gate**:
 
 - The v1 acceptance gate in `.phrase/protocol/trine-kv-v1-spec.md` passes.
+
+### Phase 4: Write Usage Documentation
+
+**Status**: Complete
+
+**Goal**: Give users a runnable path from opening a database to using the core
+v1 API safely.
+
+**Entry Condition**: Phase 3 complete.
+
+**Acceptance Gate**:
+
+- README explains what Trine KV is, how to run verification, and where to start.
+- Usage docs cover in-memory and persistent open, keyspaces, reads/writes,
+  batches, snapshots, transactions, range/prefix scans, durability, maintenance,
+  stats, and recovery boundaries.
+- At least one example program compiles and runs with `cargo run --example`.
