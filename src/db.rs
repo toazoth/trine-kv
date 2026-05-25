@@ -16,7 +16,8 @@ use crate::{
     iterator::{Direction, Iter},
     keyspace::{Keyspace, KeyspaceName},
     manifest::{self, ManifestState, ManifestStore},
-    options::{DbOptions, DurabilityMode, KeyspaceOptions, StorageMode},
+    options::{DbOptions, DurabilityMode, FailOnCorruptionPolicy, KeyspaceOptions, StorageMode},
+    recovery,
     snapshot::Snapshot,
     stats::DbStats,
     table::{self, Table, TableRangeTombstone},
@@ -149,6 +150,12 @@ impl Db {
             wal::ensure_parent_dir(path)?;
         } else {
             return Err(Error::invalid_options("database path does not exist"));
+        }
+
+        if options.read_only {
+            recovery::repair_safe_temporary_files(path, FailOnCorruptionPolicy::FailClosed)?;
+        } else {
+            recovery::repair_safe_temporary_files(path, options.fail_on_corruption)?;
         }
 
         let manifest_path = manifest::manifest_path(path);

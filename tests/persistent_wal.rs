@@ -7,9 +7,9 @@ use std::{
 };
 
 use trine_kv::{
-    CompressionProfile, Db, DbOptions, DurabilityMode, Error, FilterPolicy, IndexSearchPolicy,
-    KeyRange, KeyspaceOptions, PrefixExtractor, PrefixFilterPolicy, Sequence, WriteBatch,
-    WriteOptions, codec::CodecId, manifest, table, wal,
+    CompressionProfile, Db, DbOptions, DurabilityMode, Error, FailOnCorruptionPolicy, FilterPolicy,
+    IndexSearchPolicy, KeyRange, KeyspaceOptions, PrefixExtractor, PrefixFilterPolicy, Sequence,
+    WriteBatch, WriteOptions, codec::CodecId, manifest, recovery, table, wal,
 };
 
 fn temp_db_path(name: &str) -> PathBuf {
@@ -59,6 +59,19 @@ fn blob_file_paths(path: &std::path::Path) -> Vec<PathBuf> {
                 .is_some_and(|name| name.starts_with("blob-"))
         })
         .collect()
+}
+
+fn write_file(path: &std::path::Path, bytes: &[u8]) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("create parent directory");
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)
+        .expect("open test file");
+    file.write_all(bytes).expect("write test file");
 }
 
 #[test]
@@ -205,6 +218,73 @@ fn persistent_manifest_keeps_keyspace_options_across_reopen() {
             .expect_err("wrong keyspace options are rejected");
         assert!(matches!(error, Error::InvalidOptions { .. }));
     }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_recovery_fails_closed_on_safe_temporary_files_by_default() {
+    let path = temp_db_path("recovery-temp-fail-closed");
+    let options = DbOptions::persistent(&path);
+    let manifest_tmp = manifest::manifest_path(&path).with_extension("tmp");
+    write_file(&manifest_tmp, b"partial manifest publish");
+
+    let error = Db::open(options).expect_err("temporary files require explicit repair");
+    assert!(matches!(error, Error::Corruption { .. }));
+    assert!(
+        manifest_tmp.exists(),
+        "fail-closed recovery should leave evidence untouched"
+    );
+    assert!(!recovery::recovery_report_path(&path).exists());
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_recovery_repairs_safe_temporary_files_and_writes_report() {
+    let path = temp_db_path("recovery-temp-repair");
+    let mut options = DbOptions::persistent(&path);
+
+    {
+        let db = Db::open(options.clone()).expect("persistent db opens");
+        let keyspace = db
+            .keyspace("default", KeyspaceOptions::default())
+            .expect("keyspace opens");
+        keyspace.insert(b"a", b"a1").expect("write row");
+        db.flush().expect("flush table");
+    }
+
+    let manifest_tmp = manifest::manifest_path(&path).with_extension("tmp");
+    let blob_tmp = path.join("blob-00000000000000000999.tmp");
+    let table_tmp = table::table_path(&path, table::TableId(999)).with_extension("tmp");
+    write_file(&manifest_tmp, b"partial manifest publish");
+    write_file(&blob_tmp, b"partial blob file");
+    write_file(&table_tmp, b"partial table file");
+
+    options.fail_on_corruption = FailOnCorruptionPolicy::RepairSafeTemporaryFiles;
+    {
+        let db = Db::open(options).expect("repair recovery opens");
+        let keyspace = db
+            .keyspace("default", KeyspaceOptions::default())
+            .expect("keyspace reopens");
+        assert_eq!(
+            keyspace.get(b"a").expect("row survives repair"),
+            Some(b"a1".to_vec())
+        );
+    }
+
+    assert!(!manifest_tmp.exists());
+    assert!(!blob_tmp.exists());
+    assert!(!table_tmp.exists());
+    let report = recovery::read_recovery_report(&path).expect("recovery report reads");
+    assert_eq!(
+        report.repaired_temporary_files(),
+        &[
+            "MANIFEST.tmp".to_owned(),
+            "blob-00000000000000000999.tmp".to_owned(),
+            "table-00000000000000000999.tmp".to_owned(),
+        ]
+    );
 
     fs::remove_dir_all(path).expect("cleanup test db");
 }

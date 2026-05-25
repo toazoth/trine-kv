@@ -21,6 +21,7 @@ pub mod memtable;
 pub mod mvcc;
 pub mod options;
 pub mod prefix;
+pub mod recovery;
 pub mod search;
 pub mod snapshot;
 pub mod stats;
@@ -41,6 +42,7 @@ pub use options::{
     IndexSearchPolicy, KeyspaceOptions, PrefixFilterPolicy, StorageMode, WriteOptions,
 };
 pub use prefix::PrefixExtractor;
+pub use recovery::RecoveryReport;
 pub use snapshot::Snapshot;
 pub use stats::DbStats;
 pub use transaction::{Transaction, TransactionOptions};

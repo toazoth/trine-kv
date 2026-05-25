@@ -817,3 +817,44 @@ Record only evidence that can change planning or durable decisions.
 - Choose between recovery reporting and cleanup/version-cleaning compaction
   next; optimized search policies should wait until the remaining correctness
   gaps are narrower.
+
+## 2026-05-25: Recovery Repair Report Passed
+
+### Observation
+
+- Persistent startup now checks for known safe temporary files before loading
+  the manifest: `MANIFEST.tmp`, `RECOVERY_REPORT.tmp`, `table-*.tmp`, and
+  `blob-*.tmp`.
+- Default recovery still fails closed if such files are present, leaving the
+  temporary files untouched for inspection.
+- `FailOnCorruptionPolicy::RepairSafeTemporaryFiles` removes only those known
+  temporary files and writes a deterministic `RECOVERY_REPORT`.
+- The recovery report has a small public reader and records repaired file names
+  in sorted order.
+- Tests cover fail-closed startup, explicit repair with report output, original
+  data still reading after repair, and report encode/decode.
+
+### Interpretation
+
+- Task019 is complete for the protocol rule that safe startup repairs must
+  record a repair report.
+- Recovery still does not detect obsolete unreferenced files; that should stay
+  separate from this repair-report slice.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+- `git diff --check`
+
+### Remaining Blockers
+
+- Obsolete-file detection, blob cleanup, version-cleaning compaction,
+  partitioned filters/indexes, and optimized search policies remain future
+  blockers.
+
+### Recommended Next Action
+
+- Implement snapshot-safe version cleanup in compaction before blob cleanup, so
+  blob files can later be removed only after no live table references them.
