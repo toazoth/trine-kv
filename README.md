@@ -13,11 +13,19 @@ cargo run --example quickstart
 
 Then read [docs/usage.md](docs/usage.md) for the API path and
 [docs/durability.md](docs/durability.md) for persistence guarantees and limits.
+Release packaging notes live in [docs/release.md](docs/release.md).
 
 ## Install
 
-This repository does not assume a publication target yet. For local
-development, depend on a path:
+Published releases use Semantic Versioning. The first packaged release
+candidate is `0.1.0`:
+
+```toml
+[dependencies]
+trine-kv = "0.1"
+```
+
+For local development, depend on a path:
 
 ```toml
 [dependencies]
@@ -54,6 +62,7 @@ cargo bench --bench v1_bench
 
 - [Usage guide](docs/usage.md)
 - [Durability notes](docs/durability.md)
+- [Release packaging](docs/release.md)
 - [V1 benchmark baseline](docs/benchmarks/v1-baseline.md)
 
 ## Current Boundaries

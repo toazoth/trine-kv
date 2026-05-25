@@ -25,7 +25,7 @@ Evidence notes should separate:
 
 - Do not silently change stable contracts; update ADR or protocol docs.
 - Do not pre-split future roadmap phases into tasks.
-- Do not read archive material by default.
+- Do not read archive files by default.
 - Do not maintain mechanical per-file changelogs when the git diff is enough.
 - Write comments for non-obvious Rust engine invariants, especially lock order,
   MVCC visibility, batch atomicity, and storage-format assumptions.
@@ -39,6 +39,9 @@ Evidence notes should separate:
 - Do not implement Trine by depending on another storage engine.
 - V1 compression uses only `none` and `lz4_flex`-backed fast block compression;
   do not add zlib/DEFLATE or `flate2` for v1.
+- Public crate versions use Semantic Versioning. Before `1.0.0`, breaking
+  public API or storage-contract changes should increment the minor version;
+  compatible fixes should increment the patch version.
 - Do not change MVCC, WAL, SSTable, manifest, compaction, transaction,
   prefix-filter, compression, or search-policy behavior without updating the
   protocol spec or adding a follow-up ADR.

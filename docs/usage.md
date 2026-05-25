@@ -11,6 +11,13 @@ cargo run --example quickstart
 
 ## Add The Crate
 
+Published releases use Semantic Versioning. For the `0.1` release line:
+
+```toml
+[dependencies]
+trine-kv = "0.1"
+```
+
 For local development from this repository:
 
 ```toml

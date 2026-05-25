@@ -1788,3 +1788,49 @@ Record only evidence that can change planning or durable decisions.
 - Choose the next phase from release packaging, CI/release verification,
   integration examples, or another targeted hardening audit based on fresh
   user priority.
+
+## 2026-05-26: Release Packaging Gate Passed
+
+### Observation
+
+- User chose release packaging before integration examples and requested
+  Semantic Versioning.
+- `Cargo.toml` now records release-facing metadata for `0.1.0`, including
+  readme, docs.rs documentation URL, keywords, category, and an explicit
+  package include list.
+- Initial `cargo package --list` included local workflow and skill files. The
+  package include list now limits the crate package to source, tests, examples,
+  benches, docs, changelog, license files, README, Cargo files, and Cargo's
+  generated package metadata.
+- `CHANGELOG.md`, `LICENSE-MIT`, `LICENSE-APACHE`, and `docs/release.md` were
+  added. README and usage docs now show `trine-kv = "0.1"` for the release
+  line plus the local path dependency form for checkout development.
+- The long-term decision file now records the SemVer rule for public crate
+  versions.
+
+### Interpretation
+
+- Task042 is complete.
+- Phase 7 satisfies its acceptance gate.
+- The crate release candidate remains `0.1.0`: v1 is the storage-engine
+  protocol/version, while crate SemVer can start at `0.1.0`.
+
+### Verification
+
+- `cargo package --allow-dirty --list`
+- `cargo package --allow-dirty`
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+- `cargo run --example quickstart`
+- `git diff --check`
+- forbidden terminology scan over source, tests, phase notes, Cargo metadata,
+  benches, docs, README, examples, and changelog
+
+### Remaining Blockers
+
+- None recorded for Phase 7.
+
+### Recommended Next Action
+
+- Start Phase 8 integration examples.

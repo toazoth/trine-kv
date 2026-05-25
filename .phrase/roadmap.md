@@ -101,3 +101,37 @@ storage contract.
 
 - Operational failure-mode audit records concrete risks and verification.
 - Hardening changes are backed by focused tests before the phase closes.
+
+### Phase 7: Release Packaging
+
+**Status**: Complete
+
+**Goal**: Prepare the v1 crate for a clean first package using Semantic
+Versioning.
+
+**Entry Condition**: Phase 6 complete.
+
+**Acceptance Gate**:
+
+- Cargo package metadata is ready for a `0.1.0` SemVer release candidate.
+- Package contents exclude local workflow files and include user-facing docs,
+  examples, tests, benches, changelog, and license files.
+- Release checklist documents versioning and verification.
+- `cargo package --list`, `cargo package`, `cargo fmt --check`,
+  `cargo clippy`, `cargo test`, `cargo run --example quickstart`, and
+  `git diff --check` pass.
+
+### Phase 8: Integration Examples
+
+**Status**: Planned
+
+**Goal**: Add runnable examples that show Trine KV embedded behind realistic
+application boundaries.
+
+**Entry Condition**: Phase 7 complete.
+
+**Acceptance Gate**:
+
+- Integration examples are runnable with `cargo run --example`.
+- README or usage docs point users to the examples.
+- Examples use public APIs without changing the v1 storage contract.

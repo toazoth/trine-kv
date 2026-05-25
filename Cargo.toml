@@ -5,6 +5,23 @@ edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 description = "Embedded LSM MVCC key-value database."
+readme = "README.md"
+documentation = "https://docs.rs/trine-kv"
+keywords = ["database", "embedded", "kv", "lsm", "mvcc"]
+categories = ["database-implementations"]
+include = [
+    "/benches",
+    "/docs",
+    "/examples",
+    "/src",
+    "/tests",
+    "/CHANGELOG.md",
+    "/LICENSE-APACHE",
+    "/LICENSE-MIT",
+    "/README.md",
+    "/Cargo.lock",
+    "/Cargo.toml",
+]
 
 [lib]
 name = "trine_kv"

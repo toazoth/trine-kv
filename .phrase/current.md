@@ -6,62 +6,56 @@ Complete
 
 ## Goal
 
-Audit and harden production-facing operational behavior after API polish.
+Prepare Trine KV for a clean first crate package using Semantic Versioning.
 
 ## Entry Condition
 
-- Phase 5 API polish is complete.
-- V1 tests, quickstart, docs, and benchmark baseline are present.
+- Phase 6 production hardening is complete.
+- User chose release packaging before integration examples.
 
 ## Scope
 
-- Operational failure modes around recovery, file cleanup, locks, WAL replay,
-  flush/compaction publish, resource limits, and diagnostics.
-- Focused code changes only after an audit exposes a concrete risk.
-- Tests that reproduce the risk or prove the hardened path.
+- Cargo package metadata for the first `0.1.0` SemVer release candidate.
+- Crate package contents, license files, changelog, and release checklist.
+- README and usage docs that explain released dependency syntax.
+- Package verification using Cargo and the existing test/example gate.
 
 ## Out Of Scope
 
-- Changing v1 storage contracts without an ADR or protocol update.
-- Packaging and release automation.
-- Performance tuning that is not tied to a hardening risk.
+- Publishing to crates.io.
+- Creating GitHub releases or CI pipelines.
+- Adding integration examples; that is the next planned phase.
+- Changing v1 storage contracts.
 
 ## Acceptance Gate
 
-- At least one production-hardening audit result is recorded.
-- Any code change has a focused regression test.
-- `cargo fmt --check`, `cargo clippy`, `cargo test`, and `git diff --check`
-  pass.
+- `cargo package --list` excludes local workflow files such as `.phrase/`,
+  `.rust-skills/`, and `.claude/`.
+- `cargo package` verifies the package.
+- `cargo fmt --check`, `cargo clippy`, `cargo test`,
+  `cargo run --example quickstart`, and `git diff --check` pass.
+- Release docs record the SemVer rule and package checklist.
 
 ## Active Task Slice
 
 ```text
-task038 [x] goal:production hardening audit identifies the first concrete operational risk and fixes it if local | scope:src,recovery/table/blob/wal/db tests,.phrase/current.md,.phrase/evidence.md | verify:manual audit + focused test + cargo fmt --check + cargo clippy + cargo test + git diff --check
-task039 [x] goal:WAL decode rejects impossible operation counts before allocation | scope:src/wal.rs,.phrase/current.md,.phrase/evidence.md | verify:manual audit + focused test + cargo fmt --check + cargo clippy + cargo test + git diff --check
-task040 [x] goal:continue hardening audit for startup cleanup and manifest/table decode resource bounds | scope:src/recovery.rs,src/manifest.rs,src/table.rs,tests,.phrase/current.md,.phrase/evidence.md | verify:manual audit + focused tests if local risk appears + cargo fmt --check + cargo clippy + cargo test + git diff --check
-task041 [x] goal:audit flush/compaction cleanup and diagnostics after partial file writes or publish failures | scope:src/db.rs,src/table.rs,src/blob.rs,src/manifest.rs,tests,.phrase/current.md,.phrase/evidence.md | verify:manual audit + focused tests if local risk appears + cargo fmt --check + cargo clippy + cargo test + git diff --check
+task042 [x] goal:package metadata, package contents, release docs, and SemVer rule are ready for 0.1.0 | scope:Cargo.toml,README.md,docs,CHANGELOG.md,LICENSE*,.phrase | verify:cargo package --list + cargo package + cargo fmt --check + cargo clippy + cargo test + cargo run --example quickstart + git diff --check
 ```
 
 ## Known Blockers
 
-- None recorded for Phase 6.
-- Manifest publish failure no longer advances in-memory manifest state.
-- WAL, manifest, and table decoders reject impossible count fields before large
-  allocation.
-- Startup cleanup fail-closed behavior is covered by existing tests.
-- Failed flush/compaction publish removes unpublished table/blob output files.
+- None recorded for Phase 7.
+- Initial `cargo package --list` included local workflow and skill files; the
+  package include list now excludes them.
+- `cargo package` required network access to refresh the crates.io index in
+  this environment.
 
 ## Evidence To Record
 
-- Audit result with risk category.
-- Fix and regression test if the risk is local.
-- WAL resource-bound audit result.
-- Follow-up startup cleanup and manifest/table decode resource-bound audit
-  result.
-- Flush/compaction cleanup and diagnostics audit result.
+- Package list result.
+- Package verification result.
+- Full release gate result.
 
 ## Next Recommendation
 
-- Choose the next phase from release packaging, CI/release verification,
-  integration examples, or another targeted hardening audit based on fresh
-  user priority.
+- Start Phase 8 integration examples.
