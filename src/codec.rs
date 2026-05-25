@@ -46,3 +46,49 @@ impl BlockCodec for NoneCodec {
         }
     }
 }
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FastLz4BlockCodec;
+
+impl BlockCodec for FastLz4BlockCodec {
+    fn id(&self) -> CodecId {
+        CodecId::FastLz4Block
+    }
+
+    fn encode(&self, input: &[u8]) -> Result<Vec<u8>> {
+        Ok(lz4_flex::block::compress(input))
+    }
+
+    fn decode(&self, input: &[u8], uncompressed_len: usize) -> Result<Vec<u8>> {
+        let decoded = lz4_flex::block::decompress(input, uncompressed_len).map_err(|error| {
+            Error::InvalidFormat {
+                message: format!("invalid lz4 block: {error}"),
+            }
+        })?;
+        if decoded.len() == uncompressed_len {
+            Ok(decoded)
+        } else {
+            Err(Error::InvalidFormat {
+                message: "lz4 block length mismatch".to_owned(),
+            })
+        }
+    }
+}
+
+pub(crate) fn encode_block(codec: CodecId, input: &[u8]) -> Result<Vec<u8>> {
+    match codec {
+        CodecId::None => NoneCodec.encode(input),
+        CodecId::FastLz4Block => FastLz4BlockCodec.encode(input),
+    }
+}
+
+pub(crate) fn decode_block(
+    codec: CodecId,
+    input: &[u8],
+    uncompressed_len: usize,
+) -> Result<Vec<u8>> {
+    match codec {
+        CodecId::None => NoneCodec.decode(input, uncompressed_len),
+        CodecId::FastLz4Block => FastLz4BlockCodec.decode(input, uncompressed_len),
+    }
+}

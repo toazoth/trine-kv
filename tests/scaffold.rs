@@ -1,7 +1,7 @@
 use trine_kv::{
     CompressionProfile, Db, DbOptions, Direction, KeyRange, KeyspaceOptions, PrefixExtractor,
     Sequence, WriteBatch,
-    codec::{BlockCodec, CodecId, NoneCodec},
+    codec::{BlockCodec, CodecId, FastLz4BlockCodec, NoneCodec},
 };
 
 #[test]
@@ -36,4 +36,13 @@ fn prefix_and_none_codec_scaffold_are_usable() {
         .decode(&encoded, "plain block".len())
         .expect("none codec decodes");
     assert_eq!(decoded, b"plain block");
+
+    let fast_codec = FastLz4BlockCodec;
+    let encoded = fast_codec
+        .encode(b"fast block fast block fast block")
+        .expect("lz4 codec encodes");
+    let decoded = fast_codec
+        .decode(&encoded, "fast block fast block fast block".len())
+        .expect("lz4 codec decodes");
+    assert_eq!(decoded, b"fast block fast block fast block");
 }

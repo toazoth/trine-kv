@@ -616,3 +616,43 @@ Record only evidence that can change planning or durable decisions.
 
 - Add `lz4_flex`, route `CompressionProfile::Fast` to codec id
   `fast-lz4-block`, and keep `none` as the mandatory fallback.
+
+## 2026-05-25: LZ4 Block Compression Passed
+
+### Observation
+
+- `lz4_flex` is now the implementation behind codec id `fast-lz4-block`.
+- `CompressionProfile::Fast` writes new table blocks with codec id
+  `fast-lz4-block`; `CompressionProfile::None` continues to write codec id
+  `none`.
+- Checked block headers store codec id, uncompressed length, encoded length, and
+  checksum over the encoded bytes before decode.
+- Table open verifies every checked section uses the codec recorded in table
+  properties.
+- Tests cover direct none/lz4 codec round trips, fast table layout round trip,
+  unknown block codec failure, and persistent reopen for both fast and none
+  keyspace compression profiles.
+
+### Interpretation
+
+- Task014 is complete for V1 fast block compression.
+- The next useful slice is prefix filters, because table blocks now have stable
+  checked encode/decode and per-table codec metadata.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+- `git diff --check`
+
+### Remaining Blockers
+
+- Prefix filters are still not written or consulted.
+- Blob files, recovery reports, version cleanup, and optimized search policies
+  remain future blockers.
+
+### Recommended Next Action
+
+- Implement prefix filters as an advisory table-skip path, while keeping MVCC
+  and range tombstone checks authoritative after any filter hit.

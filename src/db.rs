@@ -90,6 +90,7 @@ impl RangeTombstone {
 struct FlushInput {
     keyspace: String,
     table_id: table::TableId,
+    codec: crate::codec::CodecId,
     point_records: Vec<(InternalKey, Option<ValueRef>)>,
     range_tombstones: Vec<TableRangeTombstone>,
 }
@@ -97,6 +98,7 @@ struct FlushInput {
 struct CompactionInput {
     keyspace: String,
     table_id: table::TableId,
+    codec: crate::codec::CodecId,
     input_table_ids: Vec<table::TableId>,
     point_records: Vec<(InternalKey, Option<ValueRef>)>,
     range_tombstones: Vec<TableRangeTombstone>,
@@ -284,6 +286,7 @@ impl Db {
             let table = table::write_table(
                 &table_path,
                 input.table_id,
+                input.codec,
                 &input.point_records,
                 &input.range_tombstones,
             )?;
@@ -333,6 +336,7 @@ impl Db {
             let table = table::write_table(
                 &table_path,
                 input.table_id,
+                input.codec,
                 &input.point_records,
                 &input.range_tombstones,
             )?;
@@ -559,6 +563,7 @@ impl Db {
             inputs.push(FlushInput {
                 keyspace: name.clone(),
                 table_id: next_table_id,
+                codec: state.options.compression.codec_id(),
                 point_records,
                 range_tombstones,
             });
@@ -613,6 +618,7 @@ impl Db {
             inputs.push(CompactionInput {
                 keyspace: name.clone(),
                 table_id: next_table_id,
+                codec: state.options.compression.codec_id(),
                 input_table_ids,
                 point_records,
                 range_tombstones,

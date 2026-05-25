@@ -7,7 +7,7 @@ use std::{
 
 use crate::{
     blob::ValueRef,
-    codec::CodecId,
+    codec::{self, CodecId},
     error::{Error, Result},
     internal_key::{InternalKey, ValueKind},
     types::{KeyRange, Sequence},
@@ -156,6 +156,7 @@ pub fn table_path(db_path: &Path, table_id: TableId) -> PathBuf {
 pub(crate) fn write_table(
     path: &Path,
     table_id: TableId,
+    codec: CodecId,
     point_records: &[(InternalKey, Option<ValueRef>)],
     range_tombstones: &[TableRangeTombstone],
 ) -> Result<Table> {
@@ -173,7 +174,7 @@ pub(crate) fn write_table(
     point_records.sort_by(|left, right| left.internal_key.cmp(&right.internal_key));
 
     let table = Table {
-        properties: table_properties(table_id, &point_records, range_tombstones),
+        properties: table_properties(table_id, codec, &point_records, range_tombstones),
         point_records,
         range_tombstones: range_tombstones.to_vec(),
     };
@@ -224,6 +225,7 @@ pub(crate) fn read_table(path: &Path) -> Result<Table> {
 
 fn table_properties(
     table_id: TableId,
+    codec: CodecId,
     point_records: &[TablePointRecord],
     range_tombstones: &[TableRangeTombstone],
 ) -> TableProperties {
@@ -251,18 +253,23 @@ fn table_properties(
             .map_or_else(Vec::new, |record| record.internal_key.user_key().to_vec()),
         smallest_sequence: smallest_sequence.unwrap_or(Sequence::ZERO),
         largest_sequence: largest_sequence.unwrap_or(Sequence::ZERO),
-        codec: CodecId::None,
+        codec,
     }
 }
 
 fn encode_table(table: &Table) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    let (data_blocks, index_entries) = append_data_blocks(&mut bytes, &table.point_records)?;
+    let codec = table.properties.codec;
+    let (data_blocks, index_entries) = append_data_blocks(&mut bytes, codec, &table.point_records)?;
     let range_tombstones =
-        append_single_block_section(&mut bytes, &encode_range_tombstone_block(table)?)?;
-    let indexes = append_single_block_section(&mut bytes, &encode_index_block(&index_entries)?)?;
-    let properties =
-        append_single_block_section(&mut bytes, &encode_properties_block(&table.properties)?)?;
+        append_single_block_section(&mut bytes, codec, &encode_range_tombstone_block(table)?)?;
+    let indexes =
+        append_single_block_section(&mut bytes, codec, &encode_index_block(&index_entries)?)?;
+    let properties = append_single_block_section(
+        &mut bytes,
+        codec,
+        &encode_properties_block(&table.properties)?,
+    )?;
     put_footer(
         &mut bytes,
         &TableFooter {
@@ -311,25 +318,42 @@ fn decode_table(bytes: &[u8]) -> Result<Table> {
     let footer = read_footer(payload)?;
     validate_footer_sections(payload, &footer)?;
 
-    let properties_payload = read_single_block_section(payload, footer.properties)?;
+    let (properties_codec, properties_payload) =
+        read_single_block_section(payload, footer.properties)?;
     let properties = decode_properties_block(&properties_payload)?;
+    validate_block_codec(properties_codec, properties.codec, TableSection::Properties)?;
 
-    let index_payload = read_single_block_section(payload, footer.indexes)?;
+    let (index_codec, index_payload) = read_single_block_section(payload, footer.indexes)?;
+    validate_block_codec(index_codec, properties.codec, TableSection::Indexes)?;
     let index_entries = decode_index_block(&index_payload)?;
     validate_data_index_covers_section(&index_entries, footer.data_blocks)?;
 
     let mut point_records = Vec::new();
     for entry in &index_entries {
-        let block_payload = read_checked_block(payload, entry.block)?;
+        let (block_codec, block_payload) = read_checked_block(payload, entry.block)?;
+        validate_block_codec(block_codec, properties.codec, TableSection::DataBlocks)?;
         let block_records = decode_data_block(&block_payload)?;
         validate_data_block_entry(entry, &block_records)?;
         point_records.extend(block_records);
     }
     validate_sorted_point_records(&point_records)?;
 
-    let tombstone_payload = read_single_block_section(payload, footer.range_tombstones)?;
+    let (tombstone_codec, tombstone_payload) =
+        read_single_block_section(payload, footer.range_tombstones)?;
+    validate_block_codec(
+        tombstone_codec,
+        properties.codec,
+        TableSection::RangeTombstones,
+    )?;
     let range_tombstones = decode_range_tombstone_block(&tombstone_payload)?;
-    if properties != table_properties(properties.id, &point_records, &range_tombstones) {
+    if properties
+        != table_properties(
+            properties.id,
+            properties.codec,
+            &point_records,
+            &range_tombstones,
+        )
+    {
         return Err(Error::Corruption {
             message: "table properties do not match encoded records".to_owned(),
         });
@@ -344,6 +368,7 @@ fn decode_table(bytes: &[u8]) -> Result<Table> {
 
 fn append_data_blocks(
     bytes: &mut Vec<u8>,
+    codec: CodecId,
     point_records: &[TablePointRecord],
 ) -> Result<(SectionHandle, Vec<DataBlockIndexEntry>)> {
     let section_start = bytes.len();
@@ -364,7 +389,7 @@ fn append_data_blocks(
 
         let records = &point_records[block_start..block_end];
         let block_payload = encode_data_block(records)?;
-        let block = append_checked_block(bytes, CodecId::None, &block_payload)?;
+        let block = append_checked_block(bytes, codec, &block_payload)?;
         index_entries.push(DataBlockIndexEntry {
             smallest_internal_key: records
                 .first()
@@ -387,9 +412,13 @@ fn append_data_blocks(
     ))
 }
 
-fn append_single_block_section(bytes: &mut Vec<u8>, block_payload: &[u8]) -> Result<SectionHandle> {
+fn append_single_block_section(
+    bytes: &mut Vec<u8>,
+    codec: CodecId,
+    block_payload: &[u8],
+) -> Result<SectionHandle> {
     let section_start = bytes.len();
-    append_checked_block(bytes, CodecId::None, block_payload)?;
+    append_checked_block(bytes, codec, block_payload)?;
     SectionHandle::from_span(section_start, bytes.len())
 }
 
@@ -398,24 +427,16 @@ fn append_checked_block(
     codec: CodecId,
     block_payload: &[u8],
 ) -> Result<BlockHandle> {
-    if codec != CodecId::None {
-        return Err(Error::CodecUnavailable {
-            codec: codec.as_str().to_owned(),
-        });
-    }
-
     let section_start = bytes.len();
+    let encoded = codec::encode_block(codec, block_payload)?;
     put_codec(bytes, codec);
     put_u32(
         bytes,
         usize_to_u32(block_payload.len(), "block payload length")?,
     );
-    put_u32(
-        bytes,
-        usize_to_u32(block_payload.len(), "encoded block length")?,
-    );
-    put_u32(bytes, checksum(block_payload));
-    bytes.extend_from_slice(block_payload);
+    put_u32(bytes, usize_to_u32(encoded.len(), "encoded block length")?);
+    put_u32(bytes, checksum(&encoded));
+    bytes.extend_from_slice(&encoded);
 
     Ok(BlockHandle {
         offset: usize_to_u64(section_start, "block offset")?,
@@ -570,7 +591,7 @@ fn validate_footer_sections(payload: &[u8], footer: &TableFooter) -> Result<()> 
     Ok(())
 }
 
-fn read_single_block_section(payload: &[u8], section: SectionHandle) -> Result<Vec<u8>> {
+fn read_single_block_section(payload: &[u8], section: SectionHandle) -> Result<(CodecId, Vec<u8>)> {
     let (_, section_end) = section_bounds(section)?;
     if section.len == 0 {
         return Err(invalid_table("empty single-block section"));
@@ -588,7 +609,7 @@ fn read_single_block_section(payload: &[u8], section: SectionHandle) -> Result<V
     read_checked_block(payload, block)
 }
 
-fn read_checked_block(payload: &[u8], block: BlockHandle) -> Result<Vec<u8>> {
+fn read_checked_block(payload: &[u8], block: BlockHandle) -> Result<(CodecId, Vec<u8>)> {
     let (start, end) = block_bounds(block)?;
     let block_bytes = payload
         .get(start..end)
@@ -614,17 +635,24 @@ fn read_checked_block(payload: &[u8], block: BlockHandle) -> Result<Vec<u8>> {
         });
     }
 
-    match codec {
-        CodecId::None => {
-            if encoded.len() != uncompressed_len {
-                return Err(invalid_table("uncompressed block length mismatch"));
-            }
-            Ok(encoded.to_vec())
-        }
-        CodecId::FastLz4Block => Err(Error::CodecUnavailable {
-            codec: codec.as_str().to_owned(),
-        }),
+    Ok((
+        codec,
+        codec::decode_block(codec, encoded, uncompressed_len)?,
+    ))
+}
+
+fn validate_block_codec(actual: CodecId, expected: CodecId, section: TableSection) -> Result<()> {
+    if actual == expected {
+        return Ok(());
     }
+
+    Err(Error::Corruption {
+        message: format!(
+            "table {section:?} block codec {} does not match table codec {}",
+            actual.as_str(),
+            expected.as_str()
+        ),
+    })
 }
 
 fn decode_properties_block(bytes: &[u8]) -> Result<TableProperties> {
@@ -1114,10 +1142,10 @@ mod tests {
 
     #[test]
     fn checked_block_index_round_trips_multiple_data_blocks() {
-        let table = table_with_records(160);
+        let table = table_with_records(160, CodecId::None);
         let payload = encode_table(&table).expect("table encodes");
         let footer = read_footer(&payload).expect("footer reads");
-        let index_payload =
+        let (_, index_payload) =
             read_single_block_section(&payload, footer.indexes).expect("index block reads");
         let index_entries = decode_index_block(&index_payload).expect("index decodes");
         assert!(
@@ -1131,17 +1159,26 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_data_block_codec_fails_closed() {
-        let table = table_with_records(4);
-        let mut payload = encode_table(&table).expect("table encodes");
-        payload[0] = 1;
-
-        let error =
-            decode_table(&table_file_bytes(&payload)).expect_err("unsupported block codec fails");
-        assert!(matches!(error, Error::CodecUnavailable { .. }));
+    fn fast_lz4_block_index_round_trips() {
+        let table = table_with_records(160, CodecId::FastLz4Block);
+        let payload = encode_table(&table).expect("table encodes");
+        let decoded = decode_table(&table_file_bytes(&payload)).expect("table decodes");
+        assert_eq!(decoded.properties(), table.properties());
+        assert_eq!(decoded.point_records(), table.point_records());
     }
 
-    fn table_with_records(count: usize) -> Table {
+    #[test]
+    fn unknown_data_block_codec_fails_closed() {
+        let table = table_with_records(4, CodecId::None);
+        let mut payload = encode_table(&table).expect("table encodes");
+        payload[0] = u8::MAX;
+
+        let error =
+            decode_table(&table_file_bytes(&payload)).expect_err("unknown block codec fails");
+        assert!(matches!(error, Error::UnsupportedFormat { .. }));
+    }
+
+    fn table_with_records(count: usize, codec: CodecId) -> Table {
         let point_records = (0..count)
             .map(|index| TablePointRecord {
                 internal_key: InternalKey::new(
@@ -1154,7 +1191,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         Table {
-            properties: table_properties(TableId(7), &point_records, &[]),
+            properties: table_properties(TableId(7), codec, &point_records, &[]),
             point_records,
             range_tombstones: Vec::new(),
         }

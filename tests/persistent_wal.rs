@@ -9,7 +9,7 @@ use std::{
 use trine_kv::{
     CompressionProfile, Db, DbOptions, DurabilityMode, Error, FilterPolicy, IndexSearchPolicy,
     KeyRange, KeyspaceOptions, PrefixExtractor, PrefixFilterPolicy, Sequence, WriteBatch,
-    WriteOptions, manifest, table, wal,
+    WriteOptions, codec::CodecId, manifest, table, wal,
 };
 
 fn temp_db_path(name: &str) -> PathBuf {
@@ -392,6 +392,81 @@ fn persistent_table_block_index_reads_points_and_ranges() {
             })
             .collect::<Vec<_>>();
         assert_eq!(rows, expected);
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_table_compression_profiles_round_trip() {
+    let path = temp_db_path("table-compression");
+    let options = DbOptions::persistent(&path);
+    let fast_options = KeyspaceOptions::default();
+    let plain_options = KeyspaceOptions {
+        compression: CompressionProfile::None,
+        ..KeyspaceOptions::default()
+    };
+
+    {
+        let db = Db::open(options.clone()).expect("persistent db opens");
+        let fast = db
+            .keyspace("fast", fast_options.clone())
+            .expect("fast keyspace opens");
+        let plain = db
+            .keyspace("plain", plain_options.clone())
+            .expect("plain keyspace opens");
+
+        for index in 0..64 {
+            let value = format!("value-{index:03}-aaaaaaaaaaaaaaaaaaaaaaaa").into_bytes();
+            fast.insert(format!("key-{index:03}").into_bytes(), value.clone())
+                .expect("write fast row");
+            plain
+                .insert(format!("key-{index:03}").into_bytes(), value)
+                .expect("write plain row");
+        }
+        db.flush().expect("flush compressed tables");
+
+        let manifest_state =
+            manifest::read_manifest(&manifest::manifest_path(&path)).expect("manifest reads");
+        assert_eq!(
+            manifest_state
+                .tables()
+                .get("fast")
+                .and_then(|tables| tables.first())
+                .expect("fast table metadata")
+                .codec,
+            CodecId::FastLz4Block
+        );
+        assert_eq!(
+            manifest_state
+                .tables()
+                .get("plain")
+                .and_then(|tables| tables.first())
+                .expect("plain table metadata")
+                .codec,
+            CodecId::None
+        );
+    }
+
+    fs::remove_file(wal::wal_path(&path)).expect("remove WAL after compressed flush");
+
+    {
+        let db = Db::open(options).expect("persistent db reopens from compressed tables");
+        let fast = db
+            .keyspace("fast", fast_options)
+            .expect("fast keyspace reopens");
+        let plain = db
+            .keyspace("plain", plain_options)
+            .expect("plain keyspace reopens");
+
+        assert_eq!(
+            fast.get(b"key-042").expect("fast row reads after reopen"),
+            Some(b"value-042-aaaaaaaaaaaaaaaaaaaaaaaa".to_vec())
+        );
+        assert_eq!(
+            plain.get(b"key-042").expect("plain row reads after reopen"),
+            Some(b"value-042-aaaaaaaaaaaaaaaaaaaaaaaa".to_vec())
+        );
     }
 
     fs::remove_dir_all(path).expect("cleanup test db");
