@@ -68,12 +68,13 @@ task029 [x] goal:compaction planning selects level-aware L0 inputs and overlappi
 task030 [x] goal:flush path can trigger automatic compaction when L0 pressure exceeds configured limits | scope:src/db.rs,src/compaction.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test + git diff --check
 task031 [x] goal:database stats expose table, L0, blob, and compaction counters from live state | scope:src/stats.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test + git diff --check
 task032 [x] goal:block cache records table block hits and misses without changing read results | scope:src/cache.rs,src/table.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test + git diff --check
-task033 [ ] goal:required benchmark harness records reproducible benchmark output for v1 gates | scope:benches,docs,.phrase/current.md | verify:cargo fmt --check + cargo clippy + cargo test + git diff --check + benchmark command
+task033 [x] goal:required benchmark harness records reproducible benchmark output for v1 gates | scope:benches,docs,.phrase/current.md | verify:cargo fmt --check + cargo clippy + cargo test + git diff --check + benchmark command
+task034 [ ] goal:durability documentation describes honest guarantees and tradeoffs for v1 | scope:docs,.phrase/current.md | verify:doc review + cargo fmt --check + cargo clippy + cargo test + git diff --check
 ```
 
 ## Known Blockers
 
-- Benchmark output and durability docs are incomplete.
+- Durability docs are incomplete.
 
 ## Evidence To Record
 
@@ -90,4 +91,5 @@ task033 [ ] goal:required benchmark harness records reproducible benchmark outpu
 - Automatic compaction trigger validation results.
 - Live stats validation results.
 - Block-cache validation results.
-- Remaining blocker category after task032.
+- Benchmark harness validation results.
+- Remaining blocker category after task033.

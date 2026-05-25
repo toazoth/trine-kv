@@ -13,6 +13,10 @@ path = "src/lib.rs"
 [dependencies]
 lz4_flex = "0.13.1"
 
+[[bench]]
+name = "v1_bench"
+harness = false
+
 [lints.rust]
 unsafe_code = "warn"
 

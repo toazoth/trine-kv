@@ -1383,3 +1383,47 @@ Record only evidence that can change planning or durable decisions.
 
 - Add a reproducible benchmark harness and record v1 benchmark output before
   writing final durability documentation.
+
+## 2026-05-25: V1 Benchmark Harness Passed
+
+### Observation
+
+- `benches/v1_bench.rs` now runs the required v1 benchmark set through a
+  deterministic harness with fixed row and operation counts.
+- The harness covers point and batch writes, present and missing reads, bounded
+  range scans, prefix scans, matching and nonmatching table partitions,
+  snapshot reads while writes continue, optimistic transaction success and
+  conflict, WAL replay, flush and compaction throughput, large inline values,
+  separated blob values, block-cache warm reads, cold table reads, search-policy
+  comparisons across small/medium/large table indexes, iterator `advance_to`
+  targets, and codec comparisons for none and fast block compression over Trine
+  block payloads.
+- `docs/benchmarks/v1-baseline.md` records the local 2026-05-25 benchmark
+  command, workload inputs, result table, and checksums.
+
+### Interpretation
+
+- Task033 is complete for the v1 benchmark-output acceptance requirement.
+- Benchmark numbers are local baselines, not portable performance claims. Future
+  comparisons should use the same harness, machine class, and build profile.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+- `git diff --check`
+- forbidden terminology scan over source, tests, phase notes, benchmark files,
+  and docs
+- `cargo clippy --bench v1_bench`
+- `cargo bench --bench v1_bench`
+
+### Remaining Blockers
+
+- Durability documentation.
+
+### Recommended Next Action
+
+- Write v1 durability documentation that clearly states each durability mode,
+  recovery behavior, checksummed file boundaries, repair policy, and known
+  non-goals before closing the v1 acceptance gate.
