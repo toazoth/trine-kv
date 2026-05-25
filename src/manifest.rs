@@ -12,13 +12,13 @@ use crate::{
         CompressionProfile, FilterPolicy, IndexSearchPolicy, KeyspaceOptions, PrefixFilterPolicy,
     },
     prefix::PrefixExtractor,
-    table::{TableId, TableProperties},
+    table::{TableId, TableLevel, TableProperties},
     types::Sequence,
 };
 
 pub const MANIFEST_FILE_NAME: &str = "MANIFEST";
 const MANIFEST_MAGIC: u32 = 0x5452_4d46;
-const MANIFEST_VERSION: u16 = 1;
+const MANIFEST_VERSION: u16 = 2;
 const HEADER_LEN: usize = 14;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -445,6 +445,7 @@ fn put_tables(bytes: &mut Vec<u8>, tables: &BTreeMap<String, Vec<TableProperties
 
 fn put_table_properties(bytes: &mut Vec<u8>, properties: &TableProperties) -> Result<()> {
     put_u64(bytes, properties.id.get());
+    put_u32(bytes, properties.level.get());
     put_bytes(bytes, &properties.smallest_user_key)?;
     put_bytes(bytes, &properties.largest_user_key)?;
     put_u64(bytes, properties.smallest_sequence.get());
@@ -618,6 +619,7 @@ impl<'payload> Cursor<'payload> {
     fn read_table_properties(&mut self) -> Result<TableProperties> {
         Ok(TableProperties {
             id: TableId(self.read_u64()?),
+            level: TableLevel(self.read_u32()?),
             smallest_user_key: self.read_bytes()?.to_vec(),
             largest_user_key: self.read_bytes()?.to_vec(),
             smallest_sequence: Sequence::new(self.read_u64()?),

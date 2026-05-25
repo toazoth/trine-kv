@@ -1,4 +1,5 @@
 use std::{
+    cmp::Ordering as CmpOrdering,
     collections::{BTreeMap, BTreeSet},
     fs,
     ops::Bound,
@@ -56,7 +57,8 @@ pub(crate) struct KeyspaceState {
 }
 
 impl KeyspaceState {
-    fn new(options: KeyspaceOptions, tables: Vec<Arc<Table>>) -> Self {
+    fn new(options: KeyspaceOptions, mut tables: Vec<Arc<Table>>) -> Self {
+        sort_tables_for_reads(&mut tables);
         Self {
             options,
             entries: RwLock::new(BTreeMap::new()),
@@ -93,6 +95,7 @@ impl RangeTombstone {
 struct FlushInput {
     keyspace: String,
     table_id: table::TableId,
+    table_level: table::TableLevel,
     table_options: table::TableWriteOptions,
     point_records: Vec<(InternalKey, Option<ValueRef>)>,
     range_tombstones: Vec<TableRangeTombstone>,
@@ -101,6 +104,7 @@ struct FlushInput {
 struct CompactionInput {
     keyspace: String,
     table_id: table::TableId,
+    table_level: table::TableLevel,
     table_options: table::TableWriteOptions,
     input_table_ids: Vec<table::TableId>,
     point_records: Vec<(InternalKey, Option<ValueRef>)>,
@@ -310,6 +314,7 @@ impl Db {
             let table = table::write_table(
                 &table_path,
                 input.table_id,
+                input.table_level,
                 &input.table_options,
                 &input.point_records,
                 &input.range_tombstones,
@@ -365,6 +370,7 @@ impl Db {
                 Some(Arc::new(table::write_table(
                     &table_path,
                     input.table_id,
+                    input.table_level,
                     &input.table_options,
                     &input.point_records,
                     &input.range_tombstones,
@@ -621,6 +627,7 @@ impl Db {
             inputs.push(FlushInput {
                 keyspace: name.clone(),
                 table_id: next_table_id,
+                table_level: table::TableLevel::ZERO,
                 table_options: table_write_options(&state.options),
                 point_records,
                 range_tombstones,
@@ -676,6 +683,7 @@ impl Db {
                 );
                 range_tombstones.extend(table.range_tombstones().iter().cloned());
             }
+            let table_level = compaction_output_level(&candidate_tables)?;
             let point_records = compact_point_records(point_records, oldest_active_snapshot);
             let point_records = cleanup_point_tombstones(&point_records);
             let range_tombstones =
@@ -684,6 +692,7 @@ impl Db {
             inputs.push(CompactionInput {
                 keyspace: name.clone(),
                 table_id: next_table_id,
+                table_level,
                 table_options: table_write_options(&state.options),
                 input_table_ids,
                 point_records,
@@ -762,11 +771,12 @@ impl Db {
         for (input, (keyspace, table)) in inputs.iter().zip(tables) {
             debug_assert_eq!(input.keyspace, keyspace);
             let state = self.keyspace_state(&keyspace)?;
-            state
+            let mut tables = state
                 .tables
                 .write()
-                .map_err(|_| lock_poisoned("table list"))?
-                .push(table);
+                .map_err(|_| lock_poisoned("table list"))?;
+            tables.push(table);
+            sort_tables_for_reads(&mut tables);
             state
                 .entries
                 .write()
@@ -793,6 +803,7 @@ impl Db {
             if let Some(table) = output.table {
                 tables.push(table);
             }
+            sort_tables_for_reads(&mut tables);
         }
 
         Ok(())
@@ -895,6 +906,39 @@ fn validate_table_blob_refs(db_path: &Path, table: &Table) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn sort_tables_for_reads(tables: &mut [Arc<Table>]) {
+    // Keep table handles in level order. Reads still merge candidate records
+    // defensively, but this invariant gives optimized point reads and
+    // compaction picking one stable rule to share.
+    tables.sort_by(compare_tables_for_reads);
+}
+
+fn compare_tables_for_reads(left: &Arc<Table>, right: &Arc<Table>) -> CmpOrdering {
+    let left = left.properties();
+    let right = right.properties();
+    left.level
+        .cmp(&right.level)
+        .then_with(|| right.largest_sequence.cmp(&left.largest_sequence))
+        .then_with(|| right.id.cmp(&left.id))
+}
+
+fn compaction_output_level(tables: &[Arc<Table>]) -> Result<table::TableLevel> {
+    let highest_level = tables
+        .iter()
+        .map(|table| table.properties().level)
+        .max()
+        .unwrap_or(table::TableLevel::ZERO);
+    // A pure L0 merge moves down to L1. Once a lower level participates, the
+    // replacement stays at that deepest input level and absorbs newer overlap.
+    if highest_level == table::TableLevel::ZERO {
+        highest_level.next().ok_or_else(|| Error::Corruption {
+            message: "table level counter overflow".to_owned(),
+        })
+    } else {
+        Ok(highest_level)
+    }
 }
 
 fn referenced_table_file_ids(manifest: &ManifestState) -> BTreeSet<table::TableId> {

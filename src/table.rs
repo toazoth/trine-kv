@@ -20,7 +20,7 @@ use crate::{
 
 pub const TABLE_FILE_EXTENSION: &str = "trinet";
 const TABLE_MAGIC: u32 = 0x5452_5442;
-const TABLE_VERSION: u16 = 1;
+const TABLE_VERSION: u16 = 2;
 const HEADER_LEN: usize = 14;
 const FOOTER_MAGIC: u32 = 0x5452_5446;
 const FOOTER_LEN: usize = 90;
@@ -69,6 +69,26 @@ impl TableId {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TableLevel(pub u32);
+
+impl TableLevel {
+    pub const ZERO: Self = Self(0);
+
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn next(self) -> Option<Self> {
+        match self.0.checked_add(1) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TableSection {
     DataBlocks,
@@ -82,6 +102,7 @@ pub enum TableSection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableProperties {
     pub id: TableId,
+    pub level: TableLevel,
     pub smallest_user_key: Vec<u8>,
     pub largest_user_key: Vec<u8>,
     pub smallest_sequence: Sequence,
@@ -491,6 +512,7 @@ pub(crate) fn list_table_file_ids(db_path: &Path) -> Result<BTreeSet<TableId>> {
 pub(crate) fn write_table(
     path: &Path,
     table_id: TableId,
+    level: TableLevel,
     options: &TableWriteOptions,
     point_records: &[(InternalKey, Option<ValueRef>)],
     range_tombstones: &[TableRangeTombstone],
@@ -519,7 +541,13 @@ pub(crate) fn write_table(
     let data_blocks = build_data_blocks(&point_records, options)?;
 
     let table = Table {
-        properties: table_properties(table_id, options.codec, &point_records, range_tombstones),
+        properties: table_properties(
+            table_id,
+            level,
+            options.codec,
+            &point_records,
+            range_tombstones,
+        ),
         point_key_filter: build_point_key_filter(options, &point_records),
         prefix_filter: build_prefix_filter(options, &point_records),
         point_records,
@@ -573,6 +601,7 @@ pub(crate) fn read_table(path: &Path) -> Result<Table> {
 
 fn table_properties(
     table_id: TableId,
+    level: TableLevel,
     codec: CodecId,
     point_records: &[TablePointRecord],
     range_tombstones: &[TableRangeTombstone],
@@ -593,6 +622,7 @@ fn table_properties(
 
     TableProperties {
         id: table_id,
+        level,
         smallest_user_key: point_records
             .first()
             .map_or_else(Vec::new, |record| record.internal_key.user_key().to_vec()),
@@ -785,6 +815,7 @@ fn decode_table(bytes: &[u8]) -> Result<Table> {
     if properties
         != table_properties(
             properties.id,
+            properties.level,
             properties.codec,
             &point_records,
             &range_tombstones,
@@ -1406,6 +1437,7 @@ fn validate_sorted_point_records(point_records: &[TablePointRecord]) -> Result<(
 
 fn put_properties(bytes: &mut Vec<u8>, properties: &TableProperties) -> Result<()> {
     put_u64(bytes, properties.id.get());
+    put_u32(bytes, properties.level.get());
     put_bytes(bytes, &properties.smallest_user_key)?;
     put_bytes(bytes, &properties.largest_user_key)?;
     put_u64(bytes, properties.smallest_sequence.get());
@@ -1685,6 +1717,7 @@ impl<'payload> Cursor<'payload> {
     fn read_properties(&mut self) -> Result<TableProperties> {
         Ok(TableProperties {
             id: TableId(self.read_u64()?),
+            level: TableLevel(self.read_u32()?),
             smallest_user_key: self.read_bytes()?.to_vec(),
             largest_user_key: self.read_bytes()?.to_vec(),
             smallest_sequence: Sequence::new(self.read_u64()?),
@@ -2014,7 +2047,13 @@ mod tests {
             .collect::<Vec<_>>();
         let data_blocks = build_data_blocks(&point_records, &options).expect("test blocks build");
         Table {
-            properties: table_properties(TableId(7), options.codec, &point_records, &[]),
+            properties: table_properties(
+                TableId(7),
+                TableLevel::ZERO,
+                options.codec,
+                &point_records,
+                &[],
+            ),
             point_key_filter: build_point_key_filter(&options, &point_records),
             prefix_filter: build_prefix_filter(&options, &point_records),
             point_records,

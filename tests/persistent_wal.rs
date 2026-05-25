@@ -75,6 +75,20 @@ fn table_file_paths(path: &std::path::Path) -> Vec<PathBuf> {
         .collect()
 }
 
+fn default_table_levels(path: &std::path::Path) -> Vec<u32> {
+    let manifest_state =
+        manifest::read_manifest(&manifest::manifest_path(path)).expect("manifest reads");
+    let mut levels = manifest_state
+        .tables()
+        .get("default")
+        .expect("default table list")
+        .iter()
+        .map(|properties| properties.level.get())
+        .collect::<Vec<_>>();
+    levels.sort_unstable();
+    levels
+}
+
 fn write_file(path: &std::path::Path, bytes: &[u8]) {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).expect("create parent directory");
@@ -565,6 +579,7 @@ fn persistent_flush_writes_table_and_reopen_can_skip_wal() {
         .get("default")
         .expect("default table list");
     assert_eq!(tables.len(), 1);
+    assert_eq!(tables[0].level.get(), 0);
     assert!(table::table_path(&path, tables[0].id).exists());
 
     fs::remove_file(wal::wal_path(&path)).expect("remove WAL after flush");
@@ -599,6 +614,69 @@ fn persistent_flush_writes_table_and_reopen_can_skip_wal() {
             )
             .expect("post-table write commits");
         assert_eq!(info.sequence(), Sequence::new(6));
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_compaction_levels_preserve_newer_l0_reads() {
+    let path = temp_db_path("compaction-levels");
+    let options = DbOptions::persistent(&path);
+
+    {
+        let db = Db::open(options.clone()).expect("persistent db opens");
+        let keyspace = db
+            .keyspace("default", KeyspaceOptions::default())
+            .expect("keyspace opens");
+
+        keyspace.insert(b"a", b"old-a").expect("write old a");
+        db.flush().expect("flush first L0 table");
+        keyspace.insert(b"b", b"old-b").expect("write b");
+        db.flush().expect("flush second L0 table");
+        assert_eq!(default_table_levels(&path), vec![0, 0]);
+
+        db.compact_range(KeyRange::all())
+            .expect("compact L0 tables");
+        assert_eq!(default_table_levels(&path), vec![1]);
+        assert_eq!(
+            keyspace.get(b"a").expect("compacted a reads"),
+            Some(b"old-a".to_vec())
+        );
+
+        keyspace.insert(b"a", b"new-a").expect("write newer L0 a");
+        db.flush().expect("flush newer L0 table");
+        assert_eq!(default_table_levels(&path), vec![0, 1]);
+        assert_eq!(
+            keyspace.get(b"a").expect("newer L0 a reads"),
+            Some(b"new-a".to_vec())
+        );
+
+        db.compact_range(KeyRange::all())
+            .expect("compact L0 into L1");
+        assert_eq!(default_table_levels(&path), vec![1]);
+        assert_eq!(
+            keyspace
+                .get(b"a")
+                .expect("newer a survives second compaction"),
+            Some(b"new-a".to_vec())
+        );
+    }
+
+    {
+        let db = Db::open(options).expect("persistent db reopens");
+        let keyspace = db
+            .keyspace("default", KeyspaceOptions::default())
+            .expect("keyspace reopens");
+        assert_eq!(default_table_levels(&path), vec![1]);
+        assert_eq!(
+            keyspace.get(b"a").expect("newer L0 a reopens"),
+            Some(b"new-a".to_vec())
+        );
+        assert_eq!(
+            keyspace.get(b"b").expect("compacted b reopens"),
+            Some(b"old-b".to_vec())
+        );
     }
 
     fs::remove_dir_all(path).expect("cleanup test db");

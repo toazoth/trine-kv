@@ -1184,3 +1184,46 @@ Record only evidence that can change planning or durable decisions.
 
 - Start the leveled compaction work with an explicit table-level metadata slice,
   then verify that reads preserve newest-before-older ordering across levels.
+
+## 2026-05-25: Compaction Level Metadata Passed
+
+### Observation
+
+- Table properties now include a compaction level in both table files and the
+  manifest; the table and manifest format versions were advanced for the new
+  required field.
+- Flush outputs are recorded as L0 tables.
+- Manual compaction writes a lower-level replacement: pure L0 inputs move to
+  L1, and compaction that already includes a lower-level table stays at that
+  deepest input level.
+- Keyspace table handles are sorted by level and recency after recovery,
+  flush, and compaction.
+- Tests verify L0 flush metadata, L0-to-L1 compaction, newer L0 reads over an
+  older L1 table, another compaction back into L1, and reopen correctness.
+
+### Interpretation
+
+- Task028 is complete as the first leveled-compaction slice: the engine now has
+  durable level metadata and stable in-memory ordering.
+- The remaining compaction blocker is not table metadata anymore; it is a
+  level-aware input picker and background scheduling.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+- `git diff --check`
+
+### Remaining Blockers
+
+- Level-aware compaction input picking.
+- Background compaction scheduling.
+- Required metrics and cache behavior.
+- Required benchmark outputs.
+- Durability documentation.
+
+### Recommended Next Action
+
+- Implement compaction planning that chooses L0 inputs and overlapping
+  lower-level tables explicitly before wiring automatic scheduling.
