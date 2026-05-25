@@ -53,16 +53,16 @@ task014 [x] goal:lz4_flex-backed fast block compression round-trips table blocks
 task015 [x] goal:prefix filters skip incompatible table reads without changing MVCC/range-tombstone results | scope:src/filter.rs,src/table.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test
 task016 [x] goal:separated blob values survive reopen, flush, and compaction | scope:src/blob.rs,src/table.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test
 task017 [x] goal:point-key filters skip incompatible point-record reads without changing MVCC/range-tombstone results | scope:src/filter.rs,src/table.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test
+task018 [x] goal:SSTable point/range/prefix reads use block index and restart points for candidate selection | scope:src/table.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test
 ```
 
 ## Known Blockers
 
-- Recovery reports, blob cleanup/version-cleaning compaction, block-level
-  index/restart seek, partitioned filters/indexes, and optimized search
-  policies are not implemented yet.
+- Recovery reports, blob cleanup/version-cleaning compaction, partitioned
+  filters/indexes, and optimized search policies are not implemented yet.
 
 ## Evidence To Record
 
 - Phase 2 scaffold gate results.
-- Next SSTable read-path validation results.
-- Remaining blocker category after point-key filter slice.
+- SSTable block candidate read-path validation results.
+- Remaining blocker category after task018.

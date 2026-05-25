@@ -830,34 +830,6 @@ fn validate_batch_len(len: usize) -> Result<()> {
     Ok(())
 }
 
-fn collect_point_records(state: &KeyspaceState) -> Result<Vec<(InternalKey, Option<ValueRef>)>> {
-    let entries = state
-        .entries
-        .read()
-        .map_err(|_| lock_poisoned("memtable entries"))?;
-    let mut records = entries
-        .iter()
-        .map(|(internal_key, value)| (internal_key.clone(), value.clone()))
-        .collect::<Vec<_>>();
-    drop(entries);
-
-    let tables = state
-        .tables
-        .read()
-        .map_err(|_| lock_poisoned("table list"))?;
-    for table in tables.iter() {
-        records.extend(
-            table
-                .point_records()
-                .iter()
-                .map(|record| (record.internal_key.clone(), record.value.clone())),
-        );
-    }
-    records.sort_by(|left, right| left.0.cmp(&right.0));
-
-    Ok(records)
-}
-
 fn collect_point_key_records(
     state: &KeyspaceState,
     key: &[u8],
@@ -883,9 +855,40 @@ fn collect_point_key_records(
         }
         records.extend(
             table
-                .point_records()
-                .iter()
-                .filter(|record| record.internal_key.user_key() == key)
+                .point_records_for_key(key)
+                .into_iter()
+                .map(|record| (record.internal_key.clone(), record.value.clone())),
+        );
+    }
+    records.sort_by(|left, right| left.0.cmp(&right.0));
+
+    Ok(records)
+}
+
+fn collect_range_point_records(
+    state: &KeyspaceState,
+    range: &KeyRange,
+) -> Result<Vec<(InternalKey, Option<ValueRef>)>> {
+    let entries = state
+        .entries
+        .read()
+        .map_err(|_| lock_poisoned("memtable entries"))?;
+    let mut records = entries
+        .iter()
+        .filter(|(internal_key, _)| key_is_in_range(internal_key.user_key(), range))
+        .map(|(internal_key, value)| (internal_key.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    drop(entries);
+
+    let tables = state
+        .tables
+        .read()
+        .map_err(|_| lock_poisoned("table list"))?;
+    for table in tables.iter() {
+        records.extend(
+            table
+                .point_records_in_range(range)
+                .into_iter()
                 .map(|record| (record.internal_key.clone(), record.value.clone())),
         );
     }
@@ -919,9 +922,8 @@ fn collect_prefix_point_records(
         }
         records.extend(
             table
-                .point_records()
-                .iter()
-                .filter(|record| record.internal_key.user_key().starts_with(prefix))
+                .point_records_with_prefix(prefix)
+                .into_iter()
                 .map(|record| (record.internal_key.clone(), record.value.clone())),
         );
     }
@@ -965,15 +967,9 @@ fn point_key_modified_after(
 ) -> Result<bool> {
     // A point read is invalidated by either a newer point record for that user
     // key or a newer range tombstone covering it.
-    for (internal_key, _) in collect_point_records(state)? {
-        match internal_key.user_key().cmp(key) {
-            std::cmp::Ordering::Less => {}
-            std::cmp::Ordering::Greater => break,
-            std::cmp::Ordering::Equal => {
-                if internal_key.sequence() > read_sequence {
-                    return Ok(true);
-                }
-            }
+    for (internal_key, _) in collect_point_key_records(state, key)? {
+        if internal_key.sequence() > read_sequence {
+            return Ok(true);
         }
     }
 
@@ -987,14 +983,7 @@ fn key_range_modified_after(
 ) -> Result<bool> {
     // A range read is invalidated by any newer point record inside the range or
     // any newer range tombstone whose bounds overlap the range read.
-    for (internal_key, _) in collect_point_records(state)? {
-        let user_key = internal_key.user_key();
-        if key_is_before_start(user_key, &range.start) {
-            continue;
-        }
-        if key_is_after_end(user_key, &range.end) {
-            break;
-        }
+    for (internal_key, _) in collect_range_point_records(state, range)? {
         if internal_key.sequence() > read_sequence {
             return Ok(true);
         }
@@ -1012,7 +1001,7 @@ fn collect_visible_range(
     read_sequence: Sequence,
     db_path: Option<&Path>,
 ) -> Result<Vec<KeyValue>> {
-    let point_records = collect_point_records(state)?;
+    let point_records = collect_range_point_records(state, range)?;
     let range_tombstones = collect_range_tombstones(state)?;
     collect_visible_records(
         &point_records,

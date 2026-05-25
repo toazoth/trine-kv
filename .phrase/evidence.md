@@ -777,3 +777,43 @@ Record only evidence that can change planning or durable decisions.
 
 - Implement a table read path that uses index entries and restart offsets for
   point/range candidate selection before adding optimized search policies.
+
+## 2026-05-25: SSTable Block Candidate Read Path Passed
+
+### Observation
+
+- Loaded tables now keep one sorted record array plus data-block metadata:
+  record ranges, block key bounds, and restart positions as record indexes.
+- Table open validates that each encoded restart offset lands exactly on a
+  decoded record boundary, starts at the first record, and remains sorted.
+- Point, range, and prefix table reads use block bounds and restart positions
+  to collect candidate records instead of scanning every table record.
+- DB point/range/prefix collectors now call the table candidate APIs; range
+  transaction conflict checks use the same bounded point-record path.
+- Tests cover direct table candidate reads for point/range/prefix queries and
+  persistent point/range/prefix reads before and after reopening from SSTables.
+
+### Interpretation
+
+- Task018 is complete for block-level candidate selection using the canonical
+  table index and data-block restart positions.
+- This is still a simple in-memory table reader after open; partitioned
+  filters/indexes and optimized search policies remain separate future work.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+- `git diff --check`
+
+### Remaining Blockers
+
+- Partitioned filters/indexes, optimized search policies, recovery reports,
+  blob cleanup, and version-cleaning compaction remain future blockers.
+
+### Recommended Next Action
+
+- Choose between recovery reporting and cleanup/version-cleaning compaction
+  next; optimized search policies should wait until the remaining correctness
+  gaps are narrower.

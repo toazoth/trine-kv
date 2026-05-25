@@ -381,6 +381,17 @@ fn persistent_table_block_index_reads_points_and_ranges() {
             })
             .collect::<Vec<_>>();
         assert_eq!(rows, expected);
+
+        let prefix_rows = collect_rows(keyspace.prefix(b"key-12").expect("prefix reads table"));
+        let expected_prefix = (120..130)
+            .map(|index| {
+                (
+                    format!("key-{index:03}").into_bytes(),
+                    format!("value-{index:03}").into_bytes(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(prefix_rows, expected_prefix);
     }
 
     fs::remove_file(wal::wal_path(&path)).expect("remove WAL after block-index flush");
@@ -412,6 +423,21 @@ fn persistent_table_block_index_reads_points_and_ranges() {
             })
             .collect::<Vec<_>>();
         assert_eq!(rows, expected);
+
+        let prefix_rows = collect_rows(
+            keyspace
+                .prefix(b"key-12")
+                .expect("prefix reads after reopen"),
+        );
+        let expected_prefix = (120..130)
+            .map(|index| {
+                (
+                    format!("key-{index:03}").into_bytes(),
+                    format!("value-{index:03}").into_bytes(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(prefix_rows, expected_prefix);
     }
 
     fs::remove_dir_all(path).expect("cleanup test db");
