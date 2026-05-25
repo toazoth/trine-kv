@@ -52,6 +52,17 @@ const PREFIX_EXTRACTOR_FIXED_LEN: u8 = 1;
 const PREFIX_EXTRACTOR_SEPARATOR: u8 = 2;
 const PREFIX_EXTRACTOR_CUSTOM: u8 = 3;
 
+// These are on-disk lower bounds. Decoders use them to reject impossible
+// record counts before reserving memory; real entries may be larger because
+// keys, values, and filters carry byte fields.
+const MIN_INTERNAL_KEY_BYTES: usize = 17;
+const MIN_VALUE_REF_BYTES: usize = 1;
+const MIN_DATA_RECORD_BYTES: usize = MIN_INTERNAL_KEY_BYTES + MIN_VALUE_REF_BYTES;
+const MIN_INDEX_ENTRY_BYTES: usize = MIN_INTERNAL_KEY_BYTES * 2 + 16 + 1 + 1;
+const MIN_RANGE_TOMBSTONE_BYTES: usize = 14;
+const MIN_FILTER_ENTRY_BYTES: usize = 4;
+const RESTART_POINT_BYTES: usize = 4;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TableId(pub u64);
 
@@ -1243,6 +1254,12 @@ fn decode_properties_block(bytes: &[u8]) -> Result<TableProperties> {
 fn decode_index_block(bytes: &[u8]) -> Result<Vec<DataBlockIndexEntry>> {
     let mut cursor = Cursor::new(bytes);
     let entry_count = cursor.read_u32()? as usize;
+    ensure_count_fits_remaining(
+        entry_count,
+        cursor.remaining_len(),
+        MIN_INDEX_ENTRY_BYTES,
+        "index entry count exceeds block bytes",
+    )?;
     let mut entries = Vec::with_capacity(entry_count);
     for _ in 0..entry_count {
         entries.push(DataBlockIndexEntry {
@@ -1265,6 +1282,12 @@ fn decode_index_block(bytes: &[u8]) -> Result<Vec<DataBlockIndexEntry>> {
 fn decode_data_block(bytes: &[u8]) -> Result<DecodedDataBlock> {
     let mut cursor = Cursor::new(bytes);
     let record_count = cursor.read_u32()? as usize;
+    ensure_count_fits_remaining(
+        record_count,
+        cursor.remaining_len(),
+        MIN_DATA_RECORD_BYTES,
+        "data record count exceeds block bytes",
+    )?;
     let mut records = Vec::with_capacity(record_count);
     let mut record_offsets = Vec::with_capacity(record_count);
     for _ in 0..record_count {
@@ -1287,6 +1310,12 @@ fn decode_data_block(bytes: &[u8]) -> Result<DecodedDataBlock> {
 fn decode_range_tombstone_block(bytes: &[u8]) -> Result<Vec<TableRangeTombstone>> {
     let mut cursor = Cursor::new(bytes);
     let tombstone_count = cursor.read_u32()? as usize;
+    ensure_count_fits_remaining(
+        tombstone_count,
+        cursor.remaining_len(),
+        MIN_RANGE_TOMBSTONE_BYTES,
+        "range tombstone count exceeds block bytes",
+    )?;
     let mut range_tombstones = Vec::with_capacity(tombstone_count);
     for _ in 0..tombstone_count {
         let start = cursor.read_bound()?;
@@ -1318,9 +1347,16 @@ fn read_point_key_filter(cursor: &mut Cursor<'_>) -> Result<Option<PointKeyFilte
         POINT_KEY_FILTER_ABSENT => Ok(None),
         POINT_KEY_FILTER_PRESENT => {
             let key_count = cursor.read_u32()? as usize;
-            let keys = (0..key_count)
-                .map(|_| cursor.read_bytes().map(<[u8]>::to_vec))
-                .collect::<Result<Vec<_>>>()?;
+            ensure_count_fits_remaining(
+                key_count,
+                cursor.remaining_len(),
+                MIN_FILTER_ENTRY_BYTES,
+                "point-key filter count exceeds block bytes",
+            )?;
+            let mut keys = Vec::with_capacity(key_count);
+            for _ in 0..key_count {
+                keys.push(cursor.read_bytes()?.to_vec());
+            }
             Ok(Some(PointKeyFilter::from_sorted_keys(keys)?))
         }
         tag => Err(Error::InvalidFormat {
@@ -1335,9 +1371,16 @@ fn read_prefix_filter(cursor: &mut Cursor<'_>) -> Result<Option<PrefixFilter>> {
         PREFIX_FILTER_PRESENT => {
             let extractor = cursor.read_prefix_extractor()?;
             let prefix_count = cursor.read_u32()? as usize;
-            let prefixes = (0..prefix_count)
-                .map(|_| cursor.read_bytes().map(<[u8]>::to_vec))
-                .collect::<Result<Vec<_>>>()?;
+            ensure_count_fits_remaining(
+                prefix_count,
+                cursor.remaining_len(),
+                MIN_FILTER_ENTRY_BYTES,
+                "prefix filter count exceeds block bytes",
+            )?;
+            let mut prefixes = Vec::with_capacity(prefix_count);
+            for _ in 0..prefix_count {
+                prefixes.push(cursor.read_bytes()?.to_vec());
+            }
             Ok(Some(PrefixFilter::from_sorted_prefixes(
                 extractor, prefixes,
             )?))
@@ -1363,6 +1406,12 @@ fn decode_restart_points(cursor: &mut Cursor<'_>, record_offsets: &[usize]) -> R
     if restart_count == 0 {
         return Err(invalid_table("data block is missing restart points"));
     }
+    ensure_count_fits_remaining(
+        restart_count,
+        cursor.remaining_len(),
+        RESTART_POINT_BYTES,
+        "data block restart count exceeds block bytes",
+    )?;
 
     let mut restart_indices = Vec::with_capacity(restart_count);
     let mut previous_restart = None;
@@ -1742,6 +1791,19 @@ fn invalid_table(message: &'static str) -> Error {
     }
 }
 
+fn ensure_count_fits_remaining(
+    count: usize,
+    remaining: usize,
+    min_item_bytes: usize,
+    message: &'static str,
+) -> Result<()> {
+    debug_assert!(min_item_bytes > 0);
+    if count > remaining / min_item_bytes {
+        return Err(invalid_table(message));
+    }
+    Ok(())
+}
+
 struct Cursor<'payload> {
     payload: &'payload [u8],
     offset: usize,
@@ -1889,6 +1951,10 @@ impl<'payload> Cursor<'payload> {
 
     const fn is_finished(&self) -> bool {
         self.offset == self.payload.len()
+    }
+
+    const fn remaining_len(&self) -> usize {
+        self.payload.len() - self.offset
     }
 }
 
@@ -2105,6 +2171,62 @@ mod tests {
         assert!(matches!(error, Error::UnsupportedFormat { .. }));
     }
 
+    #[test]
+    fn table_decode_rejects_index_entry_count_before_large_allocation() {
+        let error = decode_index_block(&count_block(u32::MAX))
+            .expect_err("impossible index count should fail");
+        assert_invalid_table_message(error, "index entry count exceeds block bytes");
+    }
+
+    #[test]
+    fn table_decode_rejects_data_record_count_before_large_allocation() {
+        let error = decode_data_block(&count_block(u32::MAX))
+            .expect_err("impossible data record count should fail");
+        assert_invalid_table_message(error, "data record count exceeds block bytes");
+    }
+
+    #[test]
+    fn table_decode_rejects_restart_count_before_large_allocation() {
+        let mut bytes = Vec::new();
+        put_u32(&mut bytes, 1);
+        put_internal_key(
+            &mut bytes,
+            &InternalKey::new(Vec::new(), Sequence::new(1), ValueKind::Put, 0),
+        )
+        .expect("internal key encodes");
+        put_value_ref(&mut bytes, None).expect("value reference encodes");
+        put_u32(&mut bytes, u32::MAX);
+
+        let error = decode_data_block(&bytes).expect_err("impossible restart count should fail");
+        assert_invalid_table_message(error, "data block restart count exceeds block bytes");
+    }
+
+    #[test]
+    fn table_decode_rejects_range_tombstone_count_before_large_allocation() {
+        let error = decode_range_tombstone_block(&count_block(u32::MAX))
+            .expect_err("impossible tombstone count should fail");
+        assert_invalid_table_message(error, "range tombstone count exceeds block bytes");
+    }
+
+    #[test]
+    fn table_decode_rejects_filter_counts_before_large_allocation() {
+        let mut point_bytes = Vec::new();
+        put_u8(&mut point_bytes, POINT_KEY_FILTER_PRESENT);
+        put_u32(&mut point_bytes, u32::MAX);
+        let error = decode_filter_block(&point_bytes)
+            .expect_err("impossible point-key filter count should fail");
+        assert_invalid_table_message(error, "point-key filter count exceeds block bytes");
+
+        let mut prefix_bytes = Vec::new();
+        put_u8(&mut prefix_bytes, POINT_KEY_FILTER_ABSENT);
+        put_u8(&mut prefix_bytes, PREFIX_FILTER_PRESENT);
+        put_u8(&mut prefix_bytes, PREFIX_EXTRACTOR_DISABLED);
+        put_u32(&mut prefix_bytes, u32::MAX);
+        let error = decode_filter_block(&prefix_bytes)
+            .expect_err("impossible prefix filter count should fail");
+        assert_invalid_table_message(error, "prefix filter count exceeds block bytes");
+    }
+
     fn table_with_records(count: usize, codec: CodecId) -> Table {
         table_with_options(count, test_table_options(codec, false))
     }
@@ -2176,5 +2298,18 @@ mod tests {
         bytes.extend_from_slice(&payload_checksum.to_le_bytes());
         bytes.extend_from_slice(payload);
         bytes
+    }
+
+    fn count_block(count: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        put_u32(&mut bytes, count);
+        bytes
+    }
+
+    fn assert_invalid_table_message(error: Error, expected: &str) {
+        assert!(
+            error.to_string().contains(expected),
+            "unexpected error: {error}"
+        );
     }
 }

@@ -20,6 +20,9 @@ pub const MANIFEST_FILE_NAME: &str = "MANIFEST";
 const MANIFEST_MAGIC: u32 = 0x5452_4d46;
 const MANIFEST_VERSION: u16 = 2;
 const HEADER_LEN: usize = 14;
+// The lower bound for one table entry: fixed fields plus two empty byte fields.
+// Decoding uses this to reject impossible counts before reserving memory.
+const MIN_TABLE_PROPERTY_BYTES: usize = 37;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestEdit {
@@ -619,6 +622,9 @@ impl<'payload> Cursor<'payload> {
                 }
             })?;
             let table_count = self.read_u32()? as usize;
+            if table_count > self.remaining_len() / MIN_TABLE_PROPERTY_BYTES {
+                return Err(invalid_manifest("table count exceeds payload bytes"));
+            }
             let mut table_list = Vec::with_capacity(table_count);
             for _ in 0..table_count {
                 table_list.push(self.read_table_properties()?);
@@ -720,6 +726,10 @@ impl<'payload> Cursor<'payload> {
     const fn is_finished(&self) -> bool {
         self.offset == self.payload.len()
     }
+
+    const fn remaining_len(&self) -> usize {
+        self.payload.len() - self.offset
+    }
 }
 
 #[cfg(test)]
@@ -730,8 +740,26 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{ManifestStore, manifest_path};
+    use super::{ManifestStore, decode_state, manifest_path};
     use crate::options::KeyspaceOptions;
+
+    #[test]
+    fn manifest_decode_rejects_table_count_before_large_allocation() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0_u64.to_le_bytes());
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+        payload.extend_from_slice(&1_u32.to_le_bytes());
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+        payload.extend_from_slice(&u32::MAX.to_le_bytes());
+
+        let error = decode_state(&payload).expect_err("impossible table count should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("table count exceeds payload bytes"),
+            "unexpected error: {error}"
+        );
+    }
 
     #[test]
     fn manifest_state_stays_put_when_publish_fails() {

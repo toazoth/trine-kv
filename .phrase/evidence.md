@@ -1686,3 +1686,55 @@ Record only evidence that can change planning or durable decisions.
 
 - Audit startup cleanup plus manifest/table decode count allocation, then fix
   any local risk with a focused regression test.
+
+## 2026-05-25: Manifest And Table Decode Resource Bounds Passed
+
+### Observation
+
+- Startup cleanup was audited through `Db::open` and `recovery`: writer opens
+  take a process lock, read-only opens do not take the writer lock, safe
+  temporary files fail closed by default, explicit repair removes only known
+  temporary files and writes a recovery report, and unreferenced table/blob
+  files fail closed for operator review. Existing persistent recovery tests
+  cover these paths.
+- Manifest decode directly reserved a table list from the encoded table count.
+- Table decode directly reserved vectors from encoded counts in index blocks,
+  data blocks, range tombstone blocks, filter blocks, and data-block restart
+  lists.
+- Manifest and table decode now compare each declared count against the
+  remaining payload bytes using the smallest valid encoded item size before
+  reserving memory.
+- Regression tests feed impossible `u32::MAX` counts and verify the decoders
+  fail before large allocation.
+
+### Interpretation
+
+- Task040 is complete for startup cleanup audit and manifest/table decode
+  resource bounds.
+- Risk category: local recovery/read-path resource exhaustion from corrupted
+  storage files.
+- The fix does not change the manifest or table format; it rejects impossible
+  existing-format inputs earlier.
+
+### Verification
+
+- Manual audit of startup cleanup, safe temporary file repair, unreferenced
+  file handling, manifest decode, and table block decode.
+- `cargo test manifest_decode_rejects_table_count_before_large_allocation`
+- `cargo test table_decode_rejects`
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+- `git diff --check`
+- forbidden terminology scan over source, tests, phase notes, benchmark files,
+  docs, README, and examples
+
+### Remaining Blockers
+
+- Continue production hardening for flush/compaction cleanup and diagnostics
+  after partial file writes or publish failures.
+
+### Recommended Next Action
+
+- Audit flush/compaction cleanup and diagnostics next, then fix any local risk
+  with a focused regression test.
