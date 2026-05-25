@@ -26,21 +26,32 @@ repository URL.
 Use an in-memory database for tests and short-lived data:
 
 ```rust
-use trine_kv::{Db, DbOptions};
+use trine_kv::Db;
 
-let db = Db::memory(DbOptions::memory())?;
+let db = Db::open_memory()?;
 ```
 
 Use a persistent database when data should live in a directory:
 
 ```rust
-use trine_kv::{Db, DbOptions};
+use trine_kv::Db;
 
-let db = Db::open(DbOptions::persistent("./trine-data"))?;
+let db = Db::open_persistent("./trine-data")?;
 ```
 
 Persistent mode creates the directory when `create_if_missing` is true and the
 database is not opened read-only.
+
+Set a database-level durability floor when every write should be at least that
+durable:
+
+```rust
+use trine_kv::DurabilityMode;
+
+let db = Db::open(
+    DbOptions::persistent("./trine-data").with_durability(DurabilityMode::Flush),
+)?;
+```
 
 `Db`, `Keyspace`, and `Snapshot` are cheap handles. A `Keyspace` keeps its
 database open, so release keyspace handles before reopening the same directory
@@ -57,10 +68,7 @@ use trine_kv::{KeyspaceOptions, PrefixExtractor};
 
 let users = db.keyspace(
     "users",
-    KeyspaceOptions {
-        prefix_extractor: PrefixExtractor::Separator(b':'),
-        ..KeyspaceOptions::default()
-    },
+    KeyspaceOptions::default().with_prefix_extractor(PrefixExtractor::Separator(b':')),
 )?;
 ```
 
@@ -78,12 +86,23 @@ users.insert(b"user:002", b"Lin")?;
 assert_eq!(users.get(b"user:001")?, Some(b"Ada".to_vec()));
 ```
 
+Use `insert_with_options` when a single-key helper needs explicit durability:
+
+```rust
+use trine_kv::WriteOptions;
+
+users.insert_with_options(b"user:003", b"Grace", WriteOptions::sync_all())?;
+```
+
 Deletes use the same keyspace handle:
 
 ```rust
 users.remove(b"user:002")?;
 assert_eq!(users.get(b"user:002")?, None);
 ```
+
+The matching `remove_with_options` and `remove_range_with_options` helpers are
+available when deletes need explicit write options.
 
 Keys and values are byte vectors. String keys are fine, but the database does
 not require UTF-8.
@@ -93,7 +112,7 @@ not require UTF-8.
 Use `WriteBatch` when several changes must commit at the same sequence:
 
 ```rust
-use trine_kv::{DurabilityMode, WriteBatch, WriteOptions};
+use trine_kv::{WriteBatch, WriteOptions};
 
 let mut batch = WriteBatch::new();
 batch.insert("users", b"user:003", b"Grace");
@@ -101,9 +120,7 @@ batch.remove("users", b"user:001");
 
 let commit = db.write(
     batch,
-    WriteOptions {
-        durability: DurabilityMode::SyncAll,
-    },
+    WriteOptions::sync_all(),
 )?;
 
 println!("committed sequence {}", commit.sequence().get());
@@ -201,16 +218,14 @@ For persistent databases, committed writes append to the WAL before becoming
 visible in memtables. Choose a durability mode per write:
 
 ```rust
-use trine_kv::{DurabilityMode, WriteBatch, WriteOptions};
+use trine_kv::{WriteBatch, WriteOptions};
 
 let mut batch = WriteBatch::new();
 batch.insert("users", b"user:006", b"Edsger");
 
 db.write(
     batch,
-    WriteOptions {
-        durability: DurabilityMode::SyncAll,
-    },
+    WriteOptions::sync_all(),
 )?;
 ```
 
@@ -220,6 +235,8 @@ a stronger mode, but they cannot weaken the mode chosen at open time.
 Use `Db::persist` as an explicit WAL sync point:
 
 ```rust
+use trine_kv::DurabilityMode;
+
 db.persist(DurabilityMode::SyncAll)?;
 ```
 
@@ -259,10 +276,7 @@ println!(
 Use read-only open for inspecting a stable persistent directory:
 
 ```rust
-let mut options = DbOptions::persistent("./trine-data");
-options.read_only = true;
-
-let db = Db::open(options)?;
+let db = Db::open_read_only("./trine-data")?;
 ```
 
 Read-only open does not take the writer lock and does not create a WAL writer.

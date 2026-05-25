@@ -118,6 +118,55 @@ fn corruption_message(error: Error) -> String {
 }
 
 #[test]
+fn persistent_api_helpers_cover_open_options_and_keyspace_writes() {
+    let path = temp_db_path("api-helpers");
+    let options = DbOptions::persistent(&path).with_durability(DurabilityMode::Flush);
+    let keyspace_options =
+        KeyspaceOptions::default().with_prefix_extractor(PrefixExtractor::Separator(b':'));
+
+    {
+        let db = Db::open(options).expect("persistent db opens");
+        let keyspace = db
+            .keyspace("default", keyspace_options.clone())
+            .expect("keyspace opens");
+
+        let insert_info = keyspace
+            .insert_with_options(b"user:001", b"Ada", WriteOptions::sync_all())
+            .expect("insert with options commits");
+        assert_eq!(insert_info.sequence(), Sequence::new(1));
+
+        keyspace
+            .insert_with_options(b"user:002", b"Lin", WriteOptions::flush())
+            .expect("second insert commits");
+        keyspace
+            .remove_with_options(b"user:002", WriteOptions::sync_data())
+            .expect("remove with options commits");
+        keyspace
+            .remove_range_with_options(
+                KeyRange::half_open(b"unused:000", b"unused:999"),
+                WriteOptions::buffered(),
+            )
+            .expect("range delete with options commits");
+
+        db.flush().expect("flush helper writes table");
+    }
+
+    {
+        let db = Db::open_read_only(&path).expect("read-only db opens");
+        let keyspace = db
+            .keyspace("default", keyspace_options)
+            .expect("read-only keyspace opens");
+        assert_eq!(
+            keyspace.get(b"user:001").expect("user reads"),
+            Some(b"Ada".to_vec())
+        );
+        assert_eq!(keyspace.get(b"user:002").expect("deleted user reads"), None);
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
 fn persistent_wal_replays_point_and_range_batches() {
     let path = temp_db_path("wal-replay");
     let options = DbOptions::persistent(&path);

@@ -1563,3 +1563,47 @@ Record only evidence that can change planning or durable decisions.
 - Choose the next phase from fresh evidence. API polish, release packaging,
   integration examples, or production-hardening audits are the likely next
   candidates.
+
+## 2026-05-25: API Polish Helpers Passed
+
+### Observation
+
+- `Db` now exposes `open_memory`, `open_persistent`, and `open_read_only` for
+  common open paths.
+- `DbOptions` now has `persistent_read_only`, `with_durability`, and
+  `read_only` helpers.
+- `KeyspaceOptions` now has helpers for prefix extractor and blob threshold
+  configuration.
+- `WriteOptions` now has named constructors for buffered, flush, sync-data, and
+  sync-all writes.
+- `Keyspace` now has `insert_with_options`, `remove_with_options`, and
+  `remove_range_with_options` for single-key helpers that need explicit write
+  options while preserving the existing no-options helpers.
+- README, usage docs, quickstart, scaffold tests, and persistent helper tests
+  now use or validate the shorter API paths.
+
+### Interpretation
+
+- Phase 5 satisfies the API-polish acceptance gate for common open and
+  single-key write paths.
+- Storage behavior is unchanged; the new helpers route through the existing
+  option structs and write path.
+
+### Verification
+
+- `cargo run --example quickstart`
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+- `git diff --check`
+- forbidden terminology scan over source, tests, phase notes, benchmark files,
+  docs, README, and examples
+
+### Remaining Blockers
+
+- None recorded for Phase 5.
+
+### Recommended Next Action
+
+- Start production hardening with an audit slice that checks operational failure
+  modes before choosing code changes.

@@ -27,10 +27,10 @@ trine-kv = { path = "../trine-kv" }
 ## Minimal Example
 
 ```rust
-use trine_kv::{Db, DbOptions, KeyspaceOptions};
+use trine_kv::{Db, KeyspaceOptions};
 
 fn main() -> trine_kv::Result<()> {
-    let db = Db::memory(DbOptions::memory())?;
+    let db = Db::open_memory()?;
     let users = db.keyspace("users", KeyspaceOptions::default())?;
 
     users.insert(b"user:001", b"Ada")?;

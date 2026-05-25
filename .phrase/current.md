@@ -6,52 +6,50 @@ Complete
 
 ## Goal
 
-Write usage documentation that lets a Rust user try Trine KV and understand the
-main v1 API without reading the engine internals.
+Polish the public v1 API so common usage paths need less caller-side boilerplate
+without changing storage behavior.
 
 ## Entry Condition
 
-- Phase 3 is complete by the v1 acceptance gate.
-- V1 implementation, benchmark baseline, and durability notes are committed.
+- Phase 4 usage documentation is complete.
+- Quickstart example and v1 tests pass.
 
 ## Scope
 
-- README entry point.
-- Runnable quickstart example.
-- Usage guide for opening databases, keyspaces, writes, reads, iteration,
-  snapshots, transactions, durability, maintenance, stats, and recovery limits.
-- Keep documentation aligned with the implemented public API.
+- Ergonomic constructors and helpers for public options.
+- Keyspace convenience methods that preserve batch/transaction semantics.
+- Documentation and examples updated only where the API becomes simpler.
 
 ## Out Of Scope
 
-- Changing storage-engine behavior while writing docs, unless documentation
-  exposes a clear contract bug.
-- Publishing crate/package metadata beyond existing `Cargo.toml`.
-- Pre-splitting release, integration, or production-hardening work.
+- Changing MVCC, WAL, SSTable, manifest, compaction, transaction,
+  prefix-filter, compression, or search-policy behavior.
+- Production-hardening audits; that is the next phase.
+- Publishing or packaging work.
 
 ## Acceptance Gate
 
-- `cargo run --example quickstart` passes.
+- API examples compile and run.
 - `cargo fmt --check`, `cargo clippy`, `cargo test`, and `git diff --check`
   pass.
-- Usage docs avoid forbidden terminology and do not overstate durability.
+- Usage docs remain accurate and avoid forbidden terminology.
 
 ## Active Task Slice
 
 ```text
-task036 [x] goal:usage docs and runnable quickstart cover the v1 public API entry path | scope:README.md,docs/usage.md,examples/quickstart.rs,.phrase/current.md,.phrase/evidence.md | verify:cargo run --example quickstart + cargo fmt --check + cargo clippy + cargo test + git diff --check
+task037 [x] goal:common open and single-key write paths need less struct boilerplate | scope:src/db.rs,src/options.rs,src/keyspace.rs,README.md,docs/usage.md,examples/quickstart.rs,tests,.phrase/current.md,.phrase/evidence.md | verify:cargo run --example quickstart + cargo fmt --check + cargo clippy + cargo test + git diff --check
 ```
 
 ## Known Blockers
 
-- None recorded for Phase 4.
+- None recorded for Phase 5.
 
 ## Evidence To Record
 
-- Quickstart example validation.
-- Documentation coverage and boundary notes.
+- API helper validation.
+- Example and docs alignment.
 
 ## Next Phase Recommendation
 
-Start the next phase from fresh evidence. Good candidates are API polish,
-release packaging, integration examples, or production-hardening audits.
+Start production hardening from an audit slice. Do not assume the first
+hardening change before checking operational failure modes.

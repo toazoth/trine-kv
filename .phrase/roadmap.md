@@ -73,3 +73,30 @@ v1 API safely.
   batches, snapshots, transactions, range/prefix scans, durability, maintenance,
   stats, and recovery boundaries.
 - At least one example program compiles and runs with `cargo run --example`.
+
+### Phase 5: Polish Public API
+
+**Status**: Complete
+
+**Goal**: Reduce first-use friction in the v1 public API without changing the
+storage contract.
+
+**Entry Condition**: Phase 4 complete.
+
+**Acceptance Gate**:
+
+- Common open and write-option paths need less caller-side struct boilerplate.
+- Existing v1 tests and examples keep passing.
+- Usage docs stay aligned with the polished API.
+
+### Phase 6: Production Hardening
+
+**Status**: Planned
+
+**Goal**: Audit and harden operational behavior after API polish lands.
+
+**Entry Condition**: Phase 5 complete.
+
+**Acceptance Gate**:
+
+- To be defined from fresh hardening evidence at phase start.

@@ -116,6 +116,24 @@ impl DbOptions {
             ..Self::default()
         }
     }
+
+    #[must_use]
+    pub fn persistent_read_only(path: impl Into<PathBuf>) -> Self {
+        Self::persistent(path).read_only()
+    }
+
+    #[must_use]
+    pub const fn with_durability(mut self, durability: DurabilityMode) -> Self {
+        self.durability = durability;
+        self
+    }
+
+    #[must_use]
+    pub const fn read_only(mut self) -> Self {
+        self.read_only = true;
+        self.create_if_missing = false;
+        self
+    }
 }
 
 impl Default for DbOptions {
@@ -152,6 +170,18 @@ pub struct KeyspaceOptions {
 impl KeyspaceOptions {
     pub const DEFAULT_BLOCK_BYTES: usize = 16 * 1024;
     pub const DEFAULT_BLOB_THRESHOLD_BYTES: usize = 1024 * 1024;
+
+    #[must_use]
+    pub fn with_prefix_extractor(mut self, prefix_extractor: PrefixExtractor) -> Self {
+        self.prefix_extractor = prefix_extractor;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_blob_threshold_bytes(mut self, blob_threshold_bytes: usize) -> Self {
+        self.blob_threshold_bytes = blob_threshold_bytes;
+        self
+    }
 }
 
 impl Default for KeyspaceOptions {
@@ -172,4 +202,31 @@ impl Default for KeyspaceOptions {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WriteOptions {
     pub durability: DurabilityMode,
+}
+
+impl WriteOptions {
+    #[must_use]
+    pub const fn new(durability: DurabilityMode) -> Self {
+        Self { durability }
+    }
+
+    #[must_use]
+    pub const fn buffered() -> Self {
+        Self::new(DurabilityMode::Buffered)
+    }
+
+    #[must_use]
+    pub const fn flush() -> Self {
+        Self::new(DurabilityMode::Flush)
+    }
+
+    #[must_use]
+    pub const fn sync_data() -> Self {
+        Self::new(DurabilityMode::SyncData)
+    }
+
+    #[must_use]
+    pub const fn sync_all() -> Self {
+        Self::new(DurabilityMode::SyncAll)
+    }
 }

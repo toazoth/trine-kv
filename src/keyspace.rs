@@ -4,7 +4,7 @@ use crate::{
     iterator::{Direction, Iter},
     options::{KeyspaceOptions, WriteOptions},
     snapshot::Snapshot,
-    types::{KeyRange, Value},
+    types::{CommitInfo, KeyRange, Value},
     write_batch::WriteBatch,
 };
 
@@ -68,21 +68,49 @@ impl Keyspace {
     }
 
     pub fn insert(&self, key: impl Into<Vec<u8>>, value: impl Into<Value>) -> Result<()> {
+        self.insert_with_options(key, value, WriteOptions::default())
+            .map(|_| ())
+    }
+
+    pub fn insert_with_options(
+        &self,
+        key: impl Into<Vec<u8>>,
+        value: impl Into<Value>,
+        options: WriteOptions,
+    ) -> Result<CommitInfo> {
         let mut batch = WriteBatch::new();
         batch.insert(self.name.as_str(), key, value);
-        self.db.write(batch, WriteOptions::default()).map(|_| ())
+        self.db.write(batch, options)
     }
 
     pub fn remove(&self, key: impl Into<Vec<u8>>) -> Result<()> {
+        self.remove_with_options(key, WriteOptions::default())
+            .map(|_| ())
+    }
+
+    pub fn remove_with_options(
+        &self,
+        key: impl Into<Vec<u8>>,
+        options: WriteOptions,
+    ) -> Result<CommitInfo> {
         let mut batch = WriteBatch::new();
         batch.remove(self.name.as_str(), key);
-        self.db.write(batch, WriteOptions::default()).map(|_| ())
+        self.db.write(batch, options)
     }
 
     pub fn remove_range(&self, range: KeyRange) -> Result<()> {
+        self.remove_range_with_options(range, WriteOptions::default())
+            .map(|_| ())
+    }
+
+    pub fn remove_range_with_options(
+        &self,
+        range: KeyRange,
+        options: WriteOptions,
+    ) -> Result<CommitInfo> {
         let mut batch = WriteBatch::new();
         batch.remove_range(self.name.as_str(), range);
-        self.db.write(batch, WriteOptions::default()).map(|_| ())
+        self.db.write(batch, options)
     }
 
     pub fn range(&self, range: &KeyRange) -> Result<Iter> {

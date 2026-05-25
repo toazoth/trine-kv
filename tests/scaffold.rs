@@ -1,12 +1,12 @@
 use trine_kv::{
-    CompressionProfile, Db, DbOptions, Direction, KeyRange, KeyspaceOptions, PrefixExtractor,
-    Sequence, WriteBatch,
+    CompressionProfile, Db, Direction, KeyRange, KeyspaceOptions, PrefixExtractor, Sequence,
+    WriteBatch,
     codec::{BlockCodec, CodecId, FastLz4BlockCodec, NoneCodec},
 };
 
 #[test]
 fn scaffold_exposes_v1_public_boundaries() {
-    let db = Db::memory(DbOptions::memory()).expect("memory db scaffold opens");
+    let db = Db::open_memory().expect("memory db scaffold opens");
     let keyspace = db
         .keyspace("default", KeyspaceOptions::default())
         .expect("keyspace scaffold opens");

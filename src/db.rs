@@ -128,8 +128,20 @@ impl Db {
     pub fn open(options: DbOptions) -> Result<Self> {
         match options.storage_mode {
             StorageMode::InMemory => Self::memory(options),
-            StorageMode::Persistent { .. } => Self::open_persistent(options),
+            StorageMode::Persistent { .. } => Self::open_persistent_with_options(options),
         }
+    }
+
+    pub fn open_memory() -> Result<Self> {
+        Self::memory(DbOptions::memory())
+    }
+
+    pub fn open_persistent(path: impl Into<std::path::PathBuf>) -> Result<Self> {
+        Self::open(DbOptions::persistent(path))
+    }
+
+    pub fn open_read_only(path: impl Into<std::path::PathBuf>) -> Result<Self> {
+        Self::open(DbOptions::persistent_read_only(path))
     }
 
     pub fn memory(mut options: DbOptions) -> Result<Self> {
@@ -158,7 +170,7 @@ impl Db {
         })
     }
 
-    fn open_persistent(options: DbOptions) -> Result<Self> {
+    fn open_persistent_with_options(options: DbOptions) -> Result<Self> {
         validate_options(&options)?;
         let block_cache_bytes = options.block_cache_bytes;
         let StorageMode::Persistent { path } = &options.storage_mode else {

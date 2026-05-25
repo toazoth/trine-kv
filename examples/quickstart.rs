@@ -9,20 +9,15 @@ fn main() -> trine_kv::Result<()> {
         std::fs::remove_dir_all(&path)?;
     }
 
-    let db = Db::open(DbOptions::persistent(&path))?;
+    let db = Db::open(DbOptions::persistent(&path).with_durability(DurabilityMode::Flush))?;
     let users = db.keyspace("users", user_keyspace_options())?;
 
-    users.insert(b"user:001", b"Ada")?;
+    users.insert_with_options(b"user:001", b"Ada", WriteOptions::sync_all())?;
 
     let mut batch = WriteBatch::new();
     batch.insert("users", b"user:002", b"Lin");
     batch.insert("users", b"team:core", b"database");
-    db.write(
-        batch,
-        WriteOptions {
-            durability: DurabilityMode::SyncAll,
-        },
-    )?;
+    db.write(batch, WriteOptions::sync_all())?;
 
     assert_eq!(users.get(b"user:001")?, Some(b"Ada".to_vec()));
 
@@ -70,10 +65,7 @@ fn main() -> trine_kv::Result<()> {
 }
 
 fn user_keyspace_options() -> KeyspaceOptions {
-    KeyspaceOptions {
-        prefix_extractor: PrefixExtractor::Separator(b':'),
-        ..KeyspaceOptions::default()
-    }
+    KeyspaceOptions::default().with_prefix_extractor(PrefixExtractor::Separator(b':'))
 }
 
 fn display_key(bytes: &[u8]) -> String {
