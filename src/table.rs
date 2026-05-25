@@ -12,8 +12,9 @@ use crate::{
     error::{Error, Result},
     filter::{PointKeyFilter, PrefixFilter},
     internal_key::{InternalKey, ValueKind},
-    options::{FilterPolicy, PrefixFilterPolicy},
+    options::{FilterPolicy, IndexSearchPolicy, PrefixFilterPolicy},
     prefix::PrefixExtractor,
+    search,
     types::{KeyRange, Sequence},
 };
 
@@ -206,8 +207,9 @@ impl TableDataBlock {
         &self,
         point_records: &'records [TablePointRecord],
         key: &[u8],
+        policy: IndexSearchPolicy,
     ) -> Vec<&'records TablePointRecord> {
-        let start = self.restart_index_for_key(point_records, key);
+        let start = self.restart_index_for_key(point_records, key, policy);
         point_records[start..self.record_range.end]
             .iter()
             .take_while(move |record| record.internal_key.user_key() <= key)
@@ -219,8 +221,9 @@ impl TableDataBlock {
         &self,
         point_records: &'records [TablePointRecord],
         range: &KeyRange,
+        policy: IndexSearchPolicy,
     ) -> Vec<&'records TablePointRecord> {
-        let start = self.restart_index_for_bound(point_records, &range.start);
+        let start = self.restart_index_for_bound(point_records, &range.start, policy);
         point_records[start..self.record_range.end]
             .iter()
             .skip_while(move |record| {
@@ -234,8 +237,9 @@ impl TableDataBlock {
         &self,
         point_records: &'records [TablePointRecord],
         prefix: &[u8],
+        policy: IndexSearchPolicy,
     ) -> Vec<&'records TablePointRecord> {
-        let start = self.restart_index_for_key(point_records, prefix);
+        let start = self.restart_index_for_key(point_records, prefix, policy);
         point_records[start..self.record_range.end]
             .iter()
             .skip_while(move |record| record.internal_key.user_key() < prefix)
@@ -258,32 +262,45 @@ impl TableDataBlock {
     }
 
     fn may_contain_prefix(&self, prefix: &[u8], extractor: &PrefixExtractor) -> bool {
-        self.largest_internal_key.user_key() >= prefix
-            && (self.smallest_internal_key.user_key().starts_with(prefix)
-                || self.smallest_internal_key.user_key() <= prefix)
+        self.prefix_bounds_may_overlap(prefix)
             && self
                 .prefix_filter
                 .as_ref()
                 .is_none_or(|filter| filter.may_contain_query_prefix(prefix, extractor))
     }
 
+    fn prefix_bounds_may_overlap(&self, prefix: &[u8]) -> bool {
+        self.largest_internal_key.user_key() >= prefix
+            && (self.smallest_internal_key.user_key().starts_with(prefix)
+                || self.smallest_internal_key.user_key() <= prefix)
+    }
+
     fn restart_index_for_bound(
         &self,
         point_records: &[TablePointRecord],
         bound: &Bound<Vec<u8>>,
+        policy: IndexSearchPolicy,
     ) -> usize {
         match bound {
             Bound::Included(key) | Bound::Excluded(key) => {
-                self.restart_index_for_key(point_records, key)
+                self.restart_index_for_key(point_records, key, policy)
             }
             Bound::Unbounded => self.record_range.start,
         }
     }
 
-    fn restart_index_for_key(&self, point_records: &[TablePointRecord], key: &[u8]) -> usize {
-        let upper = self
-            .restart_indices
-            .partition_point(|index| point_records[*index].internal_key.user_key() <= key);
+    fn restart_index_for_key(
+        &self,
+        point_records: &[TablePointRecord],
+        key: &[u8],
+        policy: IndexSearchPolicy,
+    ) -> usize {
+        let upper = search::partition_point_by(self.restart_indices.len(), policy, |index| {
+            point_records[self.restart_indices[index]]
+                .internal_key
+                .user_key()
+                <= key
+        });
         if upper == 0 {
             self.record_range.start
         } else {
@@ -334,19 +351,39 @@ impl Table {
             })
     }
 
-    pub(crate) fn point_records_for_key(&self, key: &[u8]) -> Vec<&TablePointRecord> {
-        self.data_blocks
+    pub(crate) fn point_records_for_key(
+        &self,
+        key: &[u8],
+        policy: IndexSearchPolicy,
+    ) -> Vec<&TablePointRecord> {
+        let Some(start) = self.first_block_for_key(key, policy) else {
+            return Vec::new();
+        };
+
+        self.data_blocks[start..]
             .iter()
+            .take_while(|block| block.smallest_internal_key.user_key() <= key)
             .filter(|block| block.may_contain_key(key))
-            .flat_map(|block| block.point_records_for_key(&self.point_records, key))
+            .flat_map(|block| block.point_records_for_key(&self.point_records, key, policy))
             .collect()
     }
 
-    pub(crate) fn point_records_in_range(&self, range: &KeyRange) -> Vec<&TablePointRecord> {
-        self.data_blocks
+    pub(crate) fn point_records_in_range(
+        &self,
+        range: &KeyRange,
+        policy: IndexSearchPolicy,
+    ) -> Vec<&TablePointRecord> {
+        let Some(start) = self.first_block_for_range(range, policy) else {
+            return Vec::new();
+        };
+
+        self.data_blocks[start..]
             .iter()
+            .take_while(|block| {
+                !key_is_after_end(block.smallest_internal_key.user_key(), &range.end)
+            })
             .filter(|block| block.overlaps_range(range))
-            .flat_map(|block| block.point_records_in_range(&self.point_records, range))
+            .flat_map(|block| block.point_records_in_range(&self.point_records, range, policy))
             .collect()
     }
 
@@ -354,11 +391,17 @@ impl Table {
         &self,
         prefix: &[u8],
         extractor: &PrefixExtractor,
+        policy: IndexSearchPolicy,
     ) -> Vec<&TablePointRecord> {
-        self.data_blocks
+        let Some(start) = self.first_block_for_prefix(prefix, policy) else {
+            return Vec::new();
+        };
+
+        self.data_blocks[start..]
             .iter()
+            .take_while(|block| block.prefix_bounds_may_overlap(prefix))
             .filter(|block| block.may_contain_prefix(prefix, extractor))
-            .flat_map(|block| block.point_records_with_prefix(&self.point_records, prefix))
+            .flat_map(|block| block.point_records_with_prefix(&self.point_records, prefix, policy))
             .collect()
     }
 
@@ -374,6 +417,30 @@ impl Table {
         self.prefix_filter
             .as_ref()
             .is_none_or(|filter| filter.may_contain_query_prefix(prefix, extractor))
+    }
+
+    fn first_block_for_key(&self, key: &[u8], policy: IndexSearchPolicy) -> Option<usize> {
+        let index = search::partition_point_by(self.data_blocks.len(), policy, |index| {
+            self.data_blocks[index].largest_internal_key.user_key() < key
+        });
+        (index < self.data_blocks.len()).then_some(index)
+    }
+
+    fn first_block_for_range(&self, range: &KeyRange, policy: IndexSearchPolicy) -> Option<usize> {
+        let index = search::partition_point_by(self.data_blocks.len(), policy, |index| {
+            key_is_before_start(
+                self.data_blocks[index].largest_internal_key.user_key(),
+                &range.start,
+            )
+        });
+        (index < self.data_blocks.len()).then_some(index)
+    }
+
+    fn first_block_for_prefix(&self, prefix: &[u8], policy: IndexSearchPolicy) -> Option<usize> {
+        let index = search::partition_point_by(self.data_blocks.len(), policy, |index| {
+            self.data_blocks[index].largest_internal_key.user_key() < prefix
+        });
+        (index < self.data_blocks.len()).then_some(index)
     }
 }
 
@@ -1754,15 +1821,22 @@ mod tests {
         );
 
         let point_keys = table
-            .point_records_for_key(b"key-127")
+            .point_records_for_key(b"key-127", IndexSearchPolicy::Binary)
             .into_iter()
             .map(|record| record.internal_key.user_key().to_vec())
             .collect::<Vec<_>>();
         assert_eq!(point_keys, vec![b"key-127".to_vec()]);
-        assert!(table.point_records_for_key(b"missing").is_empty());
+        assert!(
+            table
+                .point_records_for_key(b"missing", IndexSearchPolicy::Binary)
+                .is_empty()
+        );
 
         let range_keys = table
-            .point_records_in_range(&KeyRange::half_open(b"key-020", b"key-030"))
+            .point_records_in_range(
+                &KeyRange::half_open(b"key-020", b"key-030"),
+                IndexSearchPolicy::Binary,
+            )
             .into_iter()
             .map(|record| record.internal_key.user_key().to_vec())
             .collect::<Vec<_>>();
@@ -1772,7 +1846,11 @@ mod tests {
         assert_eq!(range_keys, expected_range);
 
         let prefix_keys = table
-            .point_records_with_prefix(b"key-12", &PrefixExtractor::Disabled)
+            .point_records_with_prefix(
+                b"key-12",
+                &PrefixExtractor::Disabled,
+                IndexSearchPolicy::Binary,
+            )
             .into_iter()
             .map(|record| record.internal_key.user_key().to_vec())
             .collect::<Vec<_>>();
@@ -1780,6 +1858,46 @@ mod tests {
             .map(|index| format!("key-{index:03}").into_bytes())
             .collect::<Vec<_>>();
         assert_eq!(prefix_keys, expected_prefix);
+    }
+
+    #[test]
+    fn search_policies_keep_table_candidate_results_stable() {
+        let table = table_with_filters(160, CodecId::None);
+        let expected_range = (20..30)
+            .map(|index| format!("key-{index:03}").into_bytes())
+            .collect::<Vec<_>>();
+        let expected_prefix = (120..130)
+            .map(|index| format!("key-{index:03}").into_bytes())
+            .collect::<Vec<_>>();
+
+        for policy in [
+            IndexSearchPolicy::Linear,
+            IndexSearchPolicy::Binary,
+            IndexSearchPolicy::Auto,
+            IndexSearchPolicy::Eytzinger,
+            IndexSearchPolicy::GallopingWithHint,
+        ] {
+            let point_keys = table
+                .point_records_for_key(b"key-127", policy)
+                .into_iter()
+                .map(|record| record.internal_key.user_key().to_vec())
+                .collect::<Vec<_>>();
+            assert_eq!(point_keys, vec![b"key-127".to_vec()]);
+
+            let range_keys = table
+                .point_records_in_range(&KeyRange::half_open(b"key-020", b"key-030"), policy)
+                .into_iter()
+                .map(|record| record.internal_key.user_key().to_vec())
+                .collect::<Vec<_>>();
+            assert_eq!(range_keys, expected_range, "policy {policy:?}");
+
+            let prefix_keys = table
+                .point_records_with_prefix(b"key-12", &PrefixExtractor::FixedLen(6), policy)
+                .into_iter()
+                .map(|record| record.internal_key.user_key().to_vec())
+                .collect::<Vec<_>>();
+            assert_eq!(prefix_keys, expected_prefix, "policy {policy:?}");
+        }
     }
 
     #[test]
@@ -1815,7 +1933,11 @@ mod tests {
 
         let decoded = decode_table(&table_file_bytes(&payload)).expect("table decodes");
         let prefix_keys = decoded
-            .point_records_with_prefix(b"key-12", &PrefixExtractor::FixedLen(6))
+            .point_records_with_prefix(
+                b"key-12",
+                &PrefixExtractor::FixedLen(6),
+                IndexSearchPolicy::Binary,
+            )
             .into_iter()
             .map(|record| record.internal_key.user_key().to_vec())
             .collect::<Vec<_>>();

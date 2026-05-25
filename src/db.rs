@@ -1059,7 +1059,7 @@ fn collect_point_key_records(
         }
         records.extend(
             table
-                .point_records_for_key(key)
+                .point_records_for_key(key, state.options.index_search_policy)
                 .into_iter()
                 .map(|record| (record.internal_key.clone(), record.value.clone())),
         );
@@ -1091,7 +1091,7 @@ fn collect_range_point_records(
     for table in tables.iter() {
         records.extend(
             table
-                .point_records_in_range(range)
+                .point_records_in_range(range, state.options.index_search_policy)
                 .into_iter()
                 .map(|record| (record.internal_key.clone(), record.value.clone())),
         );
@@ -1126,7 +1126,11 @@ fn collect_prefix_point_records(
         }
         records.extend(
             table
-                .point_records_with_prefix(prefix, &state.options.prefix_extractor)
+                .point_records_with_prefix(
+                    prefix,
+                    &state.options.prefix_extractor,
+                    state.options.index_search_policy,
+                )
                 .into_iter()
                 .map(|record| (record.internal_key.clone(), record.value.clone())),
         );

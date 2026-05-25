@@ -1,5 +1,7 @@
 use std::cmp::Ordering;
 
+use crate::options::IndexSearchPolicy;
+
 #[must_use]
 pub fn seek_ge<T: Ord>(items: &[T], target: &T) -> Option<usize> {
     match items.binary_search(target) {
@@ -33,9 +35,52 @@ pub fn advance_to<T: Ord>(items: &[T], current: usize, target: &T) -> Option<usi
     }
 }
 
+pub(crate) fn partition_point_by(
+    len: usize,
+    policy: IndexSearchPolicy,
+    predicate: impl FnMut(usize) -> bool,
+) -> usize {
+    // Callers keep canonical sorted arrays for validation and scans. Policy
+    // variants can get specialized layouts later behind this single boundary.
+    match policy {
+        IndexSearchPolicy::Linear => linear_partition_point(len, predicate),
+        IndexSearchPolicy::Auto if len <= 8 => linear_partition_point(len, predicate),
+        IndexSearchPolicy::Auto
+        | IndexSearchPolicy::Binary
+        | IndexSearchPolicy::Eytzinger
+        | IndexSearchPolicy::GallopingWithHint => binary_partition_point(len, predicate),
+    }
+}
+
+fn linear_partition_point(len: usize, mut predicate: impl FnMut(usize) -> bool) -> usize {
+    for index in 0..len {
+        if !predicate(index) {
+            return index;
+        }
+    }
+    len
+}
+
+fn binary_partition_point(len: usize, mut predicate: impl FnMut(usize) -> bool) -> usize {
+    let mut left = 0;
+    let mut right = len;
+
+    while left < right {
+        let middle = left + (right - left) / 2;
+        if predicate(middle) {
+            left = middle + 1;
+        } else {
+            right = middle;
+        }
+    }
+
+    left
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{advance_to, seek_ge, seek_gt, seek_le};
+    use super::{advance_to, partition_point_by, seek_ge, seek_gt, seek_le};
+    use crate::options::IndexSearchPolicy;
 
     #[test]
     fn sorted_search_boundaries_are_stable() {
@@ -52,5 +97,21 @@ mod tests {
         assert_eq!(seek_le(&items, &6), Some(2));
 
         assert_eq!(advance_to(&items, 1, &6), Some(3));
+    }
+
+    #[test]
+    fn partition_point_policy_dispatch_keeps_sorted_boundaries() {
+        let items = [1, 3, 5, 7, 9, 11, 13, 15, 17];
+
+        for policy in [
+            IndexSearchPolicy::Linear,
+            IndexSearchPolicy::Binary,
+            IndexSearchPolicy::Auto,
+            IndexSearchPolicy::Eytzinger,
+            IndexSearchPolicy::GallopingWithHint,
+        ] {
+            let index = partition_point_by(items.len(), policy, |index| items[index] <= 10);
+            assert_eq!(index, 5, "policy {policy:?} changed the boundary");
+        }
     }
 }

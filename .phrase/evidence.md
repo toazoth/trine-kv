@@ -1058,3 +1058,42 @@ Record only evidence that can change planning or durable decisions.
 
 - Implement search-policy dispatch for table/block candidate lookup, keeping
   canonical sorted index order as the validation and traversal source.
+
+## 2026-05-25: Search Policy Dispatch Passed
+
+### Observation
+
+- The search module now exposes a policy-dispatched partition-point helper.
+- Table reads use the configured keyspace search policy when choosing candidate
+  data blocks and when seeking inside block restart points.
+- Linear, binary, auto, Eytzinger, and galloping-with-hint policy variants all
+  preserve the same point, range, and prefix read results over canonical sorted
+  arrays.
+- Tests cover search boundary dispatch, table candidate stability across all
+  policies, and persistent point/range/prefix reads across all policies before
+  and after reopen.
+
+### Interpretation
+
+- Task025 is complete for wiring search policy into the current table read
+  path without changing visible results.
+- Specialized layouts or cursor hints can now be added behind the search module
+  boundary if benchmarks justify them, without changing table correctness
+  tests.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+- `git diff --check`
+
+### Remaining Blockers
+
+- No named implementation blocker remains from the current task list; the v1
+  acceptance audit is still pending.
+
+### Recommended Next Action
+
+- Run a v1 protocol acceptance audit and turn any real remaining gap into the
+  next measured slice.

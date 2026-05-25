@@ -647,6 +647,104 @@ fn persistent_table_block_index_reads_points_and_ranges() {
 }
 
 #[test]
+fn persistent_index_search_policies_preserve_table_reads() {
+    let path = temp_db_path("table-search-policies");
+    let options = DbOptions::persistent(&path);
+    let policies = [
+        ("linear", IndexSearchPolicy::Linear),
+        ("binary", IndexSearchPolicy::Binary),
+        ("auto", IndexSearchPolicy::Auto),
+        ("eytzinger", IndexSearchPolicy::Eytzinger),
+        ("galloping", IndexSearchPolicy::GallopingWithHint),
+    ];
+
+    {
+        let db = Db::open(options.clone()).expect("persistent db opens");
+        for (name, policy) in policies {
+            let keyspace_options = KeyspaceOptions {
+                index_search_policy: policy,
+                prefix_extractor: PrefixExtractor::FixedLen(6),
+                ..KeyspaceOptions::default()
+            };
+            let keyspace = db
+                .keyspace(name, keyspace_options)
+                .expect("policy keyspace opens");
+            for index in 0..80 {
+                keyspace
+                    .insert(
+                        format!("key-{index:03}").into_bytes(),
+                        format!("value-{index:03}").into_bytes(),
+                    )
+                    .expect("write policy row");
+            }
+        }
+        db.flush().expect("flush policy tables");
+
+        for (name, policy) in policies {
+            let keyspace_options = KeyspaceOptions {
+                index_search_policy: policy,
+                prefix_extractor: PrefixExtractor::FixedLen(6),
+                ..KeyspaceOptions::default()
+            };
+            let keyspace = db
+                .keyspace(name, keyspace_options)
+                .expect("policy keyspace reuses options");
+            assert_eq!(
+                keyspace.get(b"key-042").expect("policy point reads"),
+                Some(b"value-042".to_vec())
+            );
+            assert_eq!(
+                collect_rows(
+                    keyspace
+                        .range(&KeyRange::half_open(b"key-020", b"key-023"))
+                        .expect("policy range reads")
+                ),
+                vec![
+                    (b"key-020".to_vec(), b"value-020".to_vec()),
+                    (b"key-021".to_vec(), b"value-021".to_vec()),
+                    (b"key-022".to_vec(), b"value-022".to_vec()),
+                ],
+                "policy {policy:?} range changed"
+            );
+            assert_eq!(
+                collect_rows(keyspace.prefix(b"key-04").expect("policy prefix reads")),
+                (40..50)
+                    .map(|index| {
+                        (
+                            format!("key-{index:03}").into_bytes(),
+                            format!("value-{index:03}").into_bytes(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                "policy {policy:?} prefix changed"
+            );
+        }
+    }
+
+    fs::remove_file(wal::wal_path(&path)).expect("remove WAL after search policy flush");
+
+    {
+        let db = Db::open(options).expect("persistent db reopens");
+        for (name, policy) in policies {
+            let keyspace_options = KeyspaceOptions {
+                index_search_policy: policy,
+                prefix_extractor: PrefixExtractor::FixedLen(6),
+                ..KeyspaceOptions::default()
+            };
+            let keyspace = db
+                .keyspace(name, keyspace_options)
+                .expect("policy keyspace reopens");
+            assert_eq!(
+                keyspace.get(b"key-042").expect("policy point reopens"),
+                Some(b"value-042".to_vec())
+            );
+        }
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
 fn persistent_table_compression_profiles_round_trip() {
     let path = temp_db_path("table-compression");
     let options = DbOptions::persistent(&path);
