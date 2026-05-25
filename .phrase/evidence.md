@@ -1097,3 +1097,48 @@ Record only evidence that can change planning or durable decisions.
 
 - Run a v1 protocol acceptance audit and turn any real remaining gap into the
   next measured slice.
+
+## 2026-05-25: V1 Acceptance Audit Found Remaining Gaps
+
+### Observation
+
+- The current test gate passes, and the latest slices cover blob cleanup,
+  startup unreferenced-file detection, partitioned table filters, and
+  search-policy dispatch.
+- The protocol startup flow requires an exclusive process lock, but no lock file
+  or equivalent directory ownership mechanism exists yet.
+- The protocol calls for leveled/background compaction, while the current engine
+  exposes manual compaction over the table list.
+- `DbStats` only reports a small subset of required metrics, cache types exist
+  without cache behavior, and no benchmark outputs or durability documentation
+  exist in the repository.
+
+### Interpretation
+
+- Phase 3 should continue; v1 is not ready to close.
+- The next correctness blocker is persistent process locking, because two
+  writers opening the same directory can violate the storage contract before
+  compaction, metrics, or docs matter.
+
+### Verification
+
+- Manual audit against `.phrase/protocol/trine-kv-v1-spec.md` sections 25,
+  28, 30, and 31.
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+- `git diff --check`
+
+### Remaining Blockers
+
+- Persistent process locking.
+- Leveled/background compaction.
+- Required metrics and cache behavior.
+- Required benchmark outputs.
+- Durability documentation.
+
+### Recommended Next Action
+
+- Implement persistent process locking as the next measured slice, failing
+  closed on a second simultaneous opener and releasing the lock when the last
+  database handle drops.
