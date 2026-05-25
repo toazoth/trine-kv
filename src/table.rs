@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs::{self, File},
     io::{Read, Write},
     ops::{Bound, Range},
@@ -49,7 +50,7 @@ const PREFIX_EXTRACTOR_FIXED_LEN: u8 = 1;
 const PREFIX_EXTRACTOR_SEPARATOR: u8 = 2;
 const PREFIX_EXTRACTOR_CUSTOM: u8 = 3;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TableId(pub u64);
 
 impl TableId {
@@ -361,6 +362,42 @@ pub fn table_path(db_path: &Path, table_id: TableId) -> PathBuf {
         "table-{id:020}.{TABLE_FILE_EXTENSION}",
         id = table_id.get()
     ))
+}
+
+pub(crate) fn list_table_file_ids(db_path: &Path) -> Result<BTreeSet<TableId>> {
+    let mut table_ids = BTreeSet::new();
+
+    for entry in fs::read_dir(db_path)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+
+        let path = entry.path();
+        let has_table_extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case(TABLE_FILE_EXTENSION));
+        if !has_table_extension {
+            continue;
+        }
+
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let Some(table_id) = stem.strip_prefix("table-") else {
+            continue;
+        };
+        let table_id = table_id
+            .parse::<u64>()
+            .map(TableId)
+            .map_err(|_| Error::Corruption {
+                message: format!("invalid table file name: {}", path.display()),
+            })?;
+        table_ids.insert(table_id);
+    }
+
+    Ok(table_ids)
 }
 
 pub(crate) fn write_table(

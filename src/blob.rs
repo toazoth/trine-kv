@@ -69,14 +69,15 @@ pub(crate) fn list_blob_file_ids(db_path: &Path) -> Result<BTreeSet<u64>> {
             continue;
         }
 
-        let Some(file_id) = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .and_then(|stem| stem.strip_prefix("blob-"))
-            .and_then(|id| id.parse::<u64>().ok())
-        else {
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
             continue;
         };
+        let Some(file_id) = stem.strip_prefix("blob-") else {
+            continue;
+        };
+        let file_id = file_id.parse::<u64>().map_err(|_| Error::Corruption {
+            message: format!("invalid blob file name: {}", path.display()),
+        })?;
         file_ids.insert(file_id);
     }
 

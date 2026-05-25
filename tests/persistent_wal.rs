@@ -9,7 +9,7 @@ use std::{
 use trine_kv::{
     CompressionProfile, Db, DbOptions, DurabilityMode, Error, FailOnCorruptionPolicy, FilterPolicy,
     IndexSearchPolicy, KeyRange, KeyspaceOptions, PrefixExtractor, PrefixFilterPolicy, Sequence,
-    WriteBatch, WriteOptions, codec::CodecId, manifest, recovery, table, wal,
+    WriteBatch, WriteOptions, blob, codec::CodecId, manifest, recovery, table, wal,
 };
 
 fn temp_db_path(name: &str) -> PathBuf {
@@ -86,6 +86,13 @@ fn write_file(path: &std::path::Path, bytes: &[u8]) {
         .open(path)
         .expect("open test file");
     file.write_all(bytes).expect("write test file");
+}
+
+fn corruption_message(error: Error) -> String {
+    match error {
+        Error::Corruption { message } => message,
+        other => panic!("expected corruption error, got {other:?}"),
+    }
 }
 
 #[test]
@@ -298,6 +305,108 @@ fn persistent_recovery_repairs_safe_temporary_files_and_writes_report() {
             "blob-00000000000000000999.tmp".to_owned(),
             "table-00000000000000000999.tmp".to_owned(),
         ]
+    );
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_recovery_fails_closed_on_unreferenced_table_file() {
+    let path = temp_db_path("recovery-unreferenced-table");
+    let options = DbOptions::persistent(&path);
+    let unreferenced_table_path;
+
+    {
+        let db = Db::open(options.clone()).expect("persistent db opens");
+        let keyspace = db
+            .keyspace("default", KeyspaceOptions::default())
+            .expect("keyspace opens");
+        keyspace.insert(b"a", b"a1").expect("write row");
+        db.flush().expect("flush table");
+
+        let manifest_state =
+            manifest::read_manifest(&manifest::manifest_path(&path)).expect("manifest reads");
+        let table_id = manifest_state
+            .tables()
+            .get("default")
+            .and_then(|tables| tables.first())
+            .expect("default table exists")
+            .id;
+        unreferenced_table_path = table::table_path(&path, table::TableId(999));
+        fs::copy(table::table_path(&path, table_id), &unreferenced_table_path)
+            .expect("copy table file");
+    }
+
+    let message = corruption_message(
+        Db::open(options).expect_err("unreferenced table file must fail closed"),
+    );
+    assert!(message.contains("unreferenced table/blob files"));
+    assert!(message.contains("table-00000000000000000999.trinet"));
+    assert!(
+        unreferenced_table_path.exists(),
+        "startup should leave unreferenced table files for operator review"
+    );
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_recovery_fails_closed_on_unreferenced_blob_file_even_with_temp_repair_policy() {
+    let path = temp_db_path("recovery-unreferenced-blob");
+    let mut options = DbOptions::persistent(&path);
+    let keyspace_options = KeyspaceOptions {
+        blob_threshold_bytes: 8,
+        ..KeyspaceOptions::default()
+    };
+
+    {
+        let db = Db::open(options.clone()).expect("persistent db opens");
+        let keyspace = db
+            .keyspace("default", keyspace_options)
+            .expect("keyspace opens");
+        keyspace
+            .insert(b"a", b"large-value-a-large-value-a".to_vec())
+            .expect("write blob value");
+        db.flush().expect("flush blob table");
+    }
+
+    let unreferenced_blob_path = blob::blob_path(&path, 999);
+    write_file(&unreferenced_blob_path, b"unreferenced blob bytes");
+
+    options.fail_on_corruption = FailOnCorruptionPolicy::RepairSafeTemporaryFiles;
+    let message =
+        corruption_message(Db::open(options).expect_err("unreferenced blob file must fail closed"));
+    assert!(message.contains("unreferenced table/blob files"));
+    assert!(message.contains("blob-00000000000000000999.trineb"));
+    assert!(
+        unreferenced_blob_path.exists(),
+        "startup should not repair formal blob files automatically"
+    );
+    assert!(!recovery::recovery_report_path(&path).exists());
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_recovery_fails_closed_on_malformed_formal_storage_file_name() {
+    let path = temp_db_path("recovery-malformed-storage-file");
+    let options = DbOptions::persistent(&path);
+    let malformed_table_path = path.join("table-not-a-number.trinet");
+
+    {
+        let db = Db::open(options.clone()).expect("persistent db opens");
+        db.keyspace("default", KeyspaceOptions::default())
+            .expect("keyspace opens");
+    }
+
+    write_file(&malformed_table_path, b"not a valid table file");
+
+    let message =
+        corruption_message(Db::open(options).expect_err("malformed table file must fail closed"));
+    assert!(message.contains("invalid table file name"));
+    assert!(
+        malformed_table_path.exists(),
+        "startup should leave malformed formal files for operator review"
     );
 
     fs::remove_dir_all(path).expect("cleanup test db");

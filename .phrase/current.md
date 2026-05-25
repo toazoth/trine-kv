@@ -58,16 +58,18 @@ task019 [x] goal:persistent recovery fails closed on safe temporary files by def
 task020 [x] goal:manual compaction drops obsolete point versions only when active snapshot pins allow it | scope:src/snapshot.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test
 task021 [x] goal:manual compaction drops point/range tombstones only when the compaction scope proves they no longer hide retained values | scope:src/db.rs,src/manifest.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test
 task022 [x] goal:compaction removes blob files no longer referenced by live tables or active snapshots | scope:src/blob.rs,src/table.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test
+task023 [x] goal:persistent startup detects unreferenced table/blob files and handles them conservatively | scope:src/recovery.rs,src/db.rs,src/blob.rs,src/table.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test + git diff --check
 ```
 
 ## Known Blockers
 
-- Obsolete-file detection, partitioned filters/indexes, and optimized search
-  policies are not implemented yet.
+- Partitioned filters/indexes and optimized search policies are not
+  implemented yet.
 
 ## Evidence To Record
 
 - Phase 2 scaffold gate results.
 - Tombstone cleanup validation results.
 - Blob cleanup validation results.
-- Remaining blocker category after task022.
+- Obsolete-file detection validation results.
+- Remaining blocker category after task023.

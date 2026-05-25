@@ -1,12 +1,15 @@
 use std::{
+    collections::BTreeSet,
     fs::{self, File},
     io::{Read, Write},
     path::{Path, PathBuf},
 };
 
 use crate::{
+    blob,
     error::{Error, Result},
     options::FailOnCorruptionPolicy,
+    table::{self, TableId},
 };
 
 pub const RECOVERY_REPORT_FILE_NAME: &str = "RECOVERY_REPORT";
@@ -71,6 +74,27 @@ pub(crate) fn repair_safe_temporary_files(
     Ok(Some(report))
 }
 
+pub(crate) fn fail_on_unreferenced_storage_files(
+    db_path: &Path,
+    referenced_table_ids: &BTreeSet<TableId>,
+    referenced_blob_ids: &BTreeSet<u64>,
+) -> Result<()> {
+    // Formal table/blob files are stronger evidence than safe tmp files. Do
+    // not delete them during startup; report them so the operator can decide.
+    let unreferenced_files =
+        unreferenced_storage_files(db_path, referenced_table_ids, referenced_blob_ids)?;
+    if unreferenced_files.is_empty() {
+        return Ok(());
+    }
+
+    Err(Error::Corruption {
+        message: format!(
+            "unreferenced table/blob files require operator review: {}",
+            unreferenced_files.join(", ")
+        ),
+    })
+}
+
 struct TemporaryFile {
     name: String,
     path: PathBuf,
@@ -117,6 +141,38 @@ fn has_tmp_extension(name: &str) -> bool {
     Path::new(name)
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("tmp"))
+}
+
+fn unreferenced_storage_files(
+    db_path: &Path,
+    referenced_table_ids: &BTreeSet<TableId>,
+    referenced_blob_ids: &BTreeSet<u64>,
+) -> Result<Vec<String>> {
+    let mut files = Vec::new();
+
+    for table_id in table::list_table_file_ids(db_path)? {
+        if !referenced_table_ids.contains(&table_id) {
+            files.push(storage_file_name(&table::table_path(db_path, table_id))?);
+        }
+    }
+
+    for blob_id in blob::list_blob_file_ids(db_path)? {
+        if !referenced_blob_ids.contains(&blob_id) {
+            files.push(storage_file_name(&blob::blob_path(db_path, blob_id))?);
+        }
+    }
+
+    files.sort();
+    Ok(files)
+}
+
+fn storage_file_name(path: &Path) -> Result<String> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .ok_or_else(|| Error::Corruption {
+            message: format!("storage file name is not valid UTF-8: {}", path.display()),
+        })
 }
 
 fn write_recovery_report(db_path: &Path, report: &RecoveryReport) -> Result<()> {

@@ -979,3 +979,43 @@ Record only evidence that can change planning or durable decisions.
 
 - Implement obsolete-file detection during persistent startup, reporting
   unreferenced table/blob files without weakening fail-closed recovery behavior.
+
+## 2026-05-25: Obsolete File Detection Passed
+
+### Observation
+
+- Persistent startup now compares formal `table-*.trinet` files against the
+  manifest's referenced table ids.
+- Startup now compares formal `blob-*.trineb` files against blob references
+  found in loaded live tables.
+- Unreferenced formal table/blob files return `Corruption` and are left on disk
+  for operator review.
+- `RepairSafeTemporaryFiles` remains limited to known temporary files and does
+  not delete formal table/blob files.
+- Tests cover unreferenced table-file detection, unreferenced blob-file
+  detection under the temporary-file repair policy, malformed formal file-name
+  detection, and preservation of those files after startup fails.
+
+### Interpretation
+
+- Task023 is complete for conservative startup detection of unreferenced
+  storage files.
+- The next remaining blockers move out of recovery cleanup and into read-path
+  structure and search-policy work.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+- `git diff --check`
+
+### Remaining Blockers
+
+- Partitioned filters/indexes and optimized search policies remain future
+  blockers.
+
+### Recommended Next Action
+
+- Implement partitioned filters/indexes so point, range, and prefix reads can
+  skip incompatible table sections without changing visible results.

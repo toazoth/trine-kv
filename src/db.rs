@@ -167,6 +167,11 @@ impl Db {
         )?;
         let replay_floor = manifest.state().wal_replay_floor();
         let keyspaces = keyspaces_from_manifest(path, manifest.state())?;
+        recovery::fail_on_unreferenced_storage_files(
+            path,
+            &referenced_table_file_ids(manifest.state()),
+            &referenced_blob_file_ids(&keyspaces)?,
+        )?;
 
         let wal_path = wal::wal_path(path);
         let batches = wal::read_batches(&wal_path)?;
@@ -781,19 +786,7 @@ impl Db {
             .keyspaces
             .read()
             .map_err(|_| lock_poisoned("keyspace registry"))?;
-        let mut file_ids = BTreeSet::new();
-
-        for state in keyspaces.values() {
-            let tables = state
-                .tables
-                .read()
-                .map_err(|_| lock_poisoned("table list"))?;
-            for table in tables.iter() {
-                file_ids.extend(table.blob_file_ids());
-            }
-        }
-
-        Ok(file_ids)
+        referenced_blob_file_ids(&keyspaces)
     }
 
     fn remove_unreferenced_blob_files(&self, db_path: &Path) -> Result<()> {
@@ -884,6 +877,32 @@ fn validate_table_blob_refs(db_path: &Path, table: &Table) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn referenced_table_file_ids(manifest: &ManifestState) -> BTreeSet<table::TableId> {
+    manifest
+        .tables()
+        .values()
+        .flat_map(|tables| tables.iter().map(|properties| properties.id))
+        .collect()
+}
+
+fn referenced_blob_file_ids(
+    keyspaces: &BTreeMap<String, Arc<KeyspaceState>>,
+) -> Result<BTreeSet<u64>> {
+    let mut file_ids = BTreeSet::new();
+
+    for state in keyspaces.values() {
+        let tables = state
+            .tables
+            .read()
+            .map_err(|_| lock_poisoned("table list"))?;
+        for table in tables.iter() {
+            file_ids.extend(table.blob_file_ids());
+        }
+    }
+
+    Ok(file_ids)
 }
 
 fn validate_keyspace_options(options: &KeyspaceOptions) -> Result<()> {
