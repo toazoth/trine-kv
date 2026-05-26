@@ -20,6 +20,7 @@ pub struct DbStats {
     pub compaction_output_bytes: u64,
     pub block_cache_hits: u64,
     pub block_cache_misses: u64,
+    pub filters: FilterStats,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -27,4 +28,57 @@ pub struct LevelStats {
     pub level: u32,
     pub tables: usize,
     pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FilterStats {
+    pub table_point_hits: u64,
+    pub table_point_misses: u64,
+    pub table_point_false_positives: u64,
+    pub table_prefix_hits: u64,
+    pub table_prefix_misses: u64,
+    pub table_prefix_false_positives: u64,
+    pub block_point_hits: u64,
+    pub block_point_misses: u64,
+    pub block_point_false_positives: u64,
+    pub block_prefix_hits: u64,
+    pub block_prefix_misses: u64,
+    pub block_prefix_false_positives: u64,
+}
+
+impl FilterStats {
+    pub(crate) fn saturating_add_assign(&mut self, other: Self) {
+        self.table_point_hits = self.table_point_hits.saturating_add(other.table_point_hits);
+        self.table_point_misses = self
+            .table_point_misses
+            .saturating_add(other.table_point_misses);
+        self.table_point_false_positives = self
+            .table_point_false_positives
+            .saturating_add(other.table_point_false_positives);
+        self.table_prefix_hits = self
+            .table_prefix_hits
+            .saturating_add(other.table_prefix_hits);
+        self.table_prefix_misses = self
+            .table_prefix_misses
+            .saturating_add(other.table_prefix_misses);
+        self.table_prefix_false_positives = self
+            .table_prefix_false_positives
+            .saturating_add(other.table_prefix_false_positives);
+        self.block_point_hits = self.block_point_hits.saturating_add(other.block_point_hits);
+        self.block_point_misses = self
+            .block_point_misses
+            .saturating_add(other.block_point_misses);
+        self.block_point_false_positives = self
+            .block_point_false_positives
+            .saturating_add(other.block_point_false_positives);
+        self.block_prefix_hits = self
+            .block_prefix_hits
+            .saturating_add(other.block_prefix_hits);
+        self.block_prefix_misses = self
+            .block_prefix_misses
+            .saturating_add(other.block_prefix_misses);
+        self.block_prefix_false_positives = self
+            .block_prefix_false_positives
+            .saturating_add(other.block_prefix_false_positives);
+    }
 }

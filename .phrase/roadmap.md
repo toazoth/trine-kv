@@ -470,7 +470,7 @@ next LSM tree improvement.
 
 ### Phase 25: Filter Strategy Observability
 
-**Status**: In Progress
+**Status**: Complete
 
 **Goal**: Make table and block filter behavior observable and harden prefix
 filter skip paths before broader compaction or blob-GC work.
@@ -486,6 +486,28 @@ next LSM tree improvement.
   extractor matches.
 - False positives are counted only after a filter-allowed candidate yields no
   matching user key.
+- Existing public API and storage formats remain unchanged unless protocol docs
+  are updated first.
+- Full local Rust verification passes.
+
+### Phase 26: Compaction Picker Hardening
+
+**Status**: In Progress
+
+**Goal**: Improve compaction input selection and move behavior without changing
+storage format or MVCC retention rules.
+
+**Entry Condition**: Phase 25 complete and user review identifies P6 as the
+next LSM tree improvement.
+
+**Acceptance Gate**:
+
+- Compaction picker uses level score and L0 pressure without broadening work
+  beyond the needed key range.
+- L0 compaction keeps overlap closure behavior and lower-level overlap inputs.
+- L1+ compaction can avoid full-level rewrites when a narrower range is enough.
+- Trivial move is supported when an input table has no lower-level overlap.
+- Output table splitting continues to respect target table bytes.
 - Existing public API and storage formats remain unchanged unless protocol docs
   are updated first.
 - Full local Rust verification passes.

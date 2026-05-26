@@ -3020,3 +3020,46 @@ Record only evidence that can change planning or durable decisions.
 
 - Start Phase 25 with task086: audit filter read-path and stats gaps before
   changing counters or prefix-scan behavior.
+
+## 2026-05-26: Phase 25 Filter Strategy Observability Completed
+
+### Observation
+
+- `DbStats` now exposes table/block point and prefix filter hit, miss, and
+  false-positive counters.
+- Tables own filter counters and `Db::stats()` aggregates them across the
+  current version handles.
+- Table point filters count hits/misses during point table selection.
+- Block point and prefix filters count hits/misses when deciding whether to load
+  a data block.
+- False positives are counted only after a filter-allowed candidate is checked
+  and no matching user key/prefix exists in the loaded block.
+- Prefix scans with a matching extractor now have a regression proving a
+  nonmatching prefix avoids data-block reads and increments filter miss stats.
+- No storage format changed.
+
+### Interpretation
+
+- Phase 25 acceptance is met locally: filter behavior is observable, prefix miss
+  skip behavior is tested, and the next tuning decisions can use stats instead
+  of guessing.
+- The next phase should move to P6 compaction picker hardening.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo check --all-targets --all-features`
+- `cargo clippy --all-targets --all-features`
+- `cargo test persistent_filter_miss_does_not_read_corrupt_data_block --test persistent_wal`
+- `cargo test persistent_prefix_filter_stats_skip_nonmatching_tables --test persistent_wal`
+- `cargo test --all-targets --all-features`
+
+### Remaining Blockers
+
+- Remote CI cannot be executed locally; it must run after push.
+- Compaction picker refinements remain for Phase 26.
+
+### Recommended Next Action
+
+- Start Phase 26 with task089: audit compaction picker gaps before changing
+  input selection or move behavior.

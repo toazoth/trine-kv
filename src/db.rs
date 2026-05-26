@@ -560,6 +560,7 @@ impl Db {
                     let properties = table.properties();
                     let table_bytes = persistent_path
                         .map_or(0, |db_path| table_file_bytes(db_path, properties.id));
+                    stats.filters.saturating_add_assign(table.filter_stats());
                     stats.total_tables += 1;
                     stats.table_bytes = stats.table_bytes.saturating_add(table_bytes);
                     if properties.level == table::TableLevel::ZERO {

@@ -2603,6 +2603,53 @@ fn persistent_filter_miss_does_not_read_corrupt_data_block() {
         0,
         "filter miss should avoid block cache lookup"
     );
+    let filter_stats = db.stats().filters;
+    assert!(
+        filter_stats.table_point_misses + filter_stats.block_point_misses > 0,
+        "a point filter should reject the missing key before data-block read"
+    );
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_prefix_filter_stats_skip_nonmatching_tables() {
+    let path = temp_db_path("prefix-filter-stats-skip");
+    let options = DbOptions::persistent(&path);
+    let keyspace_options = KeyspaceOptions {
+        prefix_extractor: PrefixExtractor::Separator(b':'),
+        ..KeyspaceOptions::default()
+    };
+
+    {
+        let db = Db::open(options).expect("persistent db opens");
+        let keyspace = db
+            .keyspace("default", keyspace_options)
+            .expect("keyspace opens");
+        keyspace.insert(b"user:1", b"ada").expect("write user");
+        keyspace.insert(b"post:1", b"hello").expect("write post");
+        db.flush().expect("flush table");
+        assert_eq!(db.stats().block_cache_misses, 0);
+
+        assert!(
+            collect_rows(
+                keyspace
+                    .prefix(b"missing:")
+                    .expect("nonmatching prefix scans")
+            )
+            .is_empty()
+        );
+
+        let stats = db.stats();
+        assert_eq!(
+            stats.block_cache_misses, 0,
+            "prefix filter miss should not read data blocks"
+        );
+        assert!(
+            stats.filters.table_prefix_misses + stats.filters.block_prefix_misses > 0,
+            "a prefix filter should reject the nonmatching prefix"
+        );
+    }
 
     fs::remove_dir_all(path).expect("cleanup test db");
 }

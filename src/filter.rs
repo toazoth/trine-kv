@@ -124,21 +124,6 @@ impl PrefixFilter {
     pub(crate) fn may_contain_prefix(&self, prefix: &[u8]) -> bool {
         self.bloom.may_contain(prefix)
     }
-
-    #[must_use]
-    pub(crate) fn may_contain_query_prefix(
-        &self,
-        query_prefix: &[u8],
-        query_extractor: &PrefixExtractor,
-    ) -> bool {
-        if query_extractor != &self.extractor {
-            return true;
-        }
-
-        query_extractor
-            .query_filter_prefix(query_prefix)
-            .is_none_or(|prefix| self.bloom.may_contain(prefix))
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -340,8 +325,14 @@ mod tests {
         let filter =
             PrefixFilter::from_keys(extractor.clone(), keys, 10).expect("prefix filter builds");
 
-        assert!(filter.may_contain_query_prefix(b"user:", &extractor));
-        assert!(filter.may_contain_query_prefix(b"post:", &extractor));
+        let user_prefix = extractor
+            .query_filter_prefix(b"user:")
+            .expect("user query has filter prefix");
+        let post_prefix = extractor
+            .query_filter_prefix(b"post:")
+            .expect("post query has filter prefix");
+        assert!(filter.may_contain_prefix(user_prefix));
+        assert!(filter.may_contain_prefix(post_prefix));
     }
 
     #[test]

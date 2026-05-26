@@ -4,7 +4,10 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     ops::{Bound, Range},
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use crate::{
@@ -22,6 +25,7 @@ use crate::{
     prefix::PrefixExtractor,
     range_tombstone::{self, RangeTombstoneIndex, RangeTombstoneLike},
     search,
+    stats::FilterStats,
     types::{KeyRange, Sequence},
 };
 
@@ -233,6 +237,80 @@ impl DecodedDataBlock {
     }
 }
 
+#[derive(Debug, Default)]
+struct TableFilterStats {
+    table_point_hits: AtomicU64,
+    table_point_misses: AtomicU64,
+    table_point_false_positives: AtomicU64,
+    table_prefix_hits: AtomicU64,
+    table_prefix_misses: AtomicU64,
+    table_prefix_false_positives: AtomicU64,
+    block_point_hits: AtomicU64,
+    block_point_misses: AtomicU64,
+    block_point_false_positives: AtomicU64,
+    block_prefix_hits: AtomicU64,
+    block_prefix_misses: AtomicU64,
+    block_prefix_false_positives: AtomicU64,
+}
+
+impl TableFilterStats {
+    fn snapshot(&self) -> FilterStats {
+        FilterStats {
+            table_point_hits: self.table_point_hits.load(Ordering::Acquire),
+            table_point_misses: self.table_point_misses.load(Ordering::Acquire),
+            table_point_false_positives: self.table_point_false_positives.load(Ordering::Acquire),
+            table_prefix_hits: self.table_prefix_hits.load(Ordering::Acquire),
+            table_prefix_misses: self.table_prefix_misses.load(Ordering::Acquire),
+            table_prefix_false_positives: self.table_prefix_false_positives.load(Ordering::Acquire),
+            block_point_hits: self.block_point_hits.load(Ordering::Acquire),
+            block_point_misses: self.block_point_misses.load(Ordering::Acquire),
+            block_point_false_positives: self.block_point_false_positives.load(Ordering::Acquire),
+            block_prefix_hits: self.block_prefix_hits.load(Ordering::Acquire),
+            block_prefix_misses: self.block_prefix_misses.load(Ordering::Acquire),
+            block_prefix_false_positives: self.block_prefix_false_positives.load(Ordering::Acquire),
+        }
+    }
+
+    fn record_table_point(&self, allowed: bool) {
+        record_filter_result(&self.table_point_hits, &self.table_point_misses, allowed);
+    }
+
+    fn record_table_prefix(&self, allowed: bool) {
+        record_filter_result(&self.table_prefix_hits, &self.table_prefix_misses, allowed);
+    }
+
+    fn record_block_point(&self, allowed: bool) {
+        record_filter_result(&self.block_point_hits, &self.block_point_misses, allowed);
+    }
+
+    fn record_block_prefix(&self, allowed: bool) {
+        record_filter_result(&self.block_prefix_hits, &self.block_prefix_misses, allowed);
+    }
+
+    fn record_table_point_false_positive(&self) {
+        self.table_point_false_positives
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn record_block_point_false_positive(&self) {
+        self.block_point_false_positives
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn record_block_prefix_false_positive(&self) {
+        self.block_prefix_false_positives
+            .fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+fn record_filter_result(hits: &AtomicU64, misses: &AtomicU64, allowed: bool) {
+    if allowed {
+        hits.fetch_add(1, Ordering::AcqRel);
+    } else {
+        misses.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
 // Loaded tables keep one sorted record array. Each data block stores only the
 // record range it owns plus restart positions inside that range, so point and
 // range reads can jump near the target without duplicating all records.
@@ -325,26 +403,28 @@ impl TableDataBlock {
         })
     }
 
-    fn may_contain_key(&self, key: &[u8]) -> bool {
-        self.smallest_internal_key.user_key() <= key
-            && key <= self.largest_internal_key.user_key()
-            && self
-                .point_key_filter
-                .as_ref()
-                .is_none_or(|filter| filter.may_contain_key(key))
-    }
-
     fn overlaps_range(&self, range: &KeyRange) -> bool {
         !key_is_after_end(self.smallest_internal_key.user_key(), &range.end)
             && !key_is_before_start(self.largest_internal_key.user_key(), &range.start)
     }
 
-    fn may_contain_prefix(&self, prefix: &[u8], extractor: &PrefixExtractor) -> bool {
-        self.prefix_bounds_may_overlap(prefix)
-            && self
-                .prefix_filter
-                .as_ref()
-                .is_none_or(|filter| filter.may_contain_query_prefix(prefix, extractor))
+    fn key_bounds_may_contain(&self, key: &[u8]) -> bool {
+        self.smallest_internal_key.user_key() <= key && key <= self.largest_internal_key.user_key()
+    }
+
+    fn point_filter_result(&self, key: &[u8]) -> Option<bool> {
+        self.point_key_filter
+            .as_ref()
+            .map(|filter| filter.may_contain_key(key))
+    }
+
+    fn prefix_filter_result(&self, prefix: &[u8], extractor: &PrefixExtractor) -> Option<bool> {
+        let filter = self.prefix_filter.as_ref()?;
+        if filter.extractor() != extractor {
+            return None;
+        }
+        let filter_prefix = extractor.query_filter_prefix(prefix)?;
+        Some(filter.may_contain_prefix(filter_prefix))
     }
 
     fn prefix_bounds_may_overlap(&self, prefix: &[u8]) -> bool {
@@ -379,6 +459,7 @@ pub(crate) struct Table {
     range_tombstones: Arc<RwLock<Option<Arc<RangeTombstoneIndex<TableRangeTombstone>>>>>,
     point_key_filter: Option<PointKeyFilter>,
     prefix_filter: Option<PrefixFilter>,
+    filter_stats: Arc<TableFilterStats>,
 }
 
 impl Table {
@@ -442,6 +523,10 @@ impl Table {
         usize_to_u64_saturating(HEADER_LEN.saturating_add(self.payload_len))
     }
 
+    pub(crate) fn filter_stats(&self) -> FilterStats {
+        self.filter_stats.snapshot()
+    }
+
     #[must_use]
     pub(crate) fn has_key_bounds(&self) -> bool {
         !(self.data_blocks.is_empty()
@@ -473,11 +558,19 @@ impl Table {
             if block.smallest_internal_key.user_key() > key {
                 break;
             }
-            if !block.may_contain_key(key) {
+            let had_filter = block.point_key_filter.is_some();
+            if !self.block_point_filter_allows(block, key) {
                 continue;
             }
             let block = self.load_data_block(start + offset, block_cache)?;
-            records.extend(data_block_point_records_for_key(&block, key, policy));
+            let block_records = data_block_point_records_for_key(&block, key, policy);
+            if had_filter && block_records.is_empty() {
+                self.filter_stats.record_block_point_false_positive();
+            }
+            records.extend(block_records);
+        }
+        if self.point_key_filter.is_some() && records.is_empty() {
+            self.filter_stats.record_table_point_false_positive();
         }
         Ok(records)
     }
@@ -493,14 +586,24 @@ impl Table {
             return Ok(None);
         };
 
+        let mut saw_point_key = false;
         for (offset, block) in self.data_blocks[start..].iter().enumerate() {
             if block.smallest_internal_key.user_key() > key {
                 break;
             }
-            if !block.may_contain_key(key) {
+            let had_filter = block.point_key_filter.is_some();
+            if !self.block_point_filter_allows(block, key) {
                 continue;
             }
             let block = self.load_data_block(start + offset, block_cache)?;
+            let block_has_key = data_block_has_point_key(&block, key, policy);
+            if !block_has_key {
+                if had_filter {
+                    self.filter_stats.record_block_point_false_positive();
+                }
+                continue;
+            }
+            saw_point_key = true;
             if let Some(record) =
                 data_block_newest_visible_point_record_for_key(&block, key, read_sequence, policy)
             {
@@ -508,6 +611,9 @@ impl Table {
             }
         }
 
+        if self.point_key_filter.is_some() && !saw_point_key {
+            self.filter_stats.record_table_point_false_positive();
+        }
         Ok(None)
     }
 
@@ -571,31 +677,80 @@ impl Table {
             if !block.prefix_bounds_may_overlap(prefix) {
                 break;
             }
-            if !block.may_contain_prefix(prefix, extractor) {
+            let (allowed, had_filter) = self.block_prefix_filter_allows(block, prefix, extractor);
+            if !allowed {
                 continue;
             }
             let block = self.load_data_block(start + offset, block_cache)?;
-            records.extend(data_block_point_records_with_prefix(&block, prefix, policy));
+            let block_records = data_block_point_records_with_prefix(&block, prefix, policy);
+            if had_filter && block_records.is_empty() {
+                self.filter_stats.record_block_prefix_false_positive();
+            }
+            records.extend(block_records);
         }
         Ok(records)
     }
 
     #[must_use]
     pub(crate) fn may_contain_key(&self, key: &[u8]) -> bool {
-        self.has_key_bounds()
-            && self.properties.smallest_user_key.as_slice() <= key
-            && key <= self.properties.largest_user_key.as_slice()
-            && self
-                .point_key_filter
-                .as_ref()
-                .is_none_or(|filter| filter.may_contain_key(key))
+        if !self.has_key_bounds()
+            || self.properties.smallest_user_key.as_slice() > key
+            || key > self.properties.largest_user_key.as_slice()
+        {
+            return false;
+        }
+        let Some(filter) = &self.point_key_filter else {
+            return true;
+        };
+        let allowed = filter.may_contain_key(key);
+        self.filter_stats.record_table_point(allowed);
+        allowed
     }
 
     #[must_use]
     pub(crate) fn may_contain_prefix(&self, prefix: &[u8], extractor: &PrefixExtractor) -> bool {
-        self.prefix_filter
-            .as_ref()
-            .is_none_or(|filter| filter.may_contain_query_prefix(prefix, extractor))
+        let Some(allowed) = self.table_prefix_filter_result(prefix, extractor) else {
+            return true;
+        };
+        self.filter_stats.record_table_prefix(allowed);
+        allowed
+    }
+
+    fn table_prefix_filter_result(
+        &self,
+        prefix: &[u8],
+        extractor: &PrefixExtractor,
+    ) -> Option<bool> {
+        let filter = self.prefix_filter.as_ref()?;
+        if filter.extractor() != extractor {
+            return None;
+        }
+        let filter_prefix = extractor.query_filter_prefix(prefix)?;
+        Some(filter.may_contain_prefix(filter_prefix))
+    }
+
+    fn block_point_filter_allows(&self, block: &TableDataBlock, key: &[u8]) -> bool {
+        if !block.key_bounds_may_contain(key) {
+            return false;
+        }
+        let Some(allowed) = block.point_filter_result(key) else {
+            return true;
+        };
+        self.filter_stats.record_block_point(allowed);
+        allowed
+    }
+
+    fn block_prefix_filter_allows(
+        &self,
+        block: &TableDataBlock,
+        prefix: &[u8],
+        extractor: &PrefixExtractor,
+    ) -> (bool, bool) {
+        let Some(allowed) = block.prefix_filter_result(prefix, extractor) else {
+            return (true, false);
+        };
+        self.filter_stats.record_block_prefix(allowed);
+        (allowed, true)
     }
 
     fn all_point_records(&self) -> Result<Vec<TablePointRecord>> {
@@ -932,10 +1087,23 @@ impl TablePointCursor {
                     } else {
                         CursorBlockState::Done
                     }
-                } else if block.may_contain_prefix(prefix, &self.prefix_extractor) {
+                } else if self
+                    .current_block
+                    .as_ref()
+                    .is_some_and(|(current_index, _)| *current_index == block_index)
+                {
                     CursorBlockState::Scan
                 } else {
-                    CursorBlockState::Skip
+                    let (allowed, _) = self.table.block_prefix_filter_allows(
+                        block,
+                        prefix,
+                        &self.prefix_extractor,
+                    );
+                    if allowed {
+                        CursorBlockState::Scan
+                    } else {
+                        CursorBlockState::Skip
+                    }
                 }
             }
         }
@@ -956,10 +1124,25 @@ impl TablePointCursor {
             ScanSelector::Prefix(prefix) => {
                 if block.largest_internal_key.user_key() < prefix.as_slice() {
                     CursorBlockState::Done
-                } else if block.may_contain_prefix(prefix, &self.prefix_extractor) {
+                } else if !block.prefix_bounds_may_overlap(prefix) {
+                    CursorBlockState::Skip
+                } else if self
+                    .current_block
+                    .as_ref()
+                    .is_some_and(|(current_index, _)| *current_index == block_index)
+                {
                     CursorBlockState::Scan
                 } else {
-                    CursorBlockState::Skip
+                    let (allowed, _) = self.table.block_prefix_filter_allows(
+                        block,
+                        prefix,
+                        &self.prefix_extractor,
+                    );
+                    if allowed {
+                        CursorBlockState::Scan
+                    } else {
+                        CursorBlockState::Skip
+                    }
                 }
             }
         }
@@ -998,6 +1181,16 @@ impl TablePointCursor {
         let block = self
             .table
             .load_data_block(block_index, self.block_cache.as_deref())?;
+        if let ScanSelector::Prefix(prefix) = &self.selector {
+            let table_block = &self.table.data_blocks[block_index];
+            if table_block
+                .prefix_filter_result(prefix, &self.prefix_extractor)
+                .is_some()
+                && !data_block_has_prefix(&block, prefix, self.policy)
+            {
+                self.table.filter_stats.record_block_prefix_false_positive();
+            }
+        }
         self.record_index = match self.direction {
             Direction::Forward => {
                 first_record_index_for_decoded_block(&block, &self.selector, self.policy)
@@ -1096,6 +1289,14 @@ fn data_block_newest_visible_point_record_for_key(
         .cloned()
 }
 
+fn data_block_has_point_key(
+    block: &DecodedDataBlock,
+    key: &[u8],
+    policy: IndexSearchPolicy,
+) -> bool {
+    !data_block_point_record_range_for_key(block, key, policy).is_empty()
+}
+
 fn data_block_point_records_in_range(
     block: &DecodedDataBlock,
     range: &KeyRange,
@@ -1123,6 +1324,18 @@ fn data_block_point_records_with_prefix(
         .take_while(move |record| record.internal_key.user_key().starts_with(prefix))
         .cloned()
         .collect()
+}
+
+fn data_block_has_prefix(
+    block: &DecodedDataBlock,
+    prefix: &[u8],
+    policy: IndexSearchPolicy,
+) -> bool {
+    let start = data_block_restart_index_for_key(block, prefix, policy);
+    block.records[start..]
+        .iter()
+        .find(|record| record.internal_key.user_key() >= prefix)
+        .is_some_and(|record| record.internal_key.user_key().starts_with(prefix))
 }
 
 fn data_block_restart_index_for_bound(
@@ -1293,6 +1506,7 @@ pub(crate) fn write_table(
         ),
         point_key_filter: build_point_key_filter(options, &point_records),
         prefix_filter: build_prefix_filter(options, &point_records),
+        filter_stats: Arc::new(TableFilterStats::default()),
         point_records: Some(point_records),
         data_blocks,
         range_tombstones: Arc::new(RwLock::new(Some(Arc::new(RangeTombstoneIndex::new(
@@ -1401,6 +1615,7 @@ pub(crate) fn read_table(path: &Path) -> Result<Table> {
         range_tombstones: Arc::new(RwLock::new(None)),
         point_key_filter,
         prefix_filter,
+        filter_stats: Arc::new(TableFilterStats::default()),
     })
 }
 
@@ -1689,6 +1904,7 @@ fn decode_table(bytes: &[u8]) -> Result<Table> {
         ))))),
         point_key_filter,
         prefix_filter,
+        filter_stats: Arc::new(TableFilterStats::default()),
     })
 }
 
@@ -3337,6 +3553,7 @@ mod tests {
             ),
             point_key_filter: build_point_key_filter(options, &point_records),
             prefix_filter: build_prefix_filter(options, &point_records),
+            filter_stats: Arc::new(TableFilterStats::default()),
             point_records: Some(point_records),
             data_blocks,
             range_tombstones: Arc::new(RwLock::new(Some(Arc::new(RangeTombstoneIndex::new(

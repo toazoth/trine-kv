@@ -6,44 +6,41 @@ In Progress
 
 ## Goal
 
-Harden filter strategy behavior after the SSTable read path grew sharper block
-lookup, cache keys, cache replacement, and file-handle reuse.
+Harden the compaction picker after filter strategy behavior became observable.
 
 ## Entry Condition
 
-- Phase 24 completed data-block point lookup indexing, richer cache key
-  classes, cache hit promotion, and persistent table file-handle reuse.
-- User review identified P5 as the next LSM tree improvement after SSTable
-  read-path detail hardening.
+- Phase 25 exposed table/block filter hit, miss, and false-positive counters
+  and strengthened prefix miss skip tests.
+- User review identified P6 as the next LSM tree improvement after filter
+  strategy hardening.
 
 ## Scope
 
-- Audit table-level and per-block whole-key filters, prefix filters, and current
-  stats boundaries.
-- Make filter hit/miss behavior observable enough to tune later with benchmark
-  evidence.
-- Preserve current table format unless the audit proves a format change is
-  necessary and protocol docs are updated first.
-- Keep prefix scans able to skip unrelated tables/blocks when the configured
-  prefix extractor matches.
+- Audit the current compaction picker against level score, L0 pressure, overlap
+  bytes, read amplification, and trivial move behavior.
+- Keep snapshot-aware tombstone and version retention rules intact.
+- Prefer picker improvements that keep table format and public API unchanged.
+- Add tests before changing picker behavior.
 
 ## Out Of Scope
 
 - Public API redesign.
 - WAL or manifest format changes.
-- Compaction picker rewrite.
 - Blob GC.
 - Benchmark-driven policy defaults without new benchmark evidence.
 - Format changes without a protocol update.
+- Background compaction scheduling beyond picker behavior.
+- Single-delete semantics.
 
 ## Acceptance Gate
 
-- Filter stats distinguish table/block filter hits and misses for point and
-  prefix reads.
-- Prefix filter tests prove nonmatching prefixes skip data-block reads when the
-  extractor matches.
-- False positives are counted only when a filter allows a candidate but the
-  checked block/table yields no matching user key.
+- Compaction picker uses level score and L0 pressure without broadening work
+  beyond the needed key range.
+- L0 compaction keeps overlap closure behavior and lower-level overlap inputs.
+- L1+ compaction can avoid full-level rewrites when a narrower range is enough.
+- Trivial move is supported when an input table has no lower-level overlap.
+- Output table splitting continues to respect target table bytes.
 - Existing public API and storage formats remain unchanged unless protocol docs
   are updated first.
 - Full local Rust verification passes.
@@ -51,9 +48,9 @@ lookup, cache keys, cache replacement, and file-handle reuse.
 ## Active Task Slice
 
 ```text
-task086 [ ] goal:audit filter read-path and stats gaps | scope:src/filter.rs,src/table.rs,src/stats.rs,tests | verify:evidence note with exact blockers
-task087 [ ] goal:add filter hit/miss/false-positive counters | scope:src/cache.rs,src/table.rs,src/stats.rs,tests | verify:stats-focused point/prefix tests
-task088 [ ] goal:strengthen prefix filter skip behavior | scope:src/table.rs,tests | verify:nonmatching prefix avoids data-block reads
+task089 [ ] goal:audit compaction picker gaps | scope:src/compaction.rs,src/lsm/compact.rs,tests | verify:evidence note with exact blockers
+task090 [ ] goal:add picker tests for score, overlap, and trivial move | scope:src/compaction.rs,tests | verify:focused compaction picker tests
+task091 [ ] goal:implement the next picker refinement slice | scope:src/compaction.rs,src/lsm/compact.rs | verify:focused tests plus full Rust gate
 ```
 
 ## Known Blockers
@@ -64,13 +61,12 @@ task088 [ ] goal:strengthen prefix filter skip behavior | scope:src/table.rs,tes
 
 ## Evidence
 
-- Phase 24 full local verification passed.
-- Existing Bloom implementations are real bitset filters; the next gap is
-  observability and stronger skip-path proof, not replacing fake filters.
-- Table-level filters and per-block filters already exist; stats do not yet
-  expose filter hit/miss/false-positive behavior.
+- Phase 25 full local verification passed.
+- Current compaction already has level score, L0 overlap closure, output
+  splitting, and snapshot-aware cleanup, but the picker still needs a focused
+  audit before the next behavior change.
 
 ## Next Recommendation
 
-- Start task086 with a focused filter read-path audit before changing stats or
-  prefix-scan behavior.
+- Start task089 with a focused picker audit before changing compaction inputs
+  or move behavior.
