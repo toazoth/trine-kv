@@ -9,10 +9,7 @@ use crate::{
     write_batch::{BatchOperation, WriteBatch},
 };
 
-use super::{
-    Db, apply_memtable_operation, key_range_modified_after, lock_poisoned,
-    point_key_modified_after, validate_batch_len,
-};
+use super::{Db, lock_poisoned, validate_batch_len};
 
 impl Db {
     pub fn write(&self, batch: WriteBatch, options: WriteOptions) -> Result<CommitInfo> {
@@ -104,7 +101,7 @@ impl Db {
         self.append_wal(sequence, &wal_operations, durability)?;
 
         for (batch_index, operation, state) in indexed_operations {
-            apply_memtable_operation(&state, operation, sequence, batch_index)?;
+            state.apply_operation(operation, sequence, batch_index)?;
         }
 
         self.inner
@@ -123,7 +120,7 @@ impl Db {
     ) -> Result<()> {
         for read in &read_set.point_reads {
             let state = self.keyspace_state(&read.keyspace)?;
-            if point_key_modified_after(&state, &read.key, read_sequence)? {
+            if state.point_key_modified_after(&read.key, read_sequence)? {
                 return Err(Error::Conflict {
                     message: format!("point read conflict in keyspace {}", read.keyspace),
                 });
@@ -132,7 +129,7 @@ impl Db {
 
         for read in &read_set.range_reads {
             let state = self.keyspace_state(&read.keyspace)?;
-            if key_range_modified_after(&state, &read.range, read_sequence)? {
+            if state.key_range_modified_after(&read.range, read_sequence)? {
                 return Err(Error::Conflict {
                     message: format!("range read conflict in keyspace {}", read.keyspace),
                 });
@@ -192,7 +189,7 @@ impl Db {
                         error
                     }
                 })?;
-                apply_memtable_operation(&state, operation, batch.sequence, batch_index)?;
+                state.apply_operation(operation, batch.sequence, batch_index)?;
             }
 
             last_committed = batch.sequence;

@@ -380,7 +380,7 @@ risks.
 
 ### Phase 21: Internal LSM Core Boundary
 
-**Status**: In Progress
+**Status**: Complete
 
 **Goal**: Separate one-keyspace LSM tree rules from database-wide coordination
 without changing public API behavior or storage formats.

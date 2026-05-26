@@ -4,6 +4,7 @@ use std::{
 };
 
 use crate::{
+    error::{Error, Result},
     memtable::Memtable,
     options::KeyspaceOptions,
     range_tombstone::RangeTombstoneLike,
@@ -37,6 +38,24 @@ impl LsmTree {
         // records defensively, but this invariant gives optimized point reads
         // and compaction picking one stable rule to share.
         tables.sort_by(compare_tables_for_reads);
+    }
+
+    pub(crate) fn tables_snapshot(&self) -> Result<Vec<Arc<Table>>> {
+        self.tables
+            .read()
+            .map_err(|_| lock_poisoned("table list"))
+            .map(|tables| tables.clone())
+    }
+
+    pub(crate) fn l0_table_count(&self) -> Result<usize> {
+        let tables = self
+            .tables
+            .read()
+            .map_err(|_| lock_poisoned("table list"))?;
+        Ok(tables
+            .iter()
+            .filter(|table| table.properties().level == crate::table::TableLevel::ZERO)
+            .count())
     }
 }
 
@@ -86,4 +105,10 @@ fn compare_tables_for_reads(left: &Arc<Table>, right: &Arc<Table>) -> CmpOrderin
         .cmp(&right.level)
         .then_with(|| right.largest_sequence.cmp(&left.largest_sequence))
         .then_with(|| right.id.cmp(&left.id))
+}
+
+pub(super) fn lock_poisoned(lock_name: &'static str) -> Error {
+    Error::Corruption {
+        message: format!("{lock_name} lock poisoned"),
+    }
 }

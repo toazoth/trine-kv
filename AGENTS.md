@@ -3,6 +3,20 @@
 - 写rust需要使用rust skill, 去 `.rust-skills`看
 - 不得使用物化，投影等不合时宜的词。
 
+## Rust Skill Gate
+
+任何会读取、修改、评审 Rust 代码的任务，在第一次代码判断或
+修改代码之前，必须完成以下步骤：
+
+1. 读取 `.rust-skills/AGENTS.md`。
+2. 按本次改动类型读取对应的具体 skill 文件，而不是只读入口文件。
+3. 在 commentary 里输出一段 Rust Skill Receipt，列出：
+   - read: 实际读取的 skill 文件
+   - why: 为什么这些 skill 匹配本次任务
+   - applied: 本次实现会采用的具体规则
+4. 如果实现过程中问题类型变化，必须补读新的 skill，并更新 receipt。
+5. 没有 Rust Skill Receipt，不得修改 Rust 代码。
+
 # SPEC-AGENTS v3：证据校准的 Agent 工作流
 
 在处理任何请求之前，先识别用户意图，然后按最轻可行协议执行。

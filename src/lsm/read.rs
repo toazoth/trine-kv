@@ -12,7 +12,7 @@ use crate::{
     types::Sequence,
 };
 
-use super::tree::{LsmTree, RangeTombstone};
+use super::tree::{LsmTree, RangeTombstone, lock_poisoned};
 
 #[derive(Debug, Clone)]
 struct PointRecordCandidate {
@@ -213,11 +213,5 @@ fn value_bytes(value: Option<&ValueRef>, db_path: Option<&Path>) -> Result<Vec<u
             })?;
             blob::read_value(db_path, value)
         }
-    }
-}
-
-fn lock_poisoned(lock_name: &'static str) -> Error {
-    Error::Corruption {
-        message: format!("{lock_name} lock poisoned"),
     }
 }

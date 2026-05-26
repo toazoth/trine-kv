@@ -2730,3 +2730,55 @@ Record only evidence that can change planning or durable decisions.
 
 - Move range and prefix scan setup into `LsmTree` as task071 while preserving
   lazy heap merge behavior and existing iterator tests.
+
+## 2026-05-26: LSM Core Boundary Slice Completed
+
+### Observation
+
+- `src/lsm/scan.rs` now owns range and prefix scan source construction plus
+  selector-scoped range tombstone collection for one tree.
+- `src/lsm/write.rs` now owns write application, active memtable byte
+  accounting, immutable memtable counting, and active memtable freeze.
+- `src/lsm/flush.rs` now owns flush input planning and immutable memtable
+  removal after a flushed table is installed.
+- `src/lsm/compact.rs` now owns compaction input planning, point-version
+  retention, range tombstone cleanup, output splitting, and table list
+  replacement for one tree.
+- `src/lsm/conflict.rs` now owns transaction point and range conflict checks.
+- `Db` still coordinates WAL append/rewrite, manifest publish, sequence
+  assignment, snapshots, process lock, background worker lifecycle, persistent
+  file paths, and cross-keyspace batch boundaries.
+- In-memory mode continues to use the same `LsmTree` path.
+
+### Interpretation
+
+- Phase 21 is complete: the remaining tree-local read, write, flush,
+  compaction, and conflict rules have moved behind the LSM core boundary
+  without public API or storage-format changes.
+- `db.rs` is still the database coordinator, but no longer owns the extracted
+  one-keyspace rules from the Phase 21 task slice.
+
+### Verification
+
+- `cargo check --all-targets --all-features`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test scan --all-targets --all-features`
+- `cargo test prefix --all-targets --all-features`
+- `cargo test flush --all-targets --all-features`
+- `cargo test compaction --all-targets --all-features`
+- `cargo test transaction --all-targets --all-features`
+- `cargo test range --all-targets --all-features`
+- `cargo test --all-targets --all-features`
+- `cargo fmt --check`
+- `git diff --check`
+- forbidden-term scan
+
+### Remaining Blockers
+
+- Remote CI cannot be executed locally; it must run after push.
+- `AGENTS.md` has a pre-existing unstaged edit outside this phase.
+
+### Recommended Next Action
+
+- Run remote CI. Choose the next phase from fresh CI, benchmark, or review
+  evidence rather than old coupling notes.

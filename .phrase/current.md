@@ -2,7 +2,7 @@
 
 ## Status
 
-In Progress
+Complete
 
 ## Goal
 
@@ -54,15 +54,16 @@ public API behavior or storage formats.
 task068 [x] goal:write complete LSM core boundary spec | scope:.phrase/protocol,.phrase/current.md,.phrase/roadmap.md | verify:protocol link and doc diff checks
 task069 [x] goal:create internal LSM module and move tree state boundary | scope:src/lsm,src/db.rs,src/lib.rs | verify:cargo test --all-targets --all-features
 task070 [x] goal:move point read visibility into LsmTree | scope:src/lsm,src/db.rs,tests | verify:point read, tombstone, transaction, persistent tests
-task071 [ ] goal:move range and prefix scan setup into LsmTree | scope:src/lsm,src/db.rs,src/iterator.rs,tests | verify:scan, prefix, range-delete, persistent iterator tests
+task071 [x] goal:move range and prefix scan setup into LsmTree | scope:src/lsm,src/db.rs,src/iterator.rs,tests | verify:scan, prefix, range-delete, persistent iterator tests
+task072 [x] goal:move flush planning and install into LsmTree | scope:src/lsm,src/db.rs,tests | verify:flush and persistent WAL tests
+task073 [x] goal:move compaction planning and merge retention into LsmTree | scope:src/lsm,src/db.rs,tests | verify:compaction and range-delete tests
+task074 [x] goal:move transaction conflict checks into LsmTree | scope:src/lsm,src/db/commit.rs,tests | verify:transaction tests
 ```
 
 ## Known Blockers
 
 - Remote CI cannot be executed locally; it must run after push.
 - `AGENTS.md` has a pre-existing unstaged edit outside this phase.
-- Later slices still need range/prefix scans, flush, compaction, and transaction
-  conflict checks moved into LSM core after point read migration.
 
 ## Evidence
 
@@ -72,11 +73,20 @@ task071 [ ] goal:move range and prefix scan setup into LsmTree | scope:src/lsm,s
 - `DbInner.keyspaces` now stores `Arc<LsmTree>`.
 - Tree table sorting moved behind `LsmTree::sort_tables_for_reads`.
 - Point read visibility moved behind `LsmTree::read_visible_point`.
+- Range and prefix scan source construction moved behind `LsmTree::scan`.
+- Write application, active memtable freeze, memtable byte accounting, flush
+  input planning, and flush install moved behind `LsmTree`.
+- Compaction input planning, point-version retention, range tombstone cleanup,
+  output splitting, and table install moved behind `LsmTree`.
+- Transaction point/range conflict checks moved behind `LsmTree`.
+- `Db` still coordinates WAL, manifest publish, sequence assignment,
+  snapshots, process lock, background worker lifecycle, and cross-keyspace
+  batch boundaries.
 - `Db::get_at_with_pin_state` now only finds the tree and supplies
   `read_sequence`, path, and cache handles.
-- Full local Rust verification passed for the state-boundary slice.
+- Local Rust verification passed for the completed LSM core boundary slice.
 
 ## Next Recommendation
 
-- Start task071 by moving range and prefix scan setup into `LsmTree` while
-  preserving lazy heap merge behavior.
+- Close Phase 21 after remote CI. The next phase should be chosen from fresh
+  CI, benchmark, or user review evidence rather than from old coupling notes.
