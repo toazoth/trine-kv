@@ -621,6 +621,8 @@ Rules:
 - ordinary compaction may keep existing `BlobIndex` records instead of
   rewriting large values;
 - blob GC is snapshot-safe and recoverable;
+- manifest edits can mark obsolete blob files as pending deletion, and startup
+  can resume cleanup from that metadata;
 - cleanup cannot remove a blob file referenced by any live table, active
   snapshot, read pin, or pending old tree version.
 
@@ -635,7 +637,8 @@ Version edit operations:
 - add table;
 - remove table;
 - add blob file;
-- remove blob file;
+- mark blob file pending deletion;
+- clear pending blob deletion after safe physical cleanup;
 - update WAL replay floor;
 - update compaction metadata;
 

@@ -3618,3 +3618,59 @@ Record only evidence that can change planning or durable decisions.
 
 - Implement blob GC rewrite with snapshot-gated old-file deletion and
   idempotent recovery metadata when the large-value lifecycle work continues.
+
+## 2026-05-26: Phase 36 Snapshot-Safe Blob GC Completed
+
+### Observation
+
+- `DbOptions` now exposes persistent blob GC controls:
+  `blob_gc_enabled`, `blob_gc_discardable_ratio`, and
+  `blob_gc_min_file_bytes`.
+- `DbStats` now reports blob GC runs, input bytes, output bytes, and discarded
+  bytes.
+- Compaction publishes blob-file pending deletions in the manifest instead of
+  physically deleting obsolete blob files immediately.
+- Blob GC rewrites still-live records from a partially stale blob file into a
+  new blob file and publishes equivalent `BlobIndex` records for the same
+  internal keys.
+- Pending blob cleanup is gated by active snapshots/read pins and refuses to
+  delete a pending file that is still referenced by a manifest-live table.
+- Writable open can clean safe manifest-pending blob deletions; v4 manifests
+  decode with an empty pending-deletion map.
+- README, usage docs, durability notes, and protocol docs now describe the
+  implemented blob GC behavior.
+
+### Interpretation
+
+- The first Titan-like large-value lifecycle is now correct enough for normal
+  persistent use: large values separate during flush/compaction, reads validate
+  blob records, stale blob files can be reclaimed, and old blob files stay
+  available while old table handles can reach them.
+- Throughput tuning for blob GC should be evidence-led. Correctness coverage is
+  in place, but there is not yet a dedicated GC benchmark.
+
+### Verification
+
+- `cargo check --all-targets --all-features`
+- `cargo test persistent_blob_gc_rewrites_live_records_from_partially_stale_file --all-features`
+- `cargo test persistent_blob_gc_keeps_old_blob_while_read_pin_can_reach_it --all-features`
+- `cargo test persistent_recovery_cleans_manifest_pending_blob_deletion --all-features`
+- `cargo test persistent_recovery_does_not_delete_referenced_pending_blob_deletion --all-features`
+- `cargo test manifest_decode_accepts_previous_version_without_pending_blob_deletions --all-features`
+- `cargo test --all-targets --all-features`
+- `cargo clippy --all-targets --all-features`
+- `cargo fmt --all --check`
+- `git diff --check`
+- forbidden-term scan over `.phrase`, `src`, `tests`, `benches`, `examples`,
+  `docs`, and `README.md`
+
+### Remaining Blockers
+
+- Remote CI cannot be executed locally; it must run after push.
+- Blob GC throughput has no dedicated benchmark baseline yet.
+- Titan Level Merge and value-lazy iterators remain out of scope.
+
+### Recommended Next Action
+
+- Commit Phase 36, then start a dedicated benchmark phase for large-value write,
+  read, range scan, and GC rewrite throughput before tuning policy or layout.

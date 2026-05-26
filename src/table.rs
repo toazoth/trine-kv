@@ -491,7 +491,6 @@ impl Table {
         &self.properties
     }
 
-    #[cfg(test)]
     pub(crate) fn point_records(&self) -> Result<Vec<TablePointRecord>> {
         self.all_point_records()
     }
@@ -824,7 +823,6 @@ impl Table {
         (allowed, true)
     }
 
-    #[cfg(test)]
     fn all_point_records(&self) -> Result<Vec<TablePointRecord>> {
         if let Some(records) = &self.point_records {
             return Ok(records.clone());

@@ -21,7 +21,7 @@ pub(crate) struct CompactionInput {
     pub(crate) input_table_ids: Vec<table::TableId>,
     pub(crate) trivial_move: bool,
     full_bucket_compaction: bool,
-    input_tables: Vec<Arc<Table>>,
+    pub(crate) input_tables: Vec<Arc<Table>>,
 }
 
 #[derive(Debug)]

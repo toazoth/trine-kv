@@ -8,7 +8,7 @@ use std::{
 };
 
 use trine_kv::{
-    BucketOptions, CompressionProfile, Db, DbOptions, DurabilityMode, Error,
+    BlobGcRatio, BucketOptions, CompressionProfile, Db, DbOptions, DurabilityMode, Error,
     FailOnCorruptionPolicy, FilterPolicy, IndexSearchPolicy, KeyRange, PrefixExtractor,
     PrefixFilterPolicy, Sequence, TransactionOptions, WriteBatch, WriteOptions, blob,
     codec::CodecId, manifest, recovery, table, wal,
@@ -559,6 +559,99 @@ fn persistent_recovery_fails_closed_on_unreferenced_blob_file_even_with_temp_rep
         "startup should not repair formal blob files automatically"
     );
     assert!(!recovery::recovery_report_path(&path).exists());
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_recovery_cleans_manifest_pending_blob_deletion() {
+    let path = temp_db_path("recovery-pending-blob-deletion");
+    let options = DbOptions::persistent(&path);
+
+    {
+        let db = Db::open(options.clone()).expect("persistent db opens");
+        db.default_bucket().expect("bucket opens");
+    }
+
+    let pending_blob_path = blob::blob_path(&path, 999);
+    write_file(&pending_blob_path, b"pending obsolete blob bytes");
+    let mut manifest_store =
+        manifest::ManifestStore::open_or_create(manifest::manifest_path(&path), false)
+            .expect("manifest opens");
+    manifest_store
+        .replace_tables_batch_and_mark_blob_deletions(Vec::new(), vec![999], Sequence::new(7))
+        .expect("pending blob deletion is published");
+
+    {
+        let _db = Db::open(options.clone()).expect("pending blob deletion is cleaned on open");
+        assert!(
+            !pending_blob_path.exists(),
+            "pending obsolete blob file should be removed during writable open"
+        );
+        let manifest_state =
+            manifest::read_manifest(&manifest::manifest_path(&path)).expect("manifest reads");
+        assert!(
+            manifest_state.pending_blob_deletions().is_empty(),
+            "pending deletion metadata should be cleared after cleanup"
+        );
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_recovery_does_not_delete_referenced_pending_blob_deletion() {
+    let path = temp_db_path("recovery-referenced-pending-blob-deletion");
+    let mut options = DbOptions::persistent(&path);
+    options.default_bucket_options = BucketOptions {
+        blob_threshold_bytes: 8,
+        ..BucketOptions::default()
+    };
+
+    {
+        let db = Db::open(options.clone()).expect("persistent db opens");
+        db.put(b"a", b"large-value-large-value")
+            .expect("write large value");
+        db.flush().expect("flush blob-backed table");
+    }
+
+    let manifest_state =
+        manifest::read_manifest(&manifest::manifest_path(&path)).expect("manifest reads");
+    let blob_id = manifest_state
+        .tables()
+        .get("default")
+        .and_then(|tables| tables.first())
+        .and_then(|table| table.blob_file_ids().first())
+        .copied()
+        .expect("table references blob file");
+    let blob_path = blob::blob_path(&path, blob_id);
+
+    let mut manifest_store =
+        manifest::ManifestStore::open_or_create(manifest::manifest_path(&path), false)
+            .expect("manifest opens");
+    manifest_store
+        .replace_tables_batch_and_mark_blob_deletions(Vec::new(), vec![blob_id], Sequence::new(7))
+        .expect("conflicting pending blob deletion is published");
+
+    {
+        let db = Db::open(options).expect("db opens despite conflicting pending deletion");
+        assert_eq!(
+            db.get(b"a").expect("referenced blob still reads"),
+            Some(b"large-value-large-value".to_vec())
+        );
+        assert!(
+            blob_path.exists(),
+            "referenced pending blob file must remain on disk"
+        );
+        let manifest_state =
+            manifest::read_manifest(&manifest::manifest_path(&path)).expect("manifest reads");
+        assert!(
+            manifest_state
+                .pending_blob_deletions()
+                .contains_key(&blob_id),
+            "conflicting pending deletion should remain for later repair"
+        );
+    }
 
     fs::remove_dir_all(path).expect("cleanup test db");
 }
@@ -2239,6 +2332,129 @@ fn persistent_compaction_removes_blob_files_after_delete_cleanup() {
         let bucket = db.default_bucket().expect("bucket reopens");
         assert_eq!(bucket.get(b"a").expect("deleted key reopens"), None);
         assert!(blob_file_paths(&path).is_empty());
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_blob_gc_rewrites_live_records_from_partially_stale_file() {
+    let path = temp_db_path("blob-gc-partial-stale");
+    let mut options = DbOptions::persistent(&path);
+    options.blob_gc_min_file_bytes = 1;
+    options.blob_gc_discardable_ratio = BlobGcRatio::from_millionths(400_000);
+    options.default_bucket_options = BucketOptions {
+        blob_threshold_bytes: 8,
+        ..BucketOptions::default()
+    };
+    let old_a = b"large-value-a-old-large-value-a-old".to_vec();
+    let old_b = b"large-value-b-old-large-value-b-old".to_vec();
+    let new_a = b"large-value-a-new-large-value-a-new".to_vec();
+
+    {
+        let db = Db::open(options.clone()).expect("persistent db opens");
+        let bucket = db.default_bucket().expect("bucket opens");
+
+        bucket.put(b"a", old_a).expect("write old a");
+        bucket.put(b"b", old_b.clone()).expect("write old b");
+        db.flush().expect("flush shared old blob file");
+        let old_blob_path = blob_file_paths(&path)
+            .into_iter()
+            .next()
+            .expect("old blob file exists");
+
+        bucket.put(b"a", new_a.clone()).expect("write new a");
+        db.flush().expect("flush new a blob file");
+        db.compact_range(KeyRange::all())
+            .expect("compaction runs blob GC");
+
+        assert_eq!(bucket.get(b"a").expect("new a reads"), Some(new_a));
+        assert_eq!(bucket.get(b"b").expect("old b reads"), Some(old_b));
+        assert!(
+            !old_blob_path.exists(),
+            "partially stale old blob file should be removed after GC"
+        );
+        assert_eq!(
+            blob_file_paths(&path).len(),
+            2,
+            "new a and rewritten b should be the only blob files"
+        );
+        let stats = db.stats();
+        assert_eq!(stats.blob_gc_runs, 1);
+        assert!(stats.blob_gc_input_bytes > 0);
+        assert!(stats.blob_gc_output_bytes > 0);
+        assert!(stats.blob_gc_discarded_bytes > 0);
+    }
+
+    fs::remove_file(wal::wal_path(&path)).expect("remove WAL after blob GC");
+
+    {
+        let db = Db::open(options).expect("persistent db reopens after blob GC");
+        let bucket = db.default_bucket().expect("bucket reopens");
+        assert_eq!(
+            bucket.get(b"b").expect("rewritten b reopens"),
+            Some(b"large-value-b-old-large-value-b-old".to_vec())
+        );
+        assert_eq!(blob_file_paths(&path).len(), 2);
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_blob_gc_keeps_old_blob_while_read_pin_can_reach_it() {
+    let path = temp_db_path("blob-gc-read-pin");
+    let mut options = DbOptions::persistent(&path);
+    options.blob_gc_min_file_bytes = 1;
+    options.blob_gc_discardable_ratio = BlobGcRatio::from_millionths(400_000);
+    options.default_bucket_options = BucketOptions {
+        blob_threshold_bytes: 8,
+        ..BucketOptions::default()
+    };
+    let old_a = b"large-value-a-old-large-value-a-old".to_vec();
+    let old_b = b"large-value-b-old-large-value-b-old".to_vec();
+    let new_a = b"large-value-a-new-large-value-a-new".to_vec();
+
+    {
+        let db = Db::open(options).expect("persistent db opens");
+        let bucket = db.default_bucket().expect("bucket opens");
+
+        bucket.put(b"a", old_a).expect("write old a");
+        bucket.put(b"b", old_b.clone()).expect("write old b");
+        db.flush().expect("flush shared old blob file");
+        let old_blob_path = blob_file_paths(&path)
+            .into_iter()
+            .next()
+            .expect("old blob file exists");
+
+        bucket.put(b"a", new_a).expect("write new a");
+        db.flush().expect("flush new a blob file");
+        let mut iter = bucket
+            .range(&KeyRange::all())
+            .expect("range iterator pins pre-GC table handles");
+
+        db.compact_range(KeyRange::all())
+            .expect("compaction runs blob GC with read pin");
+        assert!(
+            old_blob_path.exists(),
+            "old blob file stays while a read pin can reach old table handles"
+        );
+        let rows = iter
+            .by_ref()
+            .map(|item| {
+                let item = item.expect("iterator item reads");
+                (item.key, item.value)
+            })
+            .collect::<Vec<_>>();
+        assert!(rows.contains(&(b"b".to_vec(), old_b.clone())));
+        assert_eq!(bucket.get(b"b").expect("current reads b"), Some(old_b));
+
+        drop(iter);
+        db.flush().expect("cleanup pending old blob after read pin");
+        assert!(
+            !old_blob_path.exists(),
+            "old blob file is removed after read pin release"
+        );
     }
 
     fs::remove_dir_all(path).expect("cleanup test db");

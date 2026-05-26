@@ -99,12 +99,16 @@ pub struct DbOptions {
     pub block_cache_bytes: usize,
     pub background_worker_count: usize,
     pub fail_on_corruption: FailOnCorruptionPolicy,
+    pub blob_gc_enabled: bool,
+    pub blob_gc_discardable_ratio: BlobGcRatio,
+    pub blob_gc_min_file_bytes: u64,
 }
 
 impl DbOptions {
     pub const DEFAULT_WRITE_BUFFER_BYTES: usize = 64 * 1024 * 1024;
     pub const DEFAULT_TARGET_TABLE_BYTES: usize = 64 * 1024 * 1024;
     pub const DEFAULT_BLOCK_CACHE_BYTES: usize = 256 * 1024 * 1024;
+    pub const DEFAULT_BLOB_GC_MIN_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
     #[must_use]
     pub fn memory() -> Self {
@@ -163,7 +167,48 @@ impl Default for DbOptions {
             block_cache_bytes: Self::DEFAULT_BLOCK_CACHE_BYTES,
             background_worker_count: 0,
             fail_on_corruption: FailOnCorruptionPolicy::FailClosed,
+            blob_gc_enabled: true,
+            blob_gc_discardable_ratio: BlobGcRatio::HALF,
+            blob_gc_min_file_bytes: Self::DEFAULT_BLOB_GC_MIN_FILE_BYTES,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobGcRatio {
+    millionths: u32,
+}
+
+impl BlobGcRatio {
+    pub const HALF: Self = Self {
+        millionths: 500_000,
+    };
+    pub const FULL: Self = Self {
+        millionths: 1_000_000,
+    };
+
+    #[must_use]
+    pub const fn from_millionths(millionths: u32) -> Self {
+        Self { millionths }
+    }
+
+    #[must_use]
+    pub const fn millionths(self) -> u32 {
+        self.millionths
+    }
+
+    pub(crate) fn should_collect(self, discardable_bytes: u64, total_bytes: u64) -> bool {
+        if total_bytes == 0 {
+            return false;
+        }
+        u128::from(discardable_bytes).saturating_mul(1_000_000)
+            >= u128::from(total_bytes).saturating_mul(u128::from(self.millionths))
+    }
+}
+
+impl Default for BlobGcRatio {
+    fn default() -> Self {
+        Self::HALF
     }
 }
 

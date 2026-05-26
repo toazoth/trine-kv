@@ -94,6 +94,8 @@ The manifest stores:
 - live SSTable ids and compaction levels;
 - live blob file ids plus per-table blob reference bytes, counts, and key
   spans;
+- blob file ids that are obsolete but waiting for snapshot/read-pin-safe
+  deletion;
 - the WAL replay floor.
 
 New SSTables become part of the live database only after the manifest edit is
@@ -132,11 +134,17 @@ checksums. Startup decodes manifest-referenced blob files and fails closed if a
 referenced file is missing or corrupt. Cleanup cannot remove a blob that is
 still referenced by a live table or an active snapshot.
 
+Blob GC publishes replacement SSTables and the old blob file's pending-deletion
+marker in one manifest edit. If a crash happens after that edit, writable open
+can resume physical cleanup from the manifest. If the pending file is still
+referenced by any live table, cleanup leaves it on disk and keeps the pending
+marker for later repair.
+
 ## Compaction And Cleanup
 
 Compaction writes new SSTables first and publishes them through a manifest edit.
 Input tables and obsolete blob files are removed only after the new manifest
-state is installed and active snapshot floors allow cleanup.
+state is installed and active snapshot/read-pin counts allow cleanup.
 
 Compaction must preserve:
 

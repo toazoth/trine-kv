@@ -20,7 +20,8 @@ use crate::{
 
 pub const MANIFEST_FILE_NAME: &str = "MANIFEST";
 const MANIFEST_MAGIC: u32 = 0x5452_4d46;
-const MANIFEST_VERSION: u16 = 4;
+const MANIFEST_VERSION: u16 = 5;
+const MIN_SUPPORTED_MANIFEST_VERSION: u16 = 4;
 const HEADER_LEN: usize = 14;
 // The lower bound for one table entry: fixed fields plus two empty byte fields.
 // Decoding uses this to reject impossible counts before reserving memory.
@@ -54,6 +55,7 @@ pub struct ManifestState {
     wal_replay_floor: Sequence,
     buckets: BTreeMap<String, BucketOptions>,
     tables: BTreeMap<String, Vec<TableProperties>>,
+    pending_blob_deletions: BTreeMap<u64, Sequence>,
 }
 
 impl ManifestState {
@@ -63,6 +65,7 @@ impl ManifestState {
             wal_replay_floor: Sequence::ZERO,
             buckets: BTreeMap::new(),
             tables: BTreeMap::new(),
+            pending_blob_deletions: BTreeMap::new(),
         }
     }
 
@@ -79,6 +82,11 @@ impl ManifestState {
     #[must_use]
     pub fn tables(&self) -> &BTreeMap<String, Vec<TableProperties>> {
         &self.tables
+    }
+
+    #[must_use]
+    pub fn pending_blob_deletions(&self) -> &BTreeMap<u64, Sequence> {
+        &self.pending_blob_deletions
     }
 
     pub fn next_table_id(&self) -> Result<TableId> {
@@ -208,6 +216,15 @@ impl ManifestStore {
         &mut self,
         replacements: Vec<(String, Vec<TableId>, Vec<TableProperties>)>,
     ) -> Result<()> {
+        self.replace_tables_batch_and_mark_blob_deletions(replacements, Vec::new(), Sequence::ZERO)
+    }
+
+    pub fn replace_tables_batch_and_mark_blob_deletions(
+        &mut self,
+        replacements: Vec<(String, Vec<TableId>, Vec<TableProperties>)>,
+        pending_blob_deletions: Vec<u64>,
+        pending_deletion_sequence: Sequence,
+    ) -> Result<()> {
         // Validate the whole batch before changing in-memory manifest state.
         // That keeps multi-bucket compaction from publishing a partial edit.
         for (bucket, removed_table_ids, _) in &replacements {
@@ -246,7 +263,25 @@ impl ManifestStore {
                 tables.push(replacement);
             }
         }
+        for file_id in pending_blob_deletions {
+            next_state
+                .pending_blob_deletions
+                .entry(file_id)
+                .or_insert(pending_deletion_sequence);
+        }
 
+        self.publish_next_state(next_state)
+    }
+
+    pub fn clear_pending_blob_deletions(&mut self, file_ids: &[u64]) -> Result<()> {
+        if file_ids.is_empty() {
+            return Ok(());
+        }
+
+        let mut next_state = self.state.clone();
+        for file_id in file_ids {
+            next_state.pending_blob_deletions.remove(file_id);
+        }
         self.publish_next_state(next_state)
     }
 
@@ -315,6 +350,7 @@ fn encode_state(state: &ManifestState) -> Result<Vec<u8>> {
         put_bucket_options(&mut bytes, options)?;
     }
     put_tables(&mut bytes, &state.tables)?;
+    put_pending_blob_deletions(&mut bytes, &state.pending_blob_deletions)?;
 
     Ok(bytes)
 }
@@ -333,7 +369,7 @@ fn decode_manifest(bytes: &[u8]) -> Result<ManifestState> {
             message: "manifest magic mismatch".to_owned(),
         });
     }
-    if version != MANIFEST_VERSION {
+    if !(MIN_SUPPORTED_MANIFEST_VERSION..=MANIFEST_VERSION).contains(&version) {
         return Err(Error::UnsupportedFormat {
             message: format!("unsupported manifest version {version}"),
         });
@@ -351,10 +387,10 @@ fn decode_manifest(bytes: &[u8]) -> Result<ManifestState> {
         });
     }
 
-    decode_state(payload)
+    decode_state(payload, version)
 }
 
-fn decode_state(payload: &[u8]) -> Result<ManifestState> {
+fn decode_state(payload: &[u8], version: u16) -> Result<ManifestState> {
     let mut cursor = Cursor::new(payload);
     let wal_replay_floor = Sequence::new(cursor.read_u64()?);
     let bucket_count = cursor.read_u32()? as usize;
@@ -369,6 +405,11 @@ fn decode_state(payload: &[u8]) -> Result<ManifestState> {
         buckets.insert(name, options);
     }
     let tables = cursor.read_tables()?;
+    let pending_blob_deletions = if version >= 5 {
+        cursor.read_pending_blob_deletions()?
+    } else {
+        BTreeMap::new()
+    };
 
     if !cursor.is_finished() {
         return Err(invalid_manifest("trailing payload bytes"));
@@ -378,6 +419,7 @@ fn decode_state(payload: &[u8]) -> Result<ManifestState> {
         wal_replay_floor,
         buckets,
         tables,
+        pending_blob_deletions,
     })
 }
 
@@ -474,6 +516,20 @@ fn put_tables(bytes: &mut Vec<u8>, tables: &BTreeMap<String, Vec<TableProperties
         }
     }
 
+    Ok(())
+}
+
+fn put_pending_blob_deletions(
+    bytes: &mut Vec<u8>,
+    pending_blob_deletions: &BTreeMap<u64, Sequence>,
+) -> Result<()> {
+    let count = u32::try_from(pending_blob_deletions.len())
+        .map_err(|_| Error::invalid_options("too many pending blob deletions for manifest"))?;
+    put_u32(bytes, count);
+    for (file_id, sequence) in pending_blob_deletions {
+        put_u64(bytes, *file_id);
+        put_u64(bytes, sequence.get());
+    }
     Ok(())
 }
 
@@ -688,6 +744,28 @@ impl<'payload> Cursor<'payload> {
         Ok(tables)
     }
 
+    fn read_pending_blob_deletions(&mut self) -> Result<BTreeMap<u64, Sequence>> {
+        let pending_count = self.read_u32()? as usize;
+        if pending_count > self.remaining_len() / 16 {
+            return Err(invalid_manifest(
+                "pending blob deletion count exceeds payload bytes",
+            ));
+        }
+
+        let mut pending = BTreeMap::new();
+        let mut previous = None;
+        for _ in 0..pending_count {
+            let file_id = self.read_u64()?;
+            if previous.is_some_and(|previous| previous >= file_id) {
+                return Err(invalid_manifest("pending blob deletions are not sorted"));
+            }
+            let sequence = Sequence::new(self.read_u64()?);
+            pending.insert(file_id, sequence);
+            previous = Some(file_id);
+        }
+        Ok(pending)
+    }
+
     fn read_table_properties(&mut self) -> Result<TableProperties> {
         Ok(TableProperties {
             id: TableId(self.read_u64()?),
@@ -866,7 +944,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{ManifestStore, decode_state, manifest_path};
+    use super::{MANIFEST_VERSION, ManifestStore, decode_state, manifest_path};
     use crate::options::BucketOptions;
 
     #[test]
@@ -878,13 +956,27 @@ mod tests {
         payload.extend_from_slice(&0_u32.to_le_bytes());
         payload.extend_from_slice(&u32::MAX.to_le_bytes());
 
-        let error = decode_state(&payload).expect_err("impossible table count should fail");
+        let error = decode_state(&payload, MANIFEST_VERSION)
+            .expect_err("impossible table count should fail");
         assert!(
             error
                 .to_string()
                 .contains("table count exceeds payload bytes"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn manifest_decode_accepts_previous_version_without_pending_blob_deletions() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0_u64.to_le_bytes());
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+
+        let state = decode_state(&payload, 4).expect("v4 manifest decodes");
+        assert!(state.buckets().is_empty());
+        assert!(state.tables().is_empty());
+        assert!(state.pending_blob_deletions().is_empty());
     }
 
     #[test]

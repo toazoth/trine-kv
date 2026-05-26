@@ -299,6 +299,45 @@ db.persist(DurabilityMode::SyncAll)?;
 
 Read [durability.md](durability.md) before choosing a mode for production data.
 
+## Large Values And Blob GC
+
+Small values stay inline in SSTables. In persistent mode, values at or above a
+bucket's `blob_threshold_bytes` are written into Titan-like blob files when
+memtables flush or compaction writes new SSTables. WAL records and memtables
+still keep the complete value, so ordinary writes do not need a blob file on
+the foreground path.
+
+Configure the default bucket threshold through `DbOptions`:
+
+```rust
+use trine_kv::{BucketOptions, Db, DbOptions};
+
+let db = Db::open(
+    DbOptions::persistent("./trine-data").with_default_bucket_options(
+        BucketOptions {
+            blob_threshold_bytes: 64 * 1024,
+            ..BucketOptions::default()
+        },
+    ),
+)?;
+```
+
+Blob GC is enabled for persistent databases by default. It runs from the
+compaction path, rewrites still-live records out of stale blob files, and keeps
+old blob files until no snapshot or range iterator can still reach them.
+
+Use database-level options to tune when GC is considered:
+
+```rust
+use trine_kv::{BlobGcRatio, DbOptions};
+
+let mut options = DbOptions::persistent("./trine-data");
+options.blob_gc_min_file_bytes = 64 * 1024 * 1024;
+options.blob_gc_discardable_ratio = BlobGcRatio::from_millionths(500_000);
+```
+
+In-memory databases keep values inline and do not create disk blob files.
+
 ## Flush, Compaction, And Stats
 
 Flush writes memtable contents into SSTables and advances the manifest replay
@@ -323,8 +362,12 @@ Inspect live state with `Db::stats`:
 ```rust
 let stats = db.stats();
 println!(
-    "buckets={} tables={} cache_hits={} blob_reads={}",
-    stats.live_buckets, stats.total_tables, stats.block_cache_hits, stats.blob_read_count
+    "buckets={} tables={} cache_hits={} blob_reads={} blob_gc_runs={}",
+    stats.live_buckets,
+    stats.total_tables,
+    stats.block_cache_hits,
+    stats.blob_read_count,
+    stats.blob_gc_runs,
 );
 ```
 

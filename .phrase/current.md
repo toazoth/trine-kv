@@ -6,71 +6,81 @@ Complete
 
 ## Goal
 
-Wire the Titan-like `BlobFile` format into flush, compaction output, table
-properties, read stats, and persistent recovery.
+Finish the first Titan-like large-value lifecycle by adding snapshot-safe blob
+GC rewrite, manifest pending-deletion recovery, and user-facing GC controls.
 
 ## Entry Condition
 
-- Phase 34 completed the standalone `BlobIndex` and `BlobFile` format.
-- User asked to finish the remaining spec integration work from that phase.
+- Phase 35 completed `BlobFile` flush/recovery integration.
+- User asked to finish the remaining large-value work.
 
 ## Scope
 
-- Make persistent table writes separate large inline values into the new
-  `BlobFile` format and store `ValueRef::BlobIndex` in SSTables.
-- Keep small values inline and keep in-memory mode on inline memtable values.
-- Record per-table blob reference metadata: file id, referenced bytes, record
-  count, and key span.
-- Validate manifest-referenced blob files during persistent open.
-- Count blob reads and bytes in `DbStats`.
-- Add focused persistent tests for new blob output, reopen reads, corrupt blob
-  detection, manifest/table blob references, and blob read stats.
+- Add database-level blob GC controls.
+- Mark obsolete blob files in manifest metadata before physical deletion.
+- Rewrite still-live records from partially stale blob files into new blob
+  files during compaction-triggered GC.
+- Keep old blob files while snapshots or lazy range iterators can still reach
+  old table handles.
+- Resume safe pending-deletion cleanup on writable open.
+- Expose blob GC counters in `DbStats`.
+- Update docs and protocol notes for the implemented GC behavior.
 
 ## Out Of Scope
 
-- Snapshot-safe blob GC rewrite.
-- Level Merge.
-- Blob compression tuning beyond writing the stable compression id in the
-  record format. The first integrated writer stores blob values uncompressed.
+- Titan Level Merge policy and range-locality optimization.
+- WAL-time value separation.
+- Hole punching or in-place blob-file rewriting.
+- A separate in-memory blob store.
 
 ## Acceptance Gate
 
-- Flush writes the new `BlobFile` format for values at or above
-  `blob_threshold_bytes`.
-- SSTables store `BlobIndex` for separated values and inline bytes for small
-  values.
-- Persistent reopen validates referenced blob files and fails closed on corrupt
-  blob content.
-- Table and manifest metadata preserve blob reference details.
-- Point and range/prefix reads only read blob bytes after an LSM record is
-  visible.
+- Compaction records obsolete blob files as manifest pending deletions.
+- GC rewrites live records out of partially stale blob files and keeps reads
+  correct across reopen.
+- Pending obsolete blob files are removed only when no active read can reach
+  them.
+- Recovery cleans safe pending blob deletions and preserves conflicting
+  referenced pending entries.
+- Manifest v4 files still decode with empty pending-deletion metadata.
 - Rust verification passes.
 
 ## Active Task Slice
 
 ```text
-task115 [x] goal:wire flush to new BlobFile and BlobIndex | scope:src/blob.rs src/table.rs | verify:persistent blob flush test
-task116 [x] goal:validate referenced blob files on open | scope:src/recovery.rs src/db.rs | verify:corrupt referenced blob reopen test
-task117 [x] goal:record blob reference/read stats | scope:src/table.rs src/manifest.rs src/stats.rs src/db.rs src/iterator.rs src/lsm/read.rs | verify:stats assertions + cargo test
-task118 [x] goal:run full verification and record evidence | scope:repo .phrase docs | verify:cargo test + clippy + diff checks
+task119 [x] goal:add blob GC controls and counters | scope:src/options.rs src/stats.rs src/db.rs | verify:cargo check
+task120 [x] goal:publish pending blob deletions in manifest | scope:src/manifest.rs src/db.rs | verify:pending deletion recovery tests
+task121 [x] goal:rewrite partially stale blob files safely | scope:src/blob.rs src/db.rs src/table.rs | verify:blob GC rewrite tests
+task122 [x] goal:run full verification and record evidence | scope:repo .phrase docs | verify:cargo test + clippy + diff checks
 ```
 
 ## Known Blockers
 
-- Snapshot-safe blob GC rewrite is still a follow-up phase.
 - Remote CI cannot be executed locally; it must run after push.
+- Blob GC throughput has correctness coverage but not a dedicated benchmark
+  yet.
 
 ## Evidence
 
-- `cargo test persistent_flush_writes_blob_index_file_and_reopen_reads_large_values --all-features`
+- `cargo check --all-targets --all-features` passes.
+- `cargo test persistent_blob_gc_rewrites_live_records_from_partially_stale_file --all-features`
   passes.
-- `cargo test persistent_reopen_fails_on_corrupt_referenced_blob_file --all-features`
+- `cargo test persistent_blob_gc_keeps_old_blob_while_read_pin_can_reach_it --all-features`
+  passes.
+- `cargo test persistent_recovery_cleans_manifest_pending_blob_deletion --all-features`
+  passes.
+- `cargo test persistent_recovery_does_not_delete_referenced_pending_blob_deletion --all-features`
+  passes.
+- `cargo test manifest_decode_accepts_previous_version_without_pending_blob_deletions --all-features`
   passes.
 - `cargo test --all-targets --all-features` passes.
 - `cargo clippy --all-targets --all-features` passes.
+- `cargo fmt --all --check` passes.
+- `git diff --check` passes.
+- Forbidden-term scan over `.phrase`, `src`, `tests`, `benches`, `examples`,
+  `docs`, and `README.md` passes.
 
 ## Next Recommendation
 
-- Start the next implementation slice for snapshot-safe blob GC rewrite and
-  publish/delete metadata once the user wants to continue the large-value
-  lifecycle work.
+- Commit Phase 36 once the user wants a checkpoint, then run a dedicated
+  large-value/GC benchmark phase before tuning throughput.

@@ -10,7 +10,7 @@ use std::{
 };
 
 use crate::{
-    blob,
+    blob::{self, ValueRef},
     bucket::{Bucket, BucketName, DEFAULT_BUCKET_NAME},
     cache, compaction, durability,
     error::{Error, Result},
@@ -59,6 +59,10 @@ pub(crate) struct DbInner {
     compaction_output_tables: AtomicU64,
     compaction_input_bytes: AtomicU64,
     compaction_output_bytes: AtomicU64,
+    blob_gc_runs: AtomicU64,
+    blob_gc_input_bytes: AtomicU64,
+    blob_gc_output_bytes: AtomicU64,
+    blob_gc_discarded_bytes: AtomicU64,
     blob_reads: Arc<BlobReadMetrics>,
     maintenance: Arc<MaintenanceCoordinator>,
 }
@@ -83,6 +87,37 @@ struct NamedCompactionOutput {
 struct PendingCompactionOutputs {
     outputs: Vec<NamedCompactionOutput>,
     written_table_ids: Vec<table::TableId>,
+}
+
+struct BlobGcCandidate {
+    file_id: u64,
+    total_bytes: u64,
+    live_bytes: u64,
+}
+
+struct BlobGcRewriteTable {
+    bucket: String,
+    input_table_id: table::TableId,
+    output_table_id: table::TableId,
+    level: table::TableLevel,
+    options: table::TableWriteOptions,
+    point_records: Vec<table::TablePointRecord>,
+    range_tombstones: Vec<table::TableRangeTombstone>,
+}
+
+struct BlobGcRewriteRecord {
+    internal_key: crate::internal_key::InternalKey,
+    value: Vec<u8>,
+    compression: crate::codec::CodecId,
+    table_index: usize,
+    record_index: usize,
+}
+
+struct BlobGcRewritePlan {
+    candidate: BlobGcCandidate,
+    new_blob_file_id: u64,
+    tables: Vec<BlobGcRewriteTable>,
+    records: Vec<BlobGcRewriteRecord>,
 }
 
 #[derive(Debug)]
@@ -165,6 +200,11 @@ impl Drop for DbInner {
             &self.snapshots,
             &self.pending_obsolete_table_ids,
         );
+        let _ = cleanup_pending_obsolete_blob_files(
+            persistent_path_from_options(&self.options),
+            &self.snapshots,
+            self.manifest.as_ref(),
+        );
     }
 }
 
@@ -217,6 +257,10 @@ impl Db {
                 compaction_output_tables: AtomicU64::new(0),
                 compaction_input_bytes: AtomicU64::new(0),
                 compaction_output_bytes: AtomicU64::new(0),
+                blob_gc_runs: AtomicU64::new(0),
+                blob_gc_input_bytes: AtomicU64::new(0),
+                blob_gc_output_bytes: AtomicU64::new(0),
+                blob_gc_discarded_bytes: AtomicU64::new(0),
                 blob_reads: Arc::new(BlobReadMetrics::default()),
                 maintenance: Arc::new(MaintenanceCoordinator::new()),
             }),
@@ -229,6 +273,7 @@ impl Db {
         let StorageMode::Persistent { path } = &options.storage_mode else {
             return Err(Error::invalid_options("persistent open requires a path"));
         };
+        let db_path_for_cleanup = path.clone();
 
         if path.exists() {
             if !path.is_dir() {
@@ -260,6 +305,7 @@ impl Db {
         ensure_default_bucket_in_manifest(&mut manifest, &options)?;
         let replay_floor = manifest.state().wal_replay_floor();
         let referenced_blob_ids = referenced_blob_file_ids_from_manifest(manifest.state());
+        let allowed_blob_ids = allowed_blob_file_ids_from_manifest(manifest.state());
         let mut buckets = buckets_from_manifest(path, manifest.state())?;
         ensure_default_bucket_loaded(&mut buckets, &options)?;
         recovery::fail_on_missing_referenced_blob_files(path, &referenced_blob_ids)?;
@@ -267,7 +313,7 @@ impl Db {
         recovery::fail_on_unreferenced_storage_files(
             path,
             &referenced_table_file_ids(manifest.state()),
-            &referenced_blob_ids,
+            &allowed_blob_ids,
         )?;
 
         let wal_path = wal::wal_path(path);
@@ -296,11 +342,18 @@ impl Db {
                 compaction_output_tables: AtomicU64::new(0),
                 compaction_input_bytes: AtomicU64::new(0),
                 compaction_output_bytes: AtomicU64::new(0),
+                blob_gc_runs: AtomicU64::new(0),
+                blob_gc_input_bytes: AtomicU64::new(0),
+                blob_gc_output_bytes: AtomicU64::new(0),
+                blob_gc_discarded_bytes: AtomicU64::new(0),
                 blob_reads: Arc::new(BlobReadMetrics::default()),
                 maintenance: Arc::new(MaintenanceCoordinator::new()),
             }),
         };
         db.replay_wal_batches(batches, replay_floor)?;
+        if !db.inner.options.read_only {
+            db.cleanup_pending_obsolete_blob_files(&db_path_for_cleanup)?;
+        }
         db.start_background_workers()?;
 
         Ok(db)
@@ -608,6 +661,7 @@ impl Db {
             self.compact_range(KeyRange::all())?;
         }
         self.cleanup_pending_obsolete_table_files(&db_path)?;
+        self.cleanup_pending_obsolete_blob_files(&db_path)?;
 
         Ok(())
     }
@@ -679,6 +733,8 @@ impl Db {
             .filter(|table_id| !output_table_ids.contains(table_id))
             .collect::<Vec<_>>();
         let output_table_ids_for_stats = output_table_ids.iter().copied().collect::<Vec<_>>();
+        let obsolete_blob_ids =
+            self.obsolete_blob_ids_for_compaction(&compaction_inputs, &written_tables)?;
 
         if let Err(error) = self.validate_compacted_tables(&written_tables) {
             let _ = remove_storage_files(&db_path, &written_table_ids);
@@ -695,7 +751,7 @@ impl Db {
             }
         }
 
-        if let Err(error) = self.publish_compacted_tables(&written_tables) {
+        if let Err(error) = self.publish_compacted_tables(&written_tables, &obsolete_blob_ids) {
             let _ = remove_storage_files(&db_path, &written_table_ids);
             return Err(error);
         }
@@ -708,7 +764,10 @@ impl Db {
             &output_table_ids_for_stats,
         );
         self.retire_obsolete_table_files(&db_path, &obsolete_table_ids)?;
-        self.remove_unreferenced_blob_files(&db_path)?;
+        self.cleanup_pending_obsolete_blob_files(&db_path)?;
+        if self.inner.options.blob_gc_enabled {
+            self.run_blob_gc_once_locked(&db_path)?;
+        }
 
         Ok(())
     }
@@ -734,6 +793,10 @@ impl Db {
             compaction_output_tables: self.inner.compaction_output_tables.load(Ordering::Acquire),
             compaction_input_bytes: self.inner.compaction_input_bytes.load(Ordering::Acquire),
             compaction_output_bytes: self.inner.compaction_output_bytes.load(Ordering::Acquire),
+            blob_gc_runs: self.inner.blob_gc_runs.load(Ordering::Acquire),
+            blob_gc_input_bytes: self.inner.blob_gc_input_bytes.load(Ordering::Acquire),
+            blob_gc_output_bytes: self.inner.blob_gc_output_bytes.load(Ordering::Acquire),
+            blob_gc_discarded_bytes: self.inner.blob_gc_discarded_bytes.load(Ordering::Acquire),
             ..DbStats::default()
         };
         let (blob_read_count, blob_read_bytes) = self.inner.blob_reads.snapshot();
@@ -834,6 +897,7 @@ impl Db {
         };
         if let Some(db_path) = self.persistent_path().map(Path::to_path_buf) {
             let _ = self.cleanup_pending_obsolete_table_files(&db_path);
+            let _ = self.cleanup_pending_obsolete_blob_files(&db_path);
         }
         if let Ok(mut process_lock) = self.inner.process_lock.lock() {
             process_lock.take();
@@ -1352,6 +1416,210 @@ impl Db {
         })
     }
 
+    fn run_blob_gc_once_locked(&self, db_path: &Path) -> Result<()> {
+        let Some(plan) = self.build_blob_gc_rewrite_plan(db_path)? else {
+            return Ok(());
+        };
+
+        let input_bytes = plan.candidate.total_bytes;
+        let discarded_bytes = plan
+            .candidate
+            .total_bytes
+            .saturating_sub(plan.candidate.live_bytes);
+
+        let header = blob::BlobFileHeader::new(
+            plan.new_blob_file_id,
+            self.last_committed_sequence(),
+            1,
+            crate::codec::CodecId::None,
+        );
+        let blob_records = blob_gc_blob_records(&plan.records);
+
+        let written_table_ids = plan
+            .tables
+            .iter()
+            .map(|table| table.output_table_id)
+            .collect::<Vec<_>>();
+        let obsolete_table_ids = plan
+            .tables
+            .iter()
+            .map(|table| table.input_table_id)
+            .collect::<Vec<_>>();
+        let indexes =
+            match blob::write_blob_file(db_path, plan.new_blob_file_id, header, &blob_records) {
+                Ok(indexes) => indexes,
+                Err(error) => {
+                    let _ = remove_storage_files(db_path, &written_table_ids);
+                    return Err(error);
+                }
+            };
+
+        let mut tables = plan.tables;
+        let output_bytes = match apply_blob_gc_indexes(&mut tables, plan.records, indexes) {
+            Ok(output_bytes) => output_bytes,
+            Err(error) => {
+                let _ = remove_storage_files(db_path, &written_table_ids);
+                return Err(error);
+            }
+        };
+        let outputs = match write_blob_gc_replacement_tables(db_path, tables) {
+            Ok(outputs) => outputs,
+            Err(error) => {
+                let _ = remove_storage_files(db_path, &written_table_ids);
+                return Err(error);
+            }
+        };
+
+        if let Err(error) = durability::sync_dir_after_renames(db_path) {
+            let _ = remove_storage_files(db_path, &written_table_ids);
+            return Err(error);
+        }
+
+        if let Err(error) = self.publish_compacted_tables(&outputs, &[plan.candidate.file_id]) {
+            let _ = remove_storage_files(db_path, &written_table_ids);
+            return Err(error);
+        }
+
+        self.install_compacted_tables(outputs)?;
+        self.retire_obsolete_table_files(db_path, &obsolete_table_ids)?;
+        self.inner.blob_gc_runs.fetch_add(1, Ordering::AcqRel);
+        self.inner
+            .blob_gc_input_bytes
+            .fetch_add(input_bytes, Ordering::AcqRel);
+        self.inner
+            .blob_gc_output_bytes
+            .fetch_add(output_bytes, Ordering::AcqRel);
+        self.inner
+            .blob_gc_discarded_bytes
+            .fetch_add(discarded_bytes, Ordering::AcqRel);
+        self.cleanup_pending_obsolete_blob_files(db_path)
+    }
+
+    fn build_blob_gc_rewrite_plan(&self, db_path: &Path) -> Result<Option<BlobGcRewritePlan>> {
+        let Some(candidate) = self.choose_blob_gc_candidate(db_path)? else {
+            return Ok(None);
+        };
+        let blob_file = blob::read_blob_file(db_path, candidate.file_id)?;
+        let mut records_by_offset = BTreeMap::new();
+        for record in blob_file.records {
+            records_by_offset.insert(record.index.offset, record);
+        }
+
+        let mut next_table_id = self.next_table_id()?;
+        let new_blob_file_id = next_table_id.get();
+        let buckets = self
+            .inner
+            .buckets
+            .read()
+            .map_err(|_| lock_poisoned("bucket registry"))?;
+        let mut tables = Vec::new();
+        let mut rewrite_records = Vec::new();
+
+        for (bucket, tree) in buckets.iter() {
+            for table in tree.tables_snapshot()? {
+                if !table.blob_file_ids().contains(&candidate.file_id) {
+                    continue;
+                }
+                let output_table_id = next_table_id;
+                next_table_id = next_table_id.next().ok_or_else(|| Error::Corruption {
+                    message: "table id counter overflow".to_owned(),
+                })?;
+
+                let table_index = tables.len();
+                let point_records = table.point_records()?;
+                for (record_index, point_record) in point_records.iter().enumerate() {
+                    let Some(ValueRef::BlobIndex(index)) = point_record.value.as_ref() else {
+                        continue;
+                    };
+                    if index.file_id != candidate.file_id {
+                        continue;
+                    }
+                    let blob_record =
+                        records_by_offset
+                            .get(&index.offset)
+                            .ok_or_else(|| Error::Corruption {
+                                message: "blob GC input record is missing from blob file"
+                                    .to_owned(),
+                            })?;
+                    if blob_record.index != *index
+                        || blob_record.record.internal_key != point_record.internal_key
+                    {
+                        return Err(Error::Corruption {
+                            message: "blob GC input record metadata mismatch".to_owned(),
+                        });
+                    }
+                    rewrite_records.push(BlobGcRewriteRecord {
+                        internal_key: point_record.internal_key.clone(),
+                        value: blob_record.record.value.clone(),
+                        compression: blob_record.record.compression,
+                        table_index,
+                        record_index,
+                    });
+                }
+
+                tables.push(BlobGcRewriteTable {
+                    bucket: bucket.clone(),
+                    input_table_id: table.properties().id,
+                    output_table_id,
+                    level: table.properties().level,
+                    options: blob_gc_table_write_options(&tree.options),
+                    point_records,
+                    range_tombstones: table.range_tombstones()?.all().to_vec(),
+                });
+            }
+        }
+        drop(buckets);
+
+        if rewrite_records.is_empty() {
+            return Ok(None);
+        }
+        rewrite_records.sort_by(|left, right| left.internal_key.cmp(&right.internal_key));
+
+        Ok(Some(BlobGcRewritePlan {
+            candidate,
+            new_blob_file_id,
+            tables,
+            records: rewrite_records,
+        }))
+    }
+
+    fn choose_blob_gc_candidate(&self, db_path: &Path) -> Result<Option<BlobGcCandidate>> {
+        let live_bytes_by_file = self.live_blob_bytes_by_file()?;
+        let mut best = None;
+
+        for (file_id, live_bytes) in live_bytes_by_file {
+            let properties = blob::validate_blob_file(db_path, file_id)?;
+            let total_bytes = properties.encoded_bytes;
+            if total_bytes < self.inner.options.blob_gc_min_file_bytes {
+                continue;
+            }
+            let discardable_bytes = total_bytes.saturating_sub(live_bytes);
+            if discardable_bytes == 0
+                || !self
+                    .inner
+                    .options
+                    .blob_gc_discardable_ratio
+                    .should_collect(discardable_bytes, total_bytes)
+            {
+                continue;
+            }
+
+            let candidate = BlobGcCandidate {
+                file_id,
+                total_bytes,
+                live_bytes,
+            };
+            let replace = best.as_ref().is_none_or(|current: &BlobGcCandidate| {
+                discardable_bytes > current.total_bytes.saturating_sub(current.live_bytes)
+            });
+            if replace {
+                best = Some(candidate);
+            }
+        }
+
+        Ok(best)
+    }
+
     fn next_table_id(&self) -> Result<table::TableId> {
         self.inner
             .manifest
@@ -1384,7 +1652,11 @@ impl Db {
             .add_tables(edits, flush_sequence)
     }
 
-    fn publish_compacted_tables(&self, outputs: &[NamedCompactionOutput]) -> Result<()> {
+    fn publish_compacted_tables(
+        &self,
+        outputs: &[NamedCompactionOutput],
+        obsolete_blob_ids: &[u64],
+    ) -> Result<()> {
         let edits = outputs
             .iter()
             .map(|output| {
@@ -1408,7 +1680,11 @@ impl Db {
             })?
             .lock()
             .map_err(|_| lock_poisoned("manifest store"))?
-            .replace_tables_batch(edits)
+            .replace_tables_batch_and_mark_blob_deletions(
+                edits,
+                obsolete_blob_ids.to_vec(),
+                self.last_committed_sequence(),
+            )
     }
 
     fn rewrite_wal_after_replay_floor(&self, db_path: &Path, replay_floor: Sequence) -> Result<()> {
@@ -1453,37 +1729,88 @@ impl Db {
         Ok(())
     }
 
-    fn live_blob_file_ids(&self) -> Result<BTreeSet<u64>> {
+    fn live_blob_bytes_by_file(&self) -> Result<BTreeMap<u64, u64>> {
         let buckets = self
             .inner
             .buckets
             .read()
             .map_err(|_| lock_poisoned("bucket registry"))?;
-        referenced_blob_file_ids(&buckets)
+        let mut live_blob_bytes_by_file = BTreeMap::<u64, u64>::new();
+
+        for state in buckets.values() {
+            for table in state.tables_snapshot()? {
+                for reference in table.properties().blob_references() {
+                    live_blob_bytes_by_file
+                        .entry(reference.file_id)
+                        .and_modify(|bytes| {
+                            *bytes = bytes.saturating_add(reference.referenced_bytes);
+                        })
+                        .or_insert(reference.referenced_bytes);
+                }
+            }
+        }
+
+        Ok(live_blob_bytes_by_file)
     }
 
-    fn remove_unreferenced_blob_files(&self, db_path: &Path) -> Result<()> {
-        // This pass runs after manifest publish and the in-memory table switch.
-        // A snapshot or short read pin may still hold an older Arc<Table>, so
-        // skip deletion when any pin exists; a later compaction can retry.
-        if self.inner.snapshots.active_count() != 0 {
-            return Ok(());
+    fn cleanup_pending_obsolete_blob_files(&self, db_path: &Path) -> Result<()> {
+        cleanup_pending_obsolete_blob_files(
+            Some(db_path),
+            &self.inner.snapshots,
+            self.inner.manifest.as_ref(),
+        )
+    }
+
+    fn obsolete_blob_ids_for_compaction(
+        &self,
+        inputs: &[NamedCompactionInput],
+        outputs: &[NamedCompactionOutput],
+    ) -> Result<Vec<u64>> {
+        let input_table_ids = inputs
+            .iter()
+            .flat_map(|input| input.input.input_table_ids.iter().copied())
+            .collect::<BTreeSet<_>>();
+        let input_blob_ids = inputs
+            .iter()
+            .flat_map(|input| {
+                input
+                    .input
+                    .input_tables
+                    .iter()
+                    .flat_map(|table| table.blob_file_ids())
+            })
+            .collect::<BTreeSet<_>>();
+        let output_blob_ids = outputs
+            .iter()
+            .flat_map(|output| {
+                output
+                    .output
+                    .tables
+                    .iter()
+                    .flat_map(|table| table.blob_file_ids())
+            })
+            .collect::<BTreeSet<_>>();
+
+        let buckets = self
+            .inner
+            .buckets
+            .read()
+            .map_err(|_| lock_poisoned("bucket registry"))?;
+        let mut outside_blob_ids = BTreeSet::new();
+        for state in buckets.values() {
+            for table in state.tables_snapshot()? {
+                if input_table_ids.contains(&table.properties().id) {
+                    continue;
+                }
+                outside_blob_ids.extend(table.blob_file_ids());
+            }
         }
 
-        let live_file_ids = self.live_blob_file_ids()?;
-        for file_id in blob::list_blob_file_ids(db_path)? {
-            if live_file_ids.contains(&file_id) {
-                continue;
-            }
-
-            match fs::remove_file(blob::blob_path(db_path, file_id)) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(Error::Io(error)),
-            }
-        }
-
-        Ok(())
+        Ok(input_blob_ids
+            .difference(&output_blob_ids)
+            .copied()
+            .filter(|file_id| !outside_blob_ids.contains(file_id))
+            .collect())
     }
 
     fn retire_obsolete_table_files(
@@ -1582,6 +1909,17 @@ fn validate_options(options: &DbOptions) -> Result<()> {
     if options.max_l0_files == 0 {
         return Err(Error::invalid_options("max L0 files must be non-zero"));
     }
+    let blob_gc_ratio = options.blob_gc_discardable_ratio.millionths();
+    if blob_gc_ratio == 0 || blob_gc_ratio > 1_000_000 {
+        return Err(Error::invalid_options(
+            "blob GC discardable ratio must be in (0.0, 1.0]",
+        ));
+    }
+    if options.blob_gc_enabled && options.blob_gc_min_file_bytes == 0 {
+        return Err(Error::invalid_options(
+            "blob GC minimum file size must be non-zero",
+        ));
+    }
 
     Ok(())
 }
@@ -1671,6 +2009,18 @@ fn add_obsolete_blob_stats(
     live_blob_bytes_by_file: &BTreeMap<u64, u64>,
     stats: &mut DbStats,
 ) {
+    for (file_id, live_bytes) in live_blob_bytes_by_file {
+        let Ok(properties) = blob::validate_blob_file(db_path, *file_id) else {
+            continue;
+        };
+        if properties.encoded_bytes > *live_bytes {
+            stats.stale_blob_files = stats.stale_blob_files.saturating_add(1);
+            stats.stale_blob_bytes = stats
+                .stale_blob_bytes
+                .saturating_add(properties.encoded_bytes - *live_bytes);
+        }
+    }
+
     let Ok(blob_file_ids) = blob::list_blob_file_ids(db_path) else {
         return;
     };
@@ -1715,16 +2065,92 @@ fn referenced_blob_file_ids_from_manifest(manifest: &ManifestState) -> BTreeSet<
         .collect()
 }
 
-fn referenced_blob_file_ids(buckets: &BTreeMap<String, Arc<LsmTree>>) -> Result<BTreeSet<u64>> {
-    let mut file_ids = BTreeSet::new();
+fn allowed_blob_file_ids_from_manifest(manifest: &ManifestState) -> BTreeSet<u64> {
+    let mut file_ids = referenced_blob_file_ids_from_manifest(manifest);
+    file_ids.extend(manifest.pending_blob_deletions().keys().copied());
+    file_ids
+}
 
-    for state in buckets.values() {
-        for table in state.tables_snapshot()? {
-            file_ids.extend(table.blob_file_ids());
-        }
+fn blob_gc_table_write_options(options: &BucketOptions) -> table::TableWriteOptions {
+    table::TableWriteOptions {
+        codec: options.compression.codec_id(),
+        block_bytes: options.block_bytes,
+        filter_policy: options.filter_policy,
+        prefix_extractor: options.prefix_extractor.clone(),
+        prefix_filter_policy: options.prefix_filter_policy,
+        blob_threshold_bytes: usize::MAX,
+    }
+}
+
+fn blob_gc_blob_records(records: &[BlobGcRewriteRecord]) -> Vec<blob::BlobRecord> {
+    records
+        .iter()
+        .map(|record| blob::BlobRecord {
+            internal_key: record.internal_key.clone(),
+            value: record.value.clone(),
+            compression: record.compression,
+        })
+        .collect()
+}
+
+fn apply_blob_gc_indexes(
+    tables: &mut [BlobGcRewriteTable],
+    records: Vec<BlobGcRewriteRecord>,
+    indexes: Vec<blob::BlobIndex>,
+) -> Result<u64> {
+    if records.len() != indexes.len() {
+        return Err(Error::Corruption {
+            message: "blob GC rewrite record count does not match blob indexes".to_owned(),
+        });
     }
 
-    Ok(file_ids)
+    let output_bytes = indexes.iter().fold(0_u64, |bytes, index| {
+        bytes.saturating_add(index.encoded_len)
+    });
+    for (rewrite, index) in records.into_iter().zip(indexes) {
+        let record = tables
+            .get_mut(rewrite.table_index)
+            .and_then(|table| table.point_records.get_mut(rewrite.record_index))
+            .ok_or_else(|| Error::Corruption {
+                message: "blob GC rewrite record position is invalid".to_owned(),
+            })?;
+        record.value = Some(ValueRef::BlobIndex(index));
+    }
+
+    Ok(output_bytes)
+}
+
+fn write_blob_gc_replacement_tables(
+    db_path: &Path,
+    tables: Vec<BlobGcRewriteTable>,
+) -> Result<Vec<NamedCompactionOutput>> {
+    let mut outputs = Vec::with_capacity(tables.len());
+    for rewrite_table in tables {
+        let table_path = table::table_path(db_path, rewrite_table.output_table_id);
+        let point_records = rewrite_table
+            .point_records
+            .iter()
+            .map(|record| (record.internal_key.clone(), record.value.clone()))
+            .collect::<Vec<_>>();
+        let table = Arc::new(table::write_table(
+            &table_path,
+            rewrite_table.output_table_id,
+            rewrite_table.level,
+            &rewrite_table.options,
+            &point_records,
+            &rewrite_table.range_tombstones,
+        )?);
+
+        outputs.push(NamedCompactionOutput {
+            bucket: rewrite_table.bucket,
+            output: LsmCompactionOutput {
+                input_table_ids: vec![rewrite_table.input_table_id],
+                tables: vec![table],
+            },
+        });
+    }
+
+    Ok(outputs)
 }
 
 fn validate_bucket_options(options: &BucketOptions) -> Result<()> {
@@ -1825,6 +2251,55 @@ fn cleanup_pending_obsolete_table_files(
     }
 
     Ok(())
+}
+
+fn cleanup_pending_obsolete_blob_files(
+    db_path: Option<&Path>,
+    snapshots: &SnapshotTracker,
+    manifest: Option<&Mutex<ManifestStore>>,
+) -> Result<()> {
+    let Some(db_path) = db_path else {
+        return Ok(());
+    };
+    if snapshots.active_count() != 0 {
+        return Ok(());
+    }
+    let manifest = manifest.ok_or_else(|| Error::Corruption {
+        message: "persistent database is missing manifest store".to_owned(),
+    })?;
+
+    let pending_file_ids = {
+        let manifest = manifest
+            .lock()
+            .map_err(|_| lock_poisoned("manifest store"))?;
+        let referenced_blob_ids = referenced_blob_file_ids_from_manifest(manifest.state());
+        // Manifest metadata is the deletion authority. A pending entry that is
+        // still referenced is inconsistent, so leave it on disk instead of
+        // risking a read-visible blob file.
+        manifest
+            .state()
+            .pending_blob_deletions()
+            .keys()
+            .copied()
+            .filter(|file_id| !referenced_blob_ids.contains(file_id))
+            .collect::<Vec<_>>()
+    };
+    if pending_file_ids.is_empty() {
+        return Ok(());
+    }
+
+    for file_id in &pending_file_ids {
+        match fs::remove_file(blob::blob_path(db_path, *file_id)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(Error::Io(error)),
+        }
+    }
+
+    manifest
+        .lock()
+        .map_err(|_| lock_poisoned("manifest store"))?
+        .clear_pending_blob_deletions(&pending_file_ids)
 }
 
 fn remove_table_files(db_path: &Path, table_ids: &[table::TableId]) -> Result<()> {

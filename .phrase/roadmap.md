@@ -701,3 +701,29 @@ spec integration work.
   closed on corrupt blob data.
 - `DbStats` exposes blob read count and bytes.
 - Full local Rust verification passes.
+
+### Phase 36: Snapshot-Safe Blob GC
+
+**Status**: Complete
+
+**Goal**: Finish the first Titan-like large-value lifecycle by making stale
+blob files recoverable, measurable, and safe to reclaim.
+
+**Entry Condition**: Phase 35 complete and user asks to finish the remaining
+large-value work.
+
+**Acceptance Gate**:
+
+- Compaction records obsolete blob files as manifest pending deletions instead
+  of deleting them directly.
+- Blob GC rewrites still-live records from partially stale blob files into new
+  blob files without creating user-visible MVCC versions.
+- Old blob files remain readable while an active snapshot or range iterator can
+  still reach old table handles.
+- Writable recovery tolerates manifest-pending obsolete blob files and resumes
+  physical cleanup.
+- Cleanup refuses to delete a pending blob file that is still referenced by a
+  manifest-live table.
+- `DbOptions` exposes blob GC threshold/ratio controls and `DbStats` exposes GC
+  counters.
+- Full local Rust verification passes.

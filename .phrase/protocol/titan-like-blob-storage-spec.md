@@ -187,9 +187,10 @@ Recovery must reject:
 
 Bucket-level options:
 
-- `blob_threshold_bytes`: default `64 KiB`;
-- `blob_compression`: default `Fast` after correctness tests pass; `None` is
-  allowed for the first format implementation if it lowers risk;
+- `blob_threshold_bytes`: default `1 MiB`, with smaller thresholds allowed for
+  large-value-heavy buckets;
+- blob record compression follows the bucket compression profile, using Trine's
+  `none` or `fast-lz4-block` codec ids;
 - `blob_level_merge_enabled`: default `false`.
 
 Database-level persistent options:
@@ -273,9 +274,12 @@ These properties are required for:
 
 ## 11. Manifest Metadata
 
-The manifest is the source of truth for live table and blob files.
+The manifest is the source of truth for live table and blob files. Live blob
+references are stored through SSTable properties referenced by the manifest.
+Durable pending deletion state is stored directly in the manifest.
 
-It must track per-blob-file metadata:
+Per-blob-file state is derived from live table properties and blob file
+properties:
 
 ```text
 BlobFileMetadata {
@@ -294,8 +298,10 @@ Rules:
 
 - adding SSTables and blob files happens in one manifest edit;
 - GC output and old-file pending deletion happen in one manifest edit;
-- deleting old blob files happens only after the active snapshot floor is newer
-  than `pending_deletion_sequence`;
+- deleting old blob files happens only after no active snapshot, read pin, or
+  old table handle can still reach the old `BlobIndex`;
+- cleanup must refuse to delete a pending blob file if any manifest-live table
+  still references it;
 - recovery must rebuild or validate blob estimates from live SSTable
   properties when needed.
 
@@ -342,12 +348,11 @@ GC rewrite:
 
 1. pin the current LSM versions and snapshot floor;
 2. read the selected blob file sequentially;
-3. for each `BlobRecord`, use its key/version metadata to look up the current
-   LSM record for that exact internal key;
-4. if the current LSM record still points to the exact old `BlobIndex`, copy the
-   value into a new blob file and publish an equivalent `BlobIndex` for the
-   same internal key;
-5. otherwise drop the blob record;
+3. for each live SSTable reference to that blob file, validate that the
+   `BlobRecord` metadata matches the exact internal key and old `BlobIndex`;
+4. copy still-referenced values into a new blob file and publish equivalent
+   `BlobIndex` records for the same internal keys;
+5. drop blob records that are no longer referenced by live SSTables;
 6. publish a manifest edit that marks the old blob file pending deletion at the
    GC publish sequence.
 

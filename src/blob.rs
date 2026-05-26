@@ -200,19 +200,8 @@ pub(crate) fn write_large_values(
         .unwrap_or(Sequence::ZERO);
     let threshold_bytes = usize_to_u64(threshold, "blob threshold")?;
     let header = BlobFileHeader::new(file_id, creation_sequence, threshold_bytes, compression);
-    let (blob_bytes, indexes) = encode_blob_file(header, &blob_records)?;
+    let indexes = write_blob_file(db_path, file_id, header, &blob_records)?;
     let mut index_iter = indexes.into_iter();
-
-    let path = blob_path(db_path, file_id);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let tmp_path = path.with_extension("tmp");
-    let mut file = File::create(&tmp_path)?;
-    file.write_all(&blob_bytes)?;
-    file.sync_all()?;
-    drop(file);
-    fs::rename(tmp_path, &path)?;
 
     let mut rewritten = Vec::with_capacity(records.len());
 
@@ -275,6 +264,11 @@ pub(crate) fn read_value_for_internal_key(
 }
 
 pub(crate) fn validate_blob_file(db_path: &Path, file_id: u64) -> Result<BlobFileProperties> {
+    let blob_file = read_blob_file(db_path, file_id)?;
+    Ok(blob_file.properties)
+}
+
+pub(crate) fn read_blob_file(db_path: &Path, file_id: u64) -> Result<BlobFile> {
     let mut bytes = Vec::new();
     File::open(blob_path(db_path, file_id))
         .map_err(|error| Error::Corruption {
@@ -293,7 +287,32 @@ pub(crate) fn validate_blob_file(db_path: &Path, file_id: u64) -> Result<BlobFil
             ),
         });
     }
-    Ok(blob_file.properties)
+    Ok(blob_file)
+}
+
+pub(crate) fn write_blob_file(
+    db_path: &Path,
+    file_id: u64,
+    header: BlobFileHeader,
+    records: &[BlobRecord],
+) -> Result<Vec<BlobIndex>> {
+    if header.file_id != file_id {
+        return Err(Error::invalid_options(
+            "blob header file id must match the output file id",
+        ));
+    }
+    let (blob_bytes, indexes) = encode_blob_file(header, records)?;
+    let path = blob_path(db_path, file_id);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp_path = path.with_extension("tmp");
+    let mut file = File::create(&tmp_path)?;
+    file.write_all(&blob_bytes)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(tmp_path, &path)?;
+    Ok(indexes)
 }
 
 pub fn encode_blob_file(

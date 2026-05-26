@@ -32,6 +32,10 @@ Release packaging notes live in [docs/release.md](docs/release.md).
   index search policies.
 - Large values can be separated into Titan-like blob files with `BlobIndex`
   records in SSTables.
+- Snapshot-safe blob GC rewrites still-live large values out of stale blob
+  files and delays old-file deletion while a read can still reach them.
+- Live stats report table, cache, filter, blob read, blob byte, and blob GC
+  counters.
 
 ## Install
 

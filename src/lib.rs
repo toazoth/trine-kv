@@ -41,8 +41,9 @@ pub use error::{Error, Result};
 pub use iterator::{Direction, Iter};
 pub use mvcc::SnapshotSequence;
 pub use options::{
-    BucketOptions, CompressionProfile, DbOptions, DurabilityMode, FailOnCorruptionPolicy,
-    FilterPolicy, IndexSearchPolicy, PrefixFilterPolicy, StorageMode, WriteOptions,
+    BlobGcRatio, BucketOptions, CompressionProfile, DbOptions, DurabilityMode,
+    FailOnCorruptionPolicy, FilterPolicy, IndexSearchPolicy, PrefixFilterPolicy, StorageMode,
+    WriteOptions,
 };
 pub use prefix::PrefixExtractor;
 pub use recovery::RecoveryReport;
