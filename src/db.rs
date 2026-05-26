@@ -17,7 +17,10 @@ use crate::{
     internal_key::{
         InternalKey, ValueKind, first_internal_key_for_user, last_internal_key_for_user,
     },
-    iterator::{Direction, Iter, RecordSource, ScanRangeTombstone, ScanSelector},
+    iterator::{
+        Direction, Iter, RecordGroup, RecordSource, ScanRangeTombstone, ScanSelector,
+        prefix_successor,
+    },
     keyspace::{Keyspace, KeyspaceName},
     manifest::{self, ManifestState, ManifestStore},
     memtable::Memtable,
@@ -25,10 +28,11 @@ use crate::{
         DbOptions, DurabilityMode, FailOnCorruptionPolicy, FilterPolicy, KeyspaceOptions,
         PrefixFilterPolicy, StorageMode,
     },
+    range_tombstone::{self, RangeTombstoneIndex, RangeTombstoneLike},
     recovery,
     snapshot::{Snapshot, SnapshotTracker},
     stats::{DbStats, LevelStats},
-    table::{self, Table, TableRangeTombstone},
+    table::{self, Table, TablePointCursor, TableRangeTombstone},
     transaction::{Transaction, TransactionOptions},
     types::{KeyRange, Sequence},
     wal::{self, WalWriter},
@@ -107,6 +111,12 @@ impl RangeTombstone {
     }
 }
 
+impl RangeTombstoneLike for RangeTombstone {
+    fn range(&self) -> &KeyRange {
+        &self.range
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ImmutableMemtable {
     memtable: Arc<Memtable>,
@@ -127,18 +137,28 @@ struct FlushInput {
 
 struct CompactionInput {
     keyspace: String,
-    table_id: table::TableId,
     table_level: table::TableLevel,
     table_options: table::TableWriteOptions,
     input_table_ids: Vec<table::TableId>,
-    point_records: Vec<(InternalKey, Option<ValueRef>)>,
-    range_tombstones: Vec<TableRangeTombstone>,
+    input_tables: Vec<Arc<Table>>,
+    index_search_policy: crate::options::IndexSearchPolicy,
 }
 
 struct CompactionOutput {
     keyspace: String,
     input_table_ids: Vec<table::TableId>,
-    table: Option<Arc<Table>>,
+    tables: Vec<Arc<Table>>,
+}
+
+#[derive(Debug, Default)]
+struct CompactionChunk {
+    point_records: Vec<(InternalKey, Option<ValueRef>)>,
+    estimated_bytes: u64,
+}
+
+struct CompactionTablePayload {
+    point_records: Vec<(InternalKey, Option<ValueRef>)>,
+    range_tombstones: Vec<TableRangeTombstone>,
 }
 
 #[derive(Debug, Clone)]
@@ -405,20 +425,30 @@ impl Db {
             .flat_map(|input| input.input_table_ids.iter().copied())
             .collect::<Vec<_>>();
         let mut written_tables = Vec::with_capacity(compaction_inputs.len());
-        let mut written_table_ids = Vec::with_capacity(compaction_inputs.len());
+        let mut written_table_ids = Vec::new();
+        let mut next_table_id = self.next_table_id()?;
         for input in &compaction_inputs {
-            let table = if input.point_records.is_empty() && input.range_tombstones.is_empty() {
-                None
-            } else {
-                let table_path = table::table_path(&db_path, input.table_id);
-                written_table_ids.push(input.table_id);
+            let payloads = build_compaction_table_payloads(
+                input,
+                &range,
+                oldest_active_snapshot,
+                self.inner.options.target_table_bytes,
+            )?;
+            let mut output_tables = Vec::with_capacity(payloads.len());
+            for payload in payloads {
+                let table_id = next_table_id;
+                next_table_id = next_table_id.next().ok_or_else(|| Error::Corruption {
+                    message: "table id counter overflow".to_owned(),
+                })?;
+                let table_path = table::table_path(&db_path, table_id);
+                written_table_ids.push(table_id);
                 let table = match table::write_table(
                     &table_path,
-                    input.table_id,
+                    table_id,
                     input.table_level,
                     &input.table_options,
-                    &input.point_records,
-                    &input.range_tombstones,
+                    &payload.point_records,
+                    &payload.range_tombstones,
                 ) {
                     Ok(table) => table,
                     Err(error) => {
@@ -426,12 +456,12 @@ impl Db {
                         return Err(error);
                     }
                 };
-                Some(Arc::new(table))
-            };
+                output_tables.push(Arc::new(table));
+            }
             written_tables.push(CompactionOutput {
                 keyspace: input.keyspace.clone(),
                 input_table_ids: input.input_table_ids.clone(),
-                table,
+                tables: output_tables,
             });
         }
 
@@ -656,7 +686,7 @@ impl Db {
         let state = self.keyspace_state(keyspace)?;
         let selector = ScanSelector::Range(range.clone());
         let sources = scan_sources(&state, &selector, direction, Some(&self.inner.block_cache))?;
-        let range_tombstones = scan_range_tombstones(&state)?;
+        let range_tombstones = scan_range_tombstones(&state, &selector)?;
         let db_path = self.persistent_path().map(Path::to_path_buf);
 
         Ok(Iter::from_sources(
@@ -682,7 +712,7 @@ impl Db {
         let state = self.keyspace_state(keyspace)?;
         let selector = ScanSelector::Prefix(prefix.to_vec());
         let sources = scan_sources(&state, &selector, direction, Some(&self.inner.block_cache))?;
-        let range_tombstones = scan_range_tombstones(&state)?;
+        let range_tombstones = scan_range_tombstones(&state, &selector)?;
         let db_path = self.persistent_path().map(Path::to_path_buf);
 
         Ok(Iter::from_sources(
@@ -960,13 +990,13 @@ impl Db {
         range: &KeyRange,
         oldest_active_snapshot: Sequence,
     ) -> Result<Vec<CompactionInput>> {
-        let mut next_table_id = self.next_table_id()?;
         let keyspaces = self
             .inner
             .keyspaces
             .read()
             .map_err(|_| lock_poisoned("keyspace registry"))?;
         let mut inputs = Vec::new();
+        let compaction_options = compaction_options(&self.inner.options);
 
         for (name, state) in keyspaces.iter() {
             let (candidate_tables, table_level) = {
@@ -976,10 +1006,20 @@ impl Db {
                     .map_err(|_| lock_poisoned("table list"))?;
                 let plan_tables = tables
                     .iter()
-                    .map(|table| compaction::CompactionTable::from_properties(table.properties()))
+                    .map(|table| {
+                        compaction::CompactionTable::from_properties_with_bytes(
+                            table.properties(),
+                            table.estimated_file_bytes(),
+                        )
+                    })
                     .collect::<Vec<_>>();
-                let Some(plan) =
-                    compaction::plan_compaction(name, &plan_tables, range, oldest_active_snapshot)?
+                let Some(plan) = compaction::plan_compaction(
+                    name,
+                    &plan_tables,
+                    range,
+                    oldest_active_snapshot,
+                    compaction_options,
+                )?
                 else {
                     continue;
                 };
@@ -992,37 +1032,19 @@ impl Db {
                 (candidate_tables, plan.output_level)
             };
 
-            let mut input_table_ids = Vec::with_capacity(candidate_tables.len());
-            let mut point_records = Vec::new();
-            let mut range_tombstones = Vec::new();
-            for table in &candidate_tables {
-                input_table_ids.push(table.properties().id);
-                point_records.extend(
-                    table
-                        .point_records()?
-                        .into_iter()
-                        .map(|record| (record.internal_key, record.value)),
-                );
-                let table_tombstones = table.range_tombstones()?;
-                range_tombstones.extend(table_tombstones.iter().cloned());
-            }
-            let point_records = compact_point_records(point_records, oldest_active_snapshot);
-            let point_records = cleanup_point_tombstones(&point_records);
-            let range_tombstones =
-                cleanup_range_tombstones(range_tombstones, &point_records, range_is_all(range));
+            let input_table_ids = candidate_tables
+                .iter()
+                .map(|table| table.properties().id)
+                .collect::<Vec<_>>();
 
             inputs.push(CompactionInput {
                 keyspace: name.clone(),
-                table_id: next_table_id,
                 table_level,
                 table_options: table_write_options(&state.options),
                 input_table_ids,
-                point_records,
-                range_tombstones,
+                input_tables: candidate_tables,
+                index_search_policy: state.options.index_search_policy,
             });
-            next_table_id = next_table_id.next().ok_or_else(|| Error::Corruption {
-                message: "table id counter overflow".to_owned(),
-            })?;
         }
 
         Ok(inputs)
@@ -1068,9 +1090,10 @@ impl Db {
                     output.keyspace.clone(),
                     output.input_table_ids.clone(),
                     output
-                        .table
-                        .as_ref()
-                        .map(|table| table.properties().clone()),
+                        .tables
+                        .iter()
+                        .map(|table| table.properties().clone())
+                        .collect::<Vec<_>>(),
                 )
             })
             .collect::<Vec<_>>();
@@ -1139,7 +1162,7 @@ impl Db {
                 .write()
                 .map_err(|_| lock_poisoned("table list"))?;
             tables.retain(|table| !output.input_table_ids.contains(&table.properties().id));
-            if let Some(table) = output.table {
+            for table in output.tables {
                 tables.push(table);
             }
             sort_tables_for_reads(&mut tables);
@@ -1512,6 +1535,304 @@ fn table_write_options(options: &KeyspaceOptions) -> table::TableWriteOptions {
     }
 }
 
+fn compaction_options(options: &DbOptions) -> compaction::CompactionOptions {
+    compaction::CompactionOptions {
+        target_table_bytes: usize_to_u64_saturating(options.target_table_bytes),
+        level_size_multiplier: usize_to_u64_saturating(options.level_size_multiplier),
+        max_l0_files: options.max_l0_files,
+    }
+}
+
+fn build_compaction_table_payloads(
+    input: &CompactionInput,
+    range: &KeyRange,
+    oldest_active_snapshot: Sequence,
+    target_table_bytes: usize,
+) -> Result<Vec<CompactionTablePayload>> {
+    let mut sources = input
+        .input_tables
+        .iter()
+        .cloned()
+        .map(|table| {
+            CompactionSource::new(table.point_cursor(
+                ScanSelector::Range(range.clone()),
+                input.table_options.prefix_extractor.clone(),
+                Direction::Forward,
+                input.index_search_policy,
+                None,
+            ))
+        })
+        .collect::<Vec<_>>();
+    let range_tombstones = collect_compaction_range_tombstones(input, range)?;
+    let mut tombstone_has_remaining_put = vec![false; range_tombstones.len()];
+    let mut chunks = Vec::new();
+    let mut current_chunk = CompactionChunk::default();
+    let target_table_bytes = usize_to_u64_saturating(target_table_bytes).max(1);
+
+    while let Some(user_key) = next_compaction_user_key(&mut sources)? {
+        let mut records = Vec::new();
+        for source in &mut sources {
+            if source.current_key()? == Some(user_key.as_slice()) {
+                let group = source
+                    .take_current_group()?
+                    .expect("source current key must have a current group");
+                records.push(group.first);
+                records.extend(group.rest);
+            }
+        }
+
+        let records = compact_point_record_group(records, oldest_active_snapshot);
+        if records.is_empty() {
+            continue;
+        }
+        mark_tombstones_covering_records(
+            &range_tombstones,
+            &mut tombstone_has_remaining_put,
+            &records,
+        );
+        push_compaction_records_to_chunks(
+            &mut chunks,
+            &mut current_chunk,
+            records,
+            target_table_bytes,
+        );
+    }
+
+    if !current_chunk.point_records.is_empty() {
+        chunks.push(current_chunk);
+    }
+
+    let range_tombstones = cleanup_range_tombstones_by_coverage(
+        range_tombstones,
+        tombstone_has_remaining_put,
+        range_is_all(range),
+    );
+    Ok(compaction_payloads_from_chunks(
+        chunks,
+        &range_tombstones,
+        range_is_all(range),
+        target_table_bytes,
+    ))
+}
+
+fn collect_compaction_range_tombstones(
+    input: &CompactionInput,
+    range: &KeyRange,
+) -> Result<Vec<TableRangeTombstone>> {
+    let mut tombstones = Vec::new();
+    for table in &input.input_tables {
+        tombstones.extend(table.range_tombstones_overlapping_range(range)?);
+    }
+    range_tombstone::sort_tombstones(&mut tombstones);
+    Ok(tombstones)
+}
+
+#[derive(Debug)]
+struct CompactionSource {
+    cursor: TablePointCursor,
+    current: Option<RecordGroup>,
+}
+
+impl CompactionSource {
+    fn new(cursor: TablePointCursor) -> Self {
+        Self {
+            cursor,
+            current: None,
+        }
+    }
+
+    fn current_key(&mut self) -> Result<Option<&[u8]>> {
+        self.ensure_current()?;
+        Ok(self.current.as_ref().map(|group| group.user_key.as_slice()))
+    }
+
+    fn take_current_group(&mut self) -> Result<Option<RecordGroup>> {
+        self.ensure_current()?;
+        Ok(self.current.take())
+    }
+
+    fn ensure_current(&mut self) -> Result<()> {
+        if self.current.is_none() {
+            self.current = self.cursor.next_group()?;
+        }
+        Ok(())
+    }
+}
+
+fn next_compaction_user_key(sources: &mut [CompactionSource]) -> Result<Option<Vec<u8>>> {
+    let mut selected: Option<Vec<u8>> = None;
+    for source in sources {
+        let Some(user_key) = source.current_key()? else {
+            continue;
+        };
+        if selected
+            .as_ref()
+            .is_none_or(|selected| user_key < selected.as_slice())
+        {
+            selected = Some(user_key.to_vec());
+        }
+    }
+    Ok(selected)
+}
+
+fn compact_point_record_group(
+    records: Vec<(InternalKey, Option<ValueRef>)>,
+    oldest_active_snapshot: Sequence,
+) -> Vec<(InternalKey, Option<ValueRef>)> {
+    let compacted = compact_point_records(records, oldest_active_snapshot);
+    cleanup_point_tombstones(&compacted)
+}
+
+fn push_compaction_records_to_chunks(
+    chunks: &mut Vec<CompactionChunk>,
+    current_chunk: &mut CompactionChunk,
+    records: Vec<(InternalKey, Option<ValueRef>)>,
+    target_table_bytes: u64,
+) {
+    let record_bytes = records.iter().map(compaction_record_bytes).sum::<u64>();
+    if !current_chunk.point_records.is_empty()
+        && current_chunk.estimated_bytes.saturating_add(record_bytes) > target_table_bytes
+    {
+        chunks.push(std::mem::take(current_chunk));
+    }
+
+    current_chunk.estimated_bytes = current_chunk.estimated_bytes.saturating_add(record_bytes);
+    current_chunk.point_records.extend(records);
+}
+
+fn mark_tombstones_covering_records(
+    tombstones: &[TableRangeTombstone],
+    tombstone_has_remaining_put: &mut [bool],
+    records: &[(InternalKey, Option<ValueRef>)],
+) {
+    for (internal_key, _) in records {
+        if !matches!(internal_key.kind(), ValueKind::Put) {
+            continue;
+        }
+        for (index, tombstone) in tombstones.iter().enumerate() {
+            if internal_key.sequence() <= tombstone.sequence
+                && key_is_in_range(internal_key.user_key(), &tombstone.range)
+            {
+                tombstone_has_remaining_put[index] = true;
+            }
+        }
+    }
+}
+
+fn cleanup_range_tombstones_by_coverage(
+    range_tombstones: Vec<TableRangeTombstone>,
+    tombstone_has_remaining_put: Vec<bool>,
+    full_keyspace_compaction: bool,
+) -> Vec<TableRangeTombstone> {
+    if !full_keyspace_compaction {
+        return range_tombstones;
+    }
+
+    range_tombstones
+        .into_iter()
+        .zip(tombstone_has_remaining_put)
+        .filter_map(|(tombstone, keep)| keep.then_some(tombstone))
+        .collect()
+}
+
+fn compaction_payloads_from_chunks(
+    chunks: Vec<CompactionChunk>,
+    range_tombstones: &[TableRangeTombstone],
+    full_keyspace_compaction: bool,
+    target_table_bytes: u64,
+) -> Vec<CompactionTablePayload> {
+    let mut payloads = Vec::with_capacity(chunks.len());
+    let mut assigned_tombstones = vec![false; range_tombstones.len()];
+
+    for chunk in chunks {
+        let Some(span) = chunk_range(&chunk.point_records) else {
+            continue;
+        };
+        let mut chunk_tombstones = Vec::new();
+        for (index, tombstone) in range_tombstones.iter().enumerate() {
+            if let Some(tombstone) =
+                tombstone_for_output_span(tombstone, &span, full_keyspace_compaction)
+            {
+                assigned_tombstones[index] = true;
+                chunk_tombstones.push(tombstone);
+            }
+        }
+
+        payloads.push(CompactionTablePayload {
+            point_records: chunk.point_records,
+            range_tombstones: chunk_tombstones,
+        });
+    }
+
+    let mut tombstone_only = Vec::new();
+    let mut tombstone_only_bytes = 0_u64;
+    for (index, tombstone) in range_tombstones.iter().enumerate() {
+        if assigned_tombstones[index] {
+            continue;
+        }
+        let tombstone_bytes = range_tombstone_bytes(tombstone);
+        if !tombstone_only.is_empty()
+            && tombstone_only_bytes.saturating_add(tombstone_bytes) > target_table_bytes
+        {
+            payloads.push(CompactionTablePayload {
+                point_records: Vec::new(),
+                range_tombstones: std::mem::take(&mut tombstone_only),
+            });
+            tombstone_only_bytes = 0;
+        }
+        tombstone_only.push(tombstone.clone());
+        tombstone_only_bytes = tombstone_only_bytes.saturating_add(tombstone_bytes);
+    }
+    if !tombstone_only.is_empty() {
+        payloads.push(CompactionTablePayload {
+            point_records: Vec::new(),
+            range_tombstones: tombstone_only,
+        });
+    }
+
+    payloads
+}
+
+fn tombstone_for_output_span(
+    tombstone: &TableRangeTombstone,
+    span: &KeyRange,
+    full_keyspace_compaction: bool,
+) -> Option<TableRangeTombstone> {
+    if full_keyspace_compaction {
+        range_tombstone::range_intersection(&tombstone.range, span).map(|range| {
+            TableRangeTombstone {
+                range,
+                sequence: tombstone.sequence,
+                batch_index: tombstone.batch_index,
+            }
+        })
+    } else if range_tombstone::ranges_overlap(&tombstone.range, span) {
+        Some(tombstone.clone())
+    } else {
+        None
+    }
+}
+
+fn chunk_range(point_records: &[(InternalKey, Option<ValueRef>)]) -> Option<KeyRange> {
+    let smallest = point_records.first()?.0.user_key();
+    let largest = point_records.last()?.0.user_key();
+    Some(range_tombstone::range_from_inclusive_span(
+        smallest, largest,
+    ))
+}
+
+fn compaction_record_bytes(record: &(InternalKey, Option<ValueRef>)) -> u64 {
+    usize_to_u64_saturating(record.0.user_key().len())
+        .saturating_add(record.1.as_ref().map_or(0, ValueRef::len))
+        .saturating_add(32)
+}
+
+fn range_tombstone_bytes(tombstone: &TableRangeTombstone) -> u64 {
+    key_range_bytes(&tombstone.range)
+        .saturating_add(usize_to_u64_saturating(std::mem::size_of::<Sequence>()))
+        .saturating_add(usize_to_u64_saturating(std::mem::size_of::<u32>()))
+}
+
 fn compact_point_records(
     mut point_records: Vec<(InternalKey, Option<ValueRef>)>,
     oldest_active_snapshot: Sequence,
@@ -1581,6 +1902,7 @@ fn has_older_point_record(
         .any(|(internal_key, _)| internal_key.sequence() <= tombstone_sequence)
 }
 
+#[cfg(test)]
 fn cleanup_range_tombstones(
     range_tombstones: Vec<TableRangeTombstone>,
     point_records: &[(InternalKey, Option<ValueRef>)],
@@ -1599,6 +1921,7 @@ fn cleanup_range_tombstones(
         .collect()
 }
 
+#[cfg(test)]
 fn range_tombstone_covers_remaining_put(
     tombstone: &TableRangeTombstone,
     point_records: &[(InternalKey, Option<ValueRef>)],
@@ -1791,26 +2114,9 @@ fn collect_range_point_records(
     Ok(records)
 }
 
-fn collect_range_tombstones(state: &KeyspaceState) -> Result<Vec<RangeTombstone>> {
-    let mut tombstones = collect_memtable_range_tombstones(state)?;
-
-    let tables = state
-        .tables
-        .read()
-        .map_err(|_| lock_poisoned("table list"))?;
-    for table in tables.iter() {
-        let table_tombstones = table.range_tombstones()?;
-        tombstones.extend(table_tombstones.iter().map(|tombstone| RangeTombstone {
-            range: tombstone.range.clone(),
-            sequence: tombstone.sequence,
-            batch_index: tombstone.batch_index,
-        }));
-    }
-
-    Ok(tombstones)
-}
-
-fn collect_memtable_range_tombstones(state: &KeyspaceState) -> Result<Vec<RangeTombstone>> {
+fn collect_memtable_range_tombstones(
+    state: &KeyspaceState,
+) -> Result<RangeTombstoneIndex<RangeTombstone>> {
     let active_tombstones = state
         .range_tombstones
         .read()
@@ -1827,16 +2133,55 @@ fn collect_memtable_range_tombstones(state: &KeyspaceState) -> Result<Vec<RangeT
         tombstones.extend(immutable.range_tombstones.iter().cloned());
     }
 
-    Ok(tombstones)
+    Ok(RangeTombstoneIndex::new(tombstones))
 }
 
-fn scan_range_tombstones(state: &KeyspaceState) -> Result<Vec<ScanRangeTombstone>> {
-    Ok(collect_range_tombstones(state)?
-        .into_iter()
+fn scan_range_tombstones(
+    state: &KeyspaceState,
+    selector: &ScanSelector,
+) -> Result<Vec<ScanRangeTombstone>> {
+    let range = selector_query_range(selector);
+    let memtable_tombstones = collect_memtable_range_tombstones(state)?;
+    let mut tombstones = memtable_tombstones
+        .overlapping_range(&range)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let tables = state
+        .tables
+        .read()
+        .map_err(|_| lock_poisoned("table list"))?;
+    for table in tables.iter() {
+        tombstones.extend(
+            table
+                .range_tombstones_overlapping_range(&range)?
+                .into_iter()
+                .map(|tombstone| RangeTombstone {
+                    range: tombstone.range,
+                    sequence: tombstone.sequence,
+                    batch_index: tombstone.batch_index,
+                }),
+        );
+    }
+
+    Ok(RangeTombstoneIndex::new(tombstones)
+        .all()
+        .iter()
+        .cloned()
         .map(|tombstone| {
             ScanRangeTombstone::new(tombstone.range, tombstone.sequence, tombstone.batch_index)
         })
         .collect())
+}
+
+fn selector_query_range(selector: &ScanSelector) -> KeyRange {
+    match selector {
+        ScanSelector::Range(range) => range.clone(),
+        ScanSelector::Prefix(prefix) => KeyRange {
+            start: Bound::Included(prefix.clone()),
+            end: prefix_successor(prefix).map_or(Bound::Unbounded, Bound::Excluded),
+        },
+    }
 }
 
 fn point_key_modified_after(
@@ -1918,16 +2263,12 @@ fn read_visible_point(
             let mut covered_by_table_tombstone = false;
             if !covered_by_memtable_tombstone {
                 for table in tables.iter() {
-                    let table_tombstones = table.range_tombstones()?;
-                    covered_by_table_tombstone = table_tombstones.iter().any(|tombstone| {
-                        table_range_tombstone_covers_visible_point(
-                            tombstone,
-                            key,
-                            candidate.internal_key.sequence(),
-                            candidate.internal_key.batch_index(),
-                            read_sequence,
-                        )
-                    });
+                    covered_by_table_tombstone = table.range_tombstone_covers_visible_point(
+                        key,
+                        candidate.internal_key.sequence(),
+                        candidate.internal_key.batch_index(),
+                        read_sequence,
+                    )?;
                     if covered_by_table_tombstone {
                         break;
                     }
@@ -2018,21 +2359,6 @@ fn keep_newer_point_candidate(
     }
 }
 
-fn table_range_tombstone_covers_visible_point(
-    tombstone: &TableRangeTombstone,
-    key: &[u8],
-    point_sequence: Sequence,
-    point_batch_index: u32,
-    read_sequence: Sequence,
-) -> bool {
-    if tombstone.sequence > read_sequence || !key_is_in_range(key, &tombstone.range) {
-        return false;
-    }
-
-    tombstone.sequence > point_sequence
-        || (tombstone.sequence == point_sequence && tombstone.batch_index > point_batch_index)
-}
-
 fn value_bytes(value: Option<&ValueRef>, db_path: Option<&Path>) -> Result<Vec<u8>> {
     let value = value.ok_or_else(|| Error::Corruption {
         message: "put record is missing value bytes".to_owned(),
@@ -2077,13 +2403,13 @@ fn range_is_all(range: &KeyRange) -> bool {
 }
 
 fn range_tombstones_cover(
-    range_tombstones: &[RangeTombstone],
+    range_tombstones: &RangeTombstoneIndex<RangeTombstone>,
     key: &[u8],
     point_sequence: Sequence,
     point_batch_index: u32,
     read_sequence: Sequence,
 ) -> bool {
-    range_tombstones.iter().any(|tombstone| {
+    range_tombstones.covering_key(key).any(|tombstone| {
         tombstone.covers_visible_point(key, point_sequence, point_batch_index, read_sequence)
     })
 }
@@ -2093,11 +2419,29 @@ fn range_tombstone_modified_after_key(
     key: &[u8],
     read_sequence: Sequence,
 ) -> Result<bool> {
-    let range_tombstones = collect_range_tombstones(state)?;
+    let memtable_tombstones = collect_memtable_range_tombstones(state)?;
+    if memtable_tombstones
+        .covering_key(key)
+        .any(|tombstone| tombstone.sequence > read_sequence)
+    {
+        return Ok(true);
+    }
 
-    Ok(range_tombstones.iter().any(|tombstone| {
-        tombstone.sequence > read_sequence && key_is_in_range(key, &tombstone.range)
-    }))
+    let tables = state
+        .tables
+        .read()
+        .map_err(|_| lock_poisoned("table list"))?;
+    for table in tables.iter() {
+        let tombstones = table.range_tombstones()?;
+        if tombstones
+            .covering_key(key)
+            .any(|tombstone| tombstone.sequence > read_sequence)
+        {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 fn range_tombstone_modified_after_range(
@@ -2105,27 +2449,29 @@ fn range_tombstone_modified_after_range(
     range: &KeyRange,
     read_sequence: Sequence,
 ) -> Result<bool> {
-    let range_tombstones = collect_range_tombstones(state)?;
-
-    Ok(range_tombstones.iter().any(|tombstone| {
-        tombstone.sequence > read_sequence && ranges_overlap(range, &tombstone.range)
-    }))
-}
-
-fn ranges_overlap(left: &KeyRange, right: &KeyRange) -> bool {
-    !range_ends_before_start(&left.end, &right.start)
-        && !range_ends_before_start(&right.end, &left.start)
-}
-
-fn range_ends_before_start(end: &Bound<Vec<u8>>, start: &Bound<Vec<u8>>) -> bool {
-    match (end, start) {
-        (Bound::Unbounded, _) | (_, Bound::Unbounded) => false,
-        (Bound::Excluded(end), Bound::Included(start) | Bound::Excluded(start)) => {
-            end.as_slice() <= start.as_slice()
-        }
-        (Bound::Included(end), Bound::Included(start)) => end.as_slice() < start.as_slice(),
-        (Bound::Included(end), Bound::Excluded(start)) => end.as_slice() <= start.as_slice(),
+    let memtable_tombstones = collect_memtable_range_tombstones(state)?;
+    if memtable_tombstones
+        .overlapping_range(range)
+        .any(|tombstone| tombstone.sequence > read_sequence)
+    {
+        return Ok(true);
     }
+
+    let tables = state
+        .tables
+        .read()
+        .map_err(|_| lock_poisoned("table list"))?;
+    for table in tables.iter() {
+        if table
+            .range_tombstones_overlapping_range(range)?
+            .into_iter()
+            .any(|tombstone| tombstone.sequence > read_sequence)
+        {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 fn apply_memtable_operation(
@@ -2165,11 +2511,14 @@ fn apply_memtable_operation(
                 .range_tombstones
                 .write()
                 .map_err(|_| lock_poisoned("range tombstones"))?;
-            range_tombstones.push(RangeTombstone {
-                range,
-                sequence,
-                batch_index,
-            });
+            range_tombstone::insert_sorted(
+                &mut range_tombstones,
+                RangeTombstone {
+                    range,
+                    sequence,
+                    batch_index,
+                },
+            );
         }
     }
 

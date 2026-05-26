@@ -184,13 +184,13 @@ impl ManifestStore {
         self.replace_tables_batch(vec![(
             keyspace.to_owned(),
             removed_table_ids.to_vec(),
-            Some(replacement),
+            vec![replacement],
         )])
     }
 
     pub fn replace_tables_batch(
         &mut self,
-        replacements: Vec<(String, Vec<TableId>, Option<TableProperties>)>,
+        replacements: Vec<(String, Vec<TableId>, Vec<TableProperties>)>,
     ) -> Result<()> {
         // Validate the whole batch before changing in-memory manifest state.
         // That keeps multi-keyspace compaction from publishing a partial edit.
@@ -218,7 +218,7 @@ impl ManifestStore {
         }
 
         let mut next_state = self.state.clone();
-        for (keyspace, removed_table_ids, replacement) in replacements {
+        for (keyspace, removed_table_ids, replacements) in replacements {
             let tables = next_state
                 .tables
                 .get_mut(&keyspace)
@@ -226,7 +226,7 @@ impl ManifestStore {
                     message: format!("manifest is missing table list for keyspace: {keyspace}"),
                 })?;
             tables.retain(|properties| !removed_table_ids.contains(&properties.id));
-            if let Some(replacement) = replacement {
+            for replacement in replacements {
                 tables.push(replacement);
             }
         }

@@ -2500,3 +2500,59 @@ Record only evidence that can change planning or durable decisions.
 
 - Move to compaction output sizing and level scoring, unless delete-heavy
   workloads make range tombstone query structures the sharper next risk.
+
+## 2026-05-26: Leveled Compaction And Range Tombstone Queries Passed
+
+### Observation
+
+- Range tombstones now use an ordered query index shared by memtable, SSTable,
+  point-read, transaction, and scan setup paths.
+- Point reads ask only for tombstones whose bounds can cover the requested key.
+- Range and prefix scans collect only tombstones overlapping the scan selector.
+- SSTable tombstone blocks remain on disk and are loaded on demand through the
+  table tombstone query path.
+- Compaction planning now uses L0 file pressure and L1+ level-size pressure.
+- L0 compaction groups overlapping L0 tables and overlapping L1 tables.
+- L1+ compaction moves selected inputs down one level with overlapping
+  next-level inputs.
+- Compaction merges table cursors by user key and splits output SSTables at
+  user-key boundaries according to `target_table_bytes`.
+- Full-keyspace compaction can drop range tombstones with no retained covered
+  put and clips retained tombstones to output key spans. Partial compaction
+  keeps original tombstone bounds.
+
+### Interpretation
+
+- Phase 19 is complete for the P3/P4 hardening slice.
+- The engine no longer creates one giant compaction output for a large input
+  set.
+- Range tombstone reads no longer need to inspect every tombstone in the
+  database for point reads or scan setup.
+- Compaction still runs synchronously under the writer coordinator; background
+  scheduling remains a separate phase.
+
+### Verification
+
+- `cargo test --all-targets --all-features`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo fmt --all`
+- Focused coverage:
+  - `covering_key_returns_only_possible_covering_tombstones`
+  - `overlapping_range_returns_only_intersecting_tombstones`
+  - `l0_plan_expands_overlapping_l0_group_and_lower_level_tables`
+  - `no_l0_fallback_moves_shallowest_overlapping_level_down`
+  - `overfull_level_score_picks_largest_pressure_ratio`
+  - `persistent_compaction_splits_outputs_and_moves_overfull_l1_down`
+
+### Remaining Blockers
+
+- GitHub Actions was not executed locally; remote CI must run after push.
+- Scan source merge is still linear across sources; a heap-based merge remains
+  later iterator hardening.
+- Flush and compaction are still foreground maintenance paths.
+
+### Recommended Next Action
+
+- Move to iterator merge hardening if read-path benchmarks remain the sharpest
+  risk; otherwise move to background flush/compaction scheduling and write
+  backpressure.

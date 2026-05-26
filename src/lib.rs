@@ -22,6 +22,7 @@ pub mod memtable;
 pub mod mvcc;
 pub mod options;
 pub mod prefix;
+mod range_tombstone;
 pub mod recovery;
 pub mod search;
 pub mod snapshot;

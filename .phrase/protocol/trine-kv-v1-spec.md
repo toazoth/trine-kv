@@ -588,6 +588,14 @@ Trine v1 uses leveled compaction:
 - reads check newer levels before older levels;
 - compaction picks input tables, merges sorted streams, writes new tables, and
   publishes a manifest edit.
+- L0 compaction groups overlapping L0 tables and includes overlapping L1 tables
+  before publishing L1 replacements;
+- L1 and deeper compaction uses level-size pressure from
+  `target_table_bytes * level_size_multiplier^(level - 1)` and moves selected
+  inputs down one level together with overlapping next-level inputs;
+- compaction output SSTables are split at user-key boundaries according to
+  `target_table_bytes`, except a single oversized user-key group may exceed the
+  target by itself.
 
 Compaction must preserve:
 
@@ -596,6 +604,9 @@ Compaction must preserve:
 - point tombstones needed to hide lower-level records;
 - range tombstones needed to hide covered lower-level records;
 - keyspace boundaries.
+- range tombstones may be clipped to output table key spans only when the
+  compaction scope proves older covered data outside the span has been removed;
+  partial compaction must retain the original tombstone bounds.
 
 Version cleanup rules for a user key:
 
@@ -621,6 +632,10 @@ Rules:
   compaction;
 - range tombstone indexes must allow reads to avoid scanning every tombstone in
   the database;
+- point reads query tombstones whose start bounds can cover the user key;
+- scan setup uses only tombstones whose bounds overlap the scan selector;
+- table tombstone blocks remain on disk and are loaded on demand when a
+  tombstone query needs that table;
 - partial compaction must retain tombstones if older covered data may still
   exist outside the compaction input.
 

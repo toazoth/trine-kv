@@ -7,6 +7,7 @@ use crate::{
         InternalKey, ValueKind, first_internal_key_for_user, last_internal_key_for_user,
     },
     memtable::Memtable,
+    range_tombstone::{RangeTombstoneIndex, RangeTombstoneLike},
     snapshot::Snapshot,
     table::TablePointCursor,
     types::{KeyRange, KeyValue, Sequence},
@@ -64,7 +65,7 @@ impl Iter {
                 read_sequence,
                 _read_pin: read_pin,
                 db_path,
-                range_tombstones,
+                range_tombstones: RangeTombstoneIndex::new(range_tombstones),
                 sources,
             }),
         }
@@ -93,7 +94,7 @@ struct LazyScan {
     read_sequence: Sequence,
     _read_pin: Snapshot,
     db_path: Option<PathBuf>,
-    range_tombstones: Vec<ScanRangeTombstone>,
+    range_tombstones: RangeTombstoneIndex<ScanRangeTombstone>,
     sources: Vec<RecordSource>,
 }
 
@@ -585,14 +586,20 @@ impl ScanRangeTombstone {
     }
 }
 
+impl RangeTombstoneLike for ScanRangeTombstone {
+    fn range(&self) -> &KeyRange {
+        &self.range
+    }
+}
+
 fn range_tombstones_cover(
-    range_tombstones: &[ScanRangeTombstone],
+    range_tombstones: &RangeTombstoneIndex<ScanRangeTombstone>,
     key: &[u8],
     point_sequence: Sequence,
     point_batch_index: u32,
     read_sequence: Sequence,
 ) -> bool {
-    range_tombstones.iter().any(|tombstone| {
+    range_tombstones.covering_key(key).any(|tombstone| {
         tombstone.covers_visible_point(key, point_sequence, point_batch_index, read_sequence)
     })
 }

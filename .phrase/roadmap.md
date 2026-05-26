@@ -329,3 +329,27 @@ the next read-path memory-cost mismatch.
 - False positives are allowed, but false negatives are rejected by table/block
   validation.
 - In-memory and persistent mode tests continue to pass.
+
+### Phase 19: Leveled Compaction And Range Tombstone Queries
+
+**Status**: Complete
+
+**Goal**: Make compaction use level pressure and target-sized outputs, and make
+range tombstone reads use ordered query structures.
+
+**Entry Condition**: Phase 18 complete and evidence identifies compaction output
+sizing plus tombstone lookup as the next production-readiness risks.
+
+**Acceptance Gate**:
+
+- Range tombstones are stored in ordered query structures for memtables and
+  SSTables.
+- Point reads and transaction conflict checks query only tombstones whose bounds
+  can cover the requested key or range.
+- Scan setup includes only tombstones overlapping the iterator selector.
+- L0 compaction groups overlapping L0 inputs with overlapping L1 inputs.
+- L1+ compaction uses level-size pressure and moves selected inputs down one
+  level with overlapping next-level inputs.
+- Compaction outputs split by `target_table_bytes` at user-key boundaries.
+- Existing in-memory, persistent, MVCC, range-delete, blob, and table tests keep
+  passing.

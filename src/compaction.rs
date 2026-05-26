@@ -14,19 +14,28 @@ pub struct CompactionPlan {
     pub oldest_active_snapshot: Sequence,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CompactionOptions {
+    pub(crate) target_table_bytes: u64,
+    pub(crate) level_size_multiplier: u64,
+    pub(crate) max_l0_files: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CompactionTable {
     pub(crate) id: TableId,
     pub(crate) level: TableLevel,
+    pub(crate) bytes: u64,
     smallest_user_key: Vec<u8>,
     largest_user_key: Vec<u8>,
 }
 
 impl CompactionTable {
-    pub(crate) fn from_properties(properties: &TableProperties) -> Self {
+    pub(crate) fn from_properties_with_bytes(properties: &TableProperties, bytes: u64) -> Self {
         Self {
             id: properties.id,
             level: properties.level,
+            bytes,
             smallest_user_key: properties.smallest_user_key.clone(),
             largest_user_key: properties.largest_user_key.clone(),
         }
@@ -64,35 +73,70 @@ pub(crate) fn plan_compaction(
     tables: &[CompactionTable],
     range: &KeyRange,
     oldest_active_snapshot: Sequence,
+    options: CompactionOptions,
 ) -> Result<Option<CompactionPlan>> {
-    let mut input_tables = l0_inputs_with_overlap(tables, range);
-    if input_tables.is_empty() {
-        input_tables = same_level_inputs(tables, range);
-    } else {
-        let span = key_span_for_inputs(tables, &input_tables);
-        for table in tables {
-            if table.level != TableLevel::ZERO
-                && span.as_ref().map_or_else(
-                    || table.overlaps_range(range),
-                    |span| table.overlaps_key_span(span),
-                )
-                && !input_tables.contains(&table.id)
-            {
-                input_tables.push(table.id);
-            }
+    if let Some(input_tables) = l0_compaction_inputs(tables, range, options) {
+        return Ok(Some(CompactionPlan {
+            keyspace: keyspace.to_owned(),
+            input_tables,
+            output_level: TableLevel(1),
+            oldest_active_snapshot,
+        }));
+    }
+
+    if let Some(level) = highest_scored_level(tables, range, options) {
+        let output_level = level.next().ok_or_else(level_overflow)?;
+        let input_tables = leveled_inputs(tables, range, level, output_level);
+        if !input_tables.is_empty() {
+            return Ok(Some(CompactionPlan {
+                keyspace: keyspace.to_owned(),
+                input_tables,
+                output_level,
+                oldest_active_snapshot,
+            }));
         }
     }
 
+    let Some(level) = shallowest_multi_table_level(tables, range) else {
+        return Ok(None);
+    };
+    let output_level = level.next().ok_or_else(level_overflow)?;
+    let input_tables = leveled_inputs(tables, range, level, output_level);
     if input_tables.len() < 2 {
         return Ok(None);
     }
 
     Ok(Some(CompactionPlan {
         keyspace: keyspace.to_owned(),
-        output_level: compaction_output_level(tables, &input_tables)?,
         input_tables,
+        output_level,
         oldest_active_snapshot,
     }))
+}
+
+fn l0_compaction_inputs(
+    tables: &[CompactionTable],
+    range: &KeyRange,
+    options: CompactionOptions,
+) -> Option<Vec<TableId>> {
+    let mut input_tables = l0_inputs_with_overlap(tables, range);
+    if input_tables.is_empty() {
+        return None;
+    }
+
+    let l0_count = tables
+        .iter()
+        .filter(|table| table.level == TableLevel::ZERO)
+        .count();
+    let span = key_span_for_inputs(tables, &input_tables);
+    include_overlapping_level(tables, &mut input_tables, TableLevel(1), span.as_ref());
+
+    let pressure = l0_count > options.max_l0_files;
+    if pressure || input_tables.len() >= 2 {
+        Some(input_tables)
+    } else {
+        None
+    }
 }
 
 fn l0_inputs_with_overlap(tables: &[CompactionTable], range: &KeyRange) -> Vec<TableId> {
@@ -127,21 +171,112 @@ fn l0_inputs_with_overlap(tables: &[CompactionTable], range: &KeyRange) -> Vec<T
     }
 }
 
-fn same_level_inputs(tables: &[CompactionTable], range: &KeyRange) -> Vec<TableId> {
-    let Some(level) = tables
-        .iter()
-        .filter(|table| table.overlaps_range(range))
-        .map(|table| table.level)
-        .min()
-    else {
-        return Vec::new();
-    };
-
+fn shallowest_multi_table_level(
+    tables: &[CompactionTable],
+    range: &KeyRange,
+) -> Option<TableLevel> {
     tables
         .iter()
-        .filter(|table| table.level == level && table.overlaps_range(range))
+        .filter(|table| table.level != TableLevel::ZERO && table.overlaps_range(range))
+        .map(|table| table.level)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .find(|level| {
+            tables
+                .iter()
+                .filter(|table| table.level == *level && table.overlaps_range(range))
+                .count()
+                >= 2
+        })
+}
+
+fn highest_scored_level(
+    tables: &[CompactionTable],
+    range: &KeyRange,
+    options: CompactionOptions,
+) -> Option<TableLevel> {
+    tables
+        .iter()
+        .filter(|table| table.level != TableLevel::ZERO && table.overlaps_range(range))
+        .map(|table| table.level)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .filter(|level| level_is_over_target(tables, *level, options))
+        .max_by(|left, right| compare_level_scores(tables, *left, *right, options))
+}
+
+fn level_is_over_target(
+    tables: &[CompactionTable],
+    level: TableLevel,
+    options: CompactionOptions,
+) -> bool {
+    level_bytes(tables, level) > level_target_bytes(level, options)
+}
+
+fn compare_level_scores(
+    tables: &[CompactionTable],
+    left: TableLevel,
+    right: TableLevel,
+    options: CompactionOptions,
+) -> std::cmp::Ordering {
+    let left_bytes = u128::from(level_bytes(tables, left));
+    let right_bytes = u128::from(level_bytes(tables, right));
+    let left_target = u128::from(level_target_bytes(left, options));
+    let right_target = u128::from(level_target_bytes(right, options));
+
+    left_bytes
+        .saturating_mul(right_target)
+        .cmp(&right_bytes.saturating_mul(left_target))
+}
+
+fn level_bytes(tables: &[CompactionTable], level: TableLevel) -> u64 {
+    tables
+        .iter()
+        .filter(|table| table.level == level)
+        .map(|table| table.bytes)
+        .sum()
+}
+
+fn level_target_bytes(level: TableLevel, options: CompactionOptions) -> u64 {
+    let exponent = level.get().saturating_sub(1);
+    let mut target = options.target_table_bytes.max(1);
+    for _ in 0..exponent {
+        target = target.saturating_mul(options.level_size_multiplier.max(2));
+    }
+    target
+}
+
+fn leveled_inputs(
+    tables: &[CompactionTable],
+    range: &KeyRange,
+    input_level: TableLevel,
+    output_level: TableLevel,
+) -> Vec<TableId> {
+    let mut input_tables = tables
+        .iter()
+        .filter(|table| table.level == input_level && table.overlaps_range(range))
         .map(|table| table.id)
-        .collect()
+        .collect::<Vec<_>>();
+    let span = key_span_for_inputs(tables, &input_tables);
+    include_overlapping_level(tables, &mut input_tables, output_level, span.as_ref());
+    input_tables
+}
+
+fn include_overlapping_level(
+    tables: &[CompactionTable],
+    input_tables: &mut Vec<TableId>,
+    level: TableLevel,
+    span: Option<&KeySpan>,
+) {
+    for table in tables {
+        let overlaps = span.map_or_else(
+            || table.overlaps_range(&KeyRange::all()),
+            |span| table.overlaps_key_span(span),
+        );
+        if table.level == level && overlaps && !input_tables.contains(&table.id) {
+            input_tables.push(table.id);
+        }
+    }
 }
 
 fn key_span_for_inputs(tables: &[CompactionTable], input_tables: &[TableId]) -> Option<KeySpan> {
@@ -164,22 +299,9 @@ fn key_span_for_inputs(tables: &[CompactionTable], input_tables: &[TableId]) -> 
     span
 }
 
-fn compaction_output_level(
-    tables: &[CompactionTable],
-    input_tables: &[TableId],
-) -> Result<TableLevel> {
-    let highest_level = tables
-        .iter()
-        .filter(|table| input_tables.contains(&table.id))
-        .map(|table| table.level)
-        .max()
-        .unwrap_or(TableLevel::ZERO);
-    if highest_level == TableLevel::ZERO {
-        highest_level.next().ok_or_else(|| Error::Corruption {
-            message: "table level counter overflow".to_owned(),
-        })
-    } else {
-        Ok(highest_level)
+fn level_overflow() -> Error {
+    Error::Corruption {
+        message: "table level counter overflow".to_owned(),
     }
 }
 
@@ -208,7 +330,7 @@ fn key_is_after_end(key: &[u8], end: &Bound<Vec<u8>>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{CompactionTable, plan_compaction};
+    use super::{CompactionOptions, CompactionTable, plan_compaction};
     use crate::{
         table::{TableId, TableLevel},
         types::{KeyRange, Sequence},
@@ -228,6 +350,7 @@ mod tests {
             &tables,
             &KeyRange::half_open(b"b", b"c"),
             Sequence::new(7),
+            options(),
         )
         .expect("planning succeeds")
         .expect("plan exists");
@@ -241,9 +364,15 @@ mod tests {
     fn single_l0_with_lower_overlap_is_planned() {
         let tables = vec![table(1, 0, b"a", b"c"), table(2, 1, b"b", b"d")];
 
-        let plan = plan_compaction("default", &tables, &KeyRange::all(), Sequence::ZERO)
-            .expect("planning succeeds")
-            .expect("plan exists");
+        let plan = plan_compaction(
+            "default",
+            &tables,
+            &KeyRange::all(),
+            Sequence::ZERO,
+            options(),
+        )
+        .expect("planning succeeds")
+        .expect("plan exists");
 
         assert_eq!(plan.input_tables, vec![TableId(1), TableId(2)]);
         assert_eq!(plan.output_level, TableLevel(1));
@@ -258,6 +387,7 @@ mod tests {
             &tables,
             &KeyRange::half_open(b"a", b"b"),
             Sequence::ZERO,
+            options(),
         )
         .expect("planning succeeds");
 
@@ -265,27 +395,74 @@ mod tests {
     }
 
     #[test]
-    fn no_l0_plan_uses_shallowest_overlapping_level() {
+    fn no_l0_fallback_moves_shallowest_overlapping_level_down() {
         let tables = vec![
             table(1, 1, b"a", b"b"),
             table(2, 1, b"c", b"d"),
             table(3, 2, b"a", b"d"),
         ];
 
-        let plan = plan_compaction("default", &tables, &KeyRange::all(), Sequence::ZERO)
-            .expect("planning succeeds")
-            .expect("plan exists");
+        let plan = plan_compaction(
+            "default",
+            &tables,
+            &KeyRange::all(),
+            Sequence::ZERO,
+            options(),
+        )
+        .expect("planning succeeds")
+        .expect("plan exists");
 
-        assert_eq!(plan.input_tables, vec![TableId(1), TableId(2)]);
-        assert_eq!(plan.output_level, TableLevel(1));
+        assert_eq!(plan.input_tables, vec![TableId(1), TableId(2), TableId(3)]);
+        assert_eq!(plan.output_level, TableLevel(2));
+    }
+
+    #[test]
+    fn overfull_level_score_picks_largest_pressure_ratio() {
+        let tables = vec![
+            table_with_bytes(1, 1, b"a", b"b", 90),
+            table_with_bytes(2, 2, b"a", b"b", 1_500),
+            table_with_bytes(3, 3, b"a", b"b", 2_000),
+        ];
+
+        let plan = plan_compaction(
+            "default",
+            &tables,
+            &KeyRange::all(),
+            Sequence::ZERO,
+            options(),
+        )
+        .expect("planning succeeds")
+        .expect("plan exists");
+
+        assert_eq!(plan.input_tables, vec![TableId(2), TableId(3)]);
+        assert_eq!(plan.output_level, TableLevel(3));
     }
 
     fn table(id: u64, level: u32, smallest: &[u8], largest: &[u8]) -> CompactionTable {
+        table_with_bytes(id, level, smallest, largest, 1)
+    }
+
+    fn table_with_bytes(
+        id: u64,
+        level: u32,
+        smallest: &[u8],
+        largest: &[u8],
+        bytes: u64,
+    ) -> CompactionTable {
         CompactionTable {
             id: TableId(id),
             level: TableLevel(level),
+            bytes,
             smallest_user_key: smallest.to_vec(),
             largest_user_key: largest.to_vec(),
+        }
+    }
+
+    const fn options() -> CompactionOptions {
+        CompactionOptions {
+            target_table_bytes: 100,
+            level_size_multiplier: 10,
+            max_l0_files: 8,
         }
     }
 }

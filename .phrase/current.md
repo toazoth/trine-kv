@@ -6,78 +6,83 @@ Complete
 
 ## Goal
 
-Replace exact-set table filters with real Bloom bitsets for point-key and
-prefix filters while preserving the Phase 17 metadata/data-block read boundary.
+Make compaction and range tombstone reads match the v1 leveled-LSM shape:
+choose compaction work from level pressure, split outputs by configured table
+size, and query ordered tombstone structures instead of scanning every
+tombstone.
 
 ## Entry Condition
 
-- Phase 17 file-backed table reader passed locally.
-- Evidence shows table-level and block-level filters still store complete key or
-  prefix sets, so filter memory cost does not match the advertised Bloom
-  policy.
+- Phase 18 real Bloom filters passed locally.
+- Remaining evidence identifies compaction output sizing and range tombstone
+  lookup as the next production-readiness risks.
 
 ## Scope
 
-- Implement a compact Bloom bitset in `src/filter.rs`.
-- Make `bits_per_key` and `bits_per_prefix` control filter bit count and hash
-  count.
-- Encode/decode Bloom bitsets in table filter/index blocks.
-- Keep table-level and block-level point-key filters.
-- Keep table-level and block-level prefix filters based on the configured
-  prefix extractor.
-- Keep filters advisory: false positives are allowed; false negatives fail
-  closed during block validation.
+- Add an ordered range tombstone query structure for memtables, SSTables, point
+  reads, transaction conflict checks, and scan setup.
+- Keep range tombstone blocks on disk and load them only when a query needs
+  tombstones from that table.
+- Pick compaction work from L0 pressure or level-size pressure using
+  `target_table_bytes`, `level_size_multiplier`, and `max_l0_files`.
+- Keep L0 special handling: overlapping L0 inputs are grouped and overlapping
+  L1 inputs are included before publishing an L1 replacement.
+- Move overfull L1+ inputs down one level with overlapping next-level inputs so
+  deeper levels stay non-overlapping after publish.
+- Split compaction outputs at user-key boundaries according to
+  `target_table_bytes`.
+- Preserve snapshot-visible versions and range tombstones needed for retained
+  records.
 - Preserve in-memory mode behavior.
 
 ## Out Of Scope
 
-- Changing public filter policy names.
-- Level scoring or streaming compaction.
-- Range tombstone query indexes.
 - Background worker scheduling.
-- Rewriting iterator merge strategy.
+- Replacing scan source merge with a heap-based merge.
+- Changing public API.
+- Changing compression policy.
 
 ## Acceptance Gate
 
-- Filter objects no longer store every full key/prefix as a searchable set.
-- Filter bitset size changes with `bits_per_key` / `bits_per_prefix`.
-- Existing point/range/prefix reads continue to pass.
-- A block filter missing one of its own keys/prefixes is rejected by validation.
-- Formatting, clippy, and targeted/full tests pass.
+- Point reads and transaction conflict checks query only tombstones whose bounds
+  can cover the requested key/range.
+- Scan setup collects only tombstones that overlap the iterator selector.
+- Compaction can split one input set into multiple output SSTables, each under
+  the configured target except for a single oversized user-key group.
+- L0 pressure is reduced, and overfull L1+ levels move data down by level-score
+  rules.
+- Full local Rust verification passes.
 
 ## Active Task Slice
 
 ```text
-task057 [x] goal:replace exact point-key filters with Bloom bitsets | scope:src/filter.rs,src/table.rs,tests | verify:filter sizing and round-trip tests
-task058 [x] goal:replace exact prefix filters with Bloom bitsets | scope:src/filter.rs,src/table.rs,tests | verify:prefix filter read-path tests
-task059 [x] goal:update docs and evidence for Bloom filter semantics | scope:.phrase | verify:phase evidence and protocol notes
+task060 [x] goal:ordered range tombstone query path for point/range reads | scope:src/range_tombstone.rs,src/db.rs,src/table.rs,src/iterator.rs | verify:targeted tombstone lookup tests
+task061 [x] goal:level-score compaction planning with L0 and L1+ rules | scope:src/compaction.rs,src/db.rs,tests | verify:planner and persistent level tests
+task062 [x] goal:split compaction outputs by target table size | scope:src/db.rs,src/manifest.rs,src/table.rs,tests | verify:persistent split-output compaction test
+task063 [x] goal:update protocol and evidence for P3/P4 behavior | scope:.phrase | verify:evidence delta and protocol notes
 ```
 
 ## Known Blockers
 
-- Compaction still builds complete input record lists and does not split output
-  by target table size.
-- Range tombstones still use a table-level on-demand list instead of a query
-  structure.
+- Compaction still runs synchronously under the writer coordinator.
+- Scan source merge remains linear across sources rather than heap-based.
 - GitHub Actions cannot be executed locally; remote CI must run after push.
 
 ## Evidence To Record
 
-- `point_filter_bit_count_tracks_bits_per_key` proves `bits_per_key` controls
-  Bloom bit count and hash count.
-- `point_filter_round_trips_from_parts` and
-  `prefix_filter_uses_extractor_prefixes` prove point and prefix Bloom filters
-  keep their own keys/prefixes across encode/decode.
-- `data_block_filter_false_negative_fails_closed` and
-  `prefix_block_filter_false_negative_fails_closed` prove block validation
-  rejects filters that miss their own data.
-- `persistent_filter_miss_does_not_read_corrupt_data_block` still passes with
-  Bloom filters.
-- Full local gate passed: `cargo check --all-targets --all-features`,
-  `cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D
-  warnings`, and `cargo test --all-targets --all-features`.
+- `covering_key_returns_only_possible_covering_tombstones` and
+  `overlapping_range_returns_only_intersecting_tombstones` prove ordered
+  tombstone key/range lookup.
+- `l0_plan_expands_overlapping_l0_group_and_lower_level_tables`,
+  `no_l0_fallback_moves_shallowest_overlapping_level_down`, and
+  `overfull_level_score_picks_largest_pressure_ratio` prove planner behavior.
+- `persistent_compaction_splits_outputs_and_moves_overfull_l1_down` proves
+  split outputs, L1+ down-level compaction, read correctness, and reopen.
+- Full local gate passed: `cargo test --all-targets --all-features`,
+  `cargo clippy --all-targets --all-features -- -D warnings`, and
+  `cargo fmt --all`.
 
 ## Next Recommendation
 
-- If Bloom filters pass, move to compaction output sizing and level scoring, or
-  range tombstone query structures if delete-heavy behavior is the sharper risk.
+- If this phase passes, move to iterator merge hardening or background flush
+  scheduling depending on the next benchmark/audit signal.

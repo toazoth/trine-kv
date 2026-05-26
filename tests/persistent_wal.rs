@@ -1025,6 +1025,75 @@ fn persistent_flush_auto_compacts_when_l0_pressure_exceeds_limit() {
 }
 
 #[test]
+fn persistent_compaction_splits_outputs_and_moves_overfull_l1_down() {
+    let path = temp_db_path("compaction-split-output");
+    let mut options = DbOptions::persistent(&path);
+    options.target_table_bytes = 240;
+    options.level_size_multiplier = 2;
+    let keyspace_options = KeyspaceOptions {
+        compression: CompressionProfile::None,
+        block_bytes: 256,
+        ..KeyspaceOptions::default()
+    };
+
+    {
+        let db = Db::open(options.clone()).expect("persistent db opens");
+        let keyspace = db
+            .keyspace("default", keyspace_options.clone())
+            .expect("keyspace opens");
+
+        for index in 0..30 {
+            let key = format!("key-{index:03}").into_bytes();
+            let value = format!("value-{index:03}-{}", "x".repeat(48)).into_bytes();
+            keyspace.insert(key, value).expect("write first batch");
+        }
+        db.flush().expect("flush first L0 table");
+        for index in 30..60 {
+            let key = format!("key-{index:03}").into_bytes();
+            let value = format!("value-{index:03}-{}", "y".repeat(48)).into_bytes();
+            keyspace.insert(key, value).expect("write second batch");
+        }
+        db.flush().expect("flush second L0 table");
+
+        db.compact_range(KeyRange::all())
+            .expect("manual compaction splits L1 output");
+        let levels = default_table_levels(&path);
+        assert!(levels.len() > 1, "small target should split output tables");
+        assert!(levels.iter().all(|level| *level == 1));
+
+        db.compact_range(KeyRange::all())
+            .expect("overfull L1 compacts into L2");
+        let levels = default_table_levels(&path);
+        assert!(levels.len() > 1, "L2 output should stay split");
+        assert!(levels.iter().all(|level| *level == 2));
+
+        for index in [0, 17, 30, 59] {
+            let key = format!("key-{index:03}").into_bytes();
+            let expected_prefix = format!("value-{index:03}-").into_bytes();
+            let value = keyspace
+                .get(&key)
+                .expect("value reads")
+                .expect("key exists");
+            assert!(value.starts_with(&expected_prefix));
+        }
+    }
+
+    {
+        let db = Db::open(options).expect("persistent db reopens");
+        let keyspace = db
+            .keyspace("default", keyspace_options)
+            .expect("keyspace reopens");
+        assert!(default_table_levels(&path).iter().all(|level| *level == 2));
+        assert_eq!(
+            keyspace.get(b"key-059").expect("latest key reopens"),
+            Some(format!("value-059-{}", "y".repeat(48)).into_bytes())
+        );
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
 fn persistent_stats_report_tables_blobs_and_compactions() {
     let path = temp_db_path("live-stats");
     let mut options = DbOptions::persistent(&path);

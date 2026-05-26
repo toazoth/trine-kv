@@ -20,6 +20,7 @@ use crate::{
     },
     options::{FilterPolicy, IndexSearchPolicy, PrefixFilterPolicy},
     prefix::PrefixExtractor,
+    range_tombstone::{self, RangeTombstoneIndex, RangeTombstoneLike},
     search,
     types::{KeyRange, Sequence},
 };
@@ -334,6 +335,12 @@ pub(crate) struct TableRangeTombstone {
     pub(crate) batch_index: u32,
 }
 
+impl RangeTombstoneLike for TableRangeTombstone {
+    fn range(&self) -> &KeyRange {
+        &self.range
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Table {
     path: Option<PathBuf>,
@@ -342,7 +349,7 @@ pub(crate) struct Table {
     properties: TableProperties,
     point_records: Option<Vec<TablePointRecord>>,
     data_blocks: Vec<TableDataBlock>,
-    range_tombstones: Arc<RwLock<Option<Arc<Vec<TableRangeTombstone>>>>>,
+    range_tombstones: Arc<RwLock<Option<Arc<RangeTombstoneIndex<TableRangeTombstone>>>>>,
     point_key_filter: Option<PointKeyFilter>,
     prefix_filter: Option<PrefixFilter>,
 }
@@ -357,14 +364,14 @@ impl Table {
         self.all_point_records()
     }
 
-    pub(crate) fn range_tombstones(&self) -> Result<Arc<Vec<TableRangeTombstone>>> {
+    pub(crate) fn range_tombstones(&self) -> Result<Arc<RangeTombstoneIndex<TableRangeTombstone>>> {
         if let Ok(guard) = self.range_tombstones.read() {
             if let Some(tombstones) = guard.as_ref() {
                 return Ok(Arc::clone(tombstones));
             }
         }
 
-        let tombstones = self.load_range_tombstones()?;
+        let tombstones = RangeTombstoneIndex::new(self.load_range_tombstones()?);
         let tombstones = Arc::new(tombstones);
         let mut guard = self
             .range_tombstones
@@ -376,8 +383,36 @@ impl Table {
         Ok(Arc::clone(cached))
     }
 
+    pub(crate) fn range_tombstone_covers_visible_point(
+        &self,
+        key: &[u8],
+        point_sequence: Sequence,
+        point_batch_index: u32,
+        read_sequence: Sequence,
+    ) -> Result<bool> {
+        let tombstones = self.range_tombstones()?;
+        Ok(tombstones.covering_key(key).any(|tombstone| {
+            tombstone.sequence <= read_sequence
+                && (tombstone.sequence > point_sequence
+                    || (tombstone.sequence == point_sequence
+                        && tombstone.batch_index > point_batch_index))
+        }))
+    }
+
+    pub(crate) fn range_tombstones_overlapping_range(
+        &self,
+        range: &KeyRange,
+    ) -> Result<Vec<TableRangeTombstone>> {
+        let tombstones = self.range_tombstones()?;
+        Ok(tombstones.overlapping_range(range).cloned().collect())
+    }
+
     pub(crate) fn blob_file_ids(&self) -> Vec<u64> {
         self.properties.blob_file_ids.clone()
+    }
+
+    pub(crate) fn estimated_file_bytes(&self) -> u64 {
+        usize_to_u64_saturating(HEADER_LEN.saturating_add(self.payload_len))
     }
 
     #[cfg(test)]
@@ -1180,7 +1215,9 @@ pub(crate) fn write_table(
         prefix_filter: build_prefix_filter(options, &point_records),
         point_records: Some(point_records),
         data_blocks,
-        range_tombstones: Arc::new(RwLock::new(Some(Arc::new(range_tombstones.to_vec())))),
+        range_tombstones: Arc::new(RwLock::new(Some(Arc::new(RangeTombstoneIndex::new(
+            range_tombstones.to_vec(),
+        ))))),
     };
     let payload = encode_table(&table)?;
     let payload_len = u32::try_from(payload.len())
@@ -1317,19 +1354,70 @@ fn table_properties(
         .into_iter()
         .collect();
 
+    let (smallest_user_key, largest_user_key) = table_key_bounds(point_records, range_tombstones);
+
     TableProperties {
         id: table_id,
         level,
-        smallest_user_key: point_records
-            .first()
-            .map_or_else(Vec::new, |record| record.internal_key.user_key().to_vec()),
-        largest_user_key: point_records
-            .last()
-            .map_or_else(Vec::new, |record| record.internal_key.user_key().to_vec()),
+        smallest_user_key,
+        largest_user_key,
         smallest_sequence: smallest_sequence.unwrap_or(Sequence::ZERO),
         largest_sequence: largest_sequence.unwrap_or(Sequence::ZERO),
         codec,
         blob_file_ids,
+    }
+}
+
+fn table_key_bounds(
+    point_records: &[TablePointRecord],
+    range_tombstones: &[TableRangeTombstone],
+) -> (Vec<u8>, Vec<u8>) {
+    let mut smallest = point_records
+        .first()
+        .map(|record| record.internal_key.user_key().to_vec());
+    let mut largest = point_records
+        .last()
+        .map(|record| record.internal_key.user_key().to_vec());
+
+    for tombstone in range_tombstones {
+        let (Some(start), Some(end)) = (
+            finite_bound_bytes(&tombstone.range.start),
+            finite_bound_bytes(&tombstone.range.end),
+        ) else {
+            continue;
+        };
+        update_smallest(&mut smallest, start);
+        update_largest(&mut largest, end);
+    }
+
+    match (smallest, largest) {
+        (Some(smallest), Some(largest)) => (smallest, largest),
+        _ => (Vec::new(), Vec::new()),
+    }
+}
+
+fn finite_bound_bytes(bound: &Bound<Vec<u8>>) -> Option<Vec<u8>> {
+    match bound {
+        Bound::Included(bytes) | Bound::Excluded(bytes) => Some(bytes.clone()),
+        Bound::Unbounded => None,
+    }
+}
+
+fn update_smallest(current: &mut Option<Vec<u8>>, candidate: Vec<u8>) {
+    if current
+        .as_ref()
+        .is_none_or(|current| candidate.as_slice() < current.as_slice())
+    {
+        *current = Some(candidate);
+    }
+}
+
+fn update_largest(current: &mut Option<Vec<u8>>, candidate: Vec<u8>) {
+    if current
+        .as_ref()
+        .is_none_or(|current| candidate.as_slice() > current.as_slice())
+    {
+        *current = Some(candidate);
     }
 }
 
@@ -1537,7 +1625,9 @@ fn decode_table(bytes: &[u8]) -> Result<Table> {
         properties,
         point_records: Some(point_records),
         data_blocks,
-        range_tombstones: Arc::new(RwLock::new(Some(Arc::new(range_tombstones)))),
+        range_tombstones: Arc::new(RwLock::new(Some(Arc::new(RangeTombstoneIndex::new(
+            range_tombstones,
+        ))))),
         point_key_filter,
         prefix_filter,
     })
@@ -1637,9 +1727,12 @@ fn encode_range_tombstone_block(table: &Table) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     put_u32(
         &mut bytes,
-        usize_to_u32(range_tombstones.len(), "range tombstone block record count")?,
+        usize_to_u32(
+            range_tombstones.all().len(),
+            "range tombstone block record count",
+        )?,
     );
-    for tombstone in range_tombstones.iter() {
+    for tombstone in range_tombstones.all() {
         put_bound(&mut bytes, &tombstone.range.start)?;
         put_bound(&mut bytes, &tombstone.range.end)?;
         put_u64(&mut bytes, tombstone.sequence.get());
@@ -2059,6 +2152,7 @@ fn decode_range_tombstone_block(bytes: &[u8]) -> Result<Vec<TableRangeTombstone>
     if !cursor.is_finished() {
         return Err(invalid_table("trailing range tombstone block bytes"));
     }
+    range_tombstone::sort_tombstones(&mut range_tombstones);
     Ok(range_tombstones)
 }
 
@@ -3075,7 +3169,9 @@ mod tests {
             prefix_filter: build_prefix_filter(options, &point_records),
             point_records: Some(point_records),
             data_blocks,
-            range_tombstones: Arc::new(RwLock::new(Some(Arc::new(Vec::new())))),
+            range_tombstones: Arc::new(RwLock::new(Some(Arc::new(RangeTombstoneIndex::new(
+                Vec::new(),
+            ))))),
         }
     }
 
