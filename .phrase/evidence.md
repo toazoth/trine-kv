@@ -2044,3 +2044,70 @@ Record only evidence that can change planning or durable decisions.
 
 - Push and let CI run, then use the `Publish` workflow with `mode=dry-run`
   before any real publish.
+
+## 2026-05-26: Pre-Publish Benchmark Tuning Passed
+
+### Observation
+
+- The current release-profile benchmark baseline showed the largest
+  release-relevant cost in persistent write-heavy paths after adding
+  parent-directory sync.
+- `separated blob values` took 52841 us before tuning. That workload writes a
+  blob file and an SSTable before publishing the manifest.
+- Table/blob output paths previously synced the parent directory per output
+  file. That made one table write with separated values pay for both blob and
+  table directory syncs before the manifest directory sync.
+- The implementation now syncs table/blob file contents before rename, batches
+  one database-directory sync after all table/blob renames, and only then
+  publishes the manifest.
+- Manifest and recovery-report files still sync the parent directory
+  immediately after their own rename because they are direct durable cutover or
+  report files.
+- `docs/benchmarks/v1-prepublish-tuning.md` records the before/after numbers
+  and the scoped conclusion.
+
+### Interpretation
+
+- Task047 is complete.
+- Phase 12 satisfies its acceptance gate.
+- Risk category: local durable-write syscall cost.
+- The tuning keeps the durability boundary: files are synced and their
+  directory entries are synced before the manifest points at them.
+- The reliable benchmark win is the separated-blob path: 52841 us before tuning
+  versus a 46869 us post-tuning median across three runs, about 11.3 percent
+  faster in this local session.
+- Flush did not improve because its directory sync count is unchanged.
+  Compaction remained noisy, so it should not be claimed as a win without a
+  larger benchmark.
+
+### Verification
+
+- `cargo bench --bench v1_bench` before tuning
+- `cargo bench --bench v1_bench` after tuning, three runs
+- `cargo test sync_parent_dir_after_rename_accepts_published_file`
+- `cargo test publish_failure_removes_unpublished_table_and_blob_files`
+- `cargo check --target x86_64-pc-windows-gnu`
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `cargo run --example quickstart`
+- `cargo run --example user_store`
+- `cargo run --example event_index`
+- `cargo package --allow-dirty --list`
+- `cargo package --allow-dirty --locked`
+- `cargo publish --dry-run --allow-dirty --locked`
+- `git diff --check`
+- forbidden terminology scan over workflows, source, tests, phase notes, Cargo
+  metadata, benches, docs, README, examples, and changelog
+
+### Remaining Blockers
+
+- GitHub Actions was not executed locally; the remote workflow must run after
+  push.
+- Benchmark numbers are local and noisy; compare only within the same machine
+  and session.
+
+### Recommended Next Action
+
+- Push and let CI run, then use the `Publish` workflow with `mode=dry-run`
+  before any real publish.

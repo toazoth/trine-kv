@@ -10,11 +10,15 @@ pub(crate) fn sync_parent_dir_after_rename(path: &Path) -> Result<()> {
         return Ok(());
     };
 
-    sync_dir(parent)
+    sync_directory(parent)
+}
+
+pub(crate) fn sync_dir_after_renames(path: &Path) -> Result<()> {
+    sync_directory(path)
 }
 
 #[cfg(unix)]
-fn sync_dir(path: &Path) -> Result<()> {
+fn sync_directory(path: &Path) -> Result<()> {
     use std::fs::File;
 
     // A file sync protects the new file bytes, while rename changes the parent
@@ -25,7 +29,7 @@ fn sync_dir(path: &Path) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn sync_dir(path: &Path) -> Result<()> {
+fn sync_directory(path: &Path) -> Result<()> {
     use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
 
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
@@ -46,7 +50,7 @@ fn sync_dir(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn sync_dir(_path: &Path) -> Result<()> {
+fn sync_directory(_path: &Path) -> Result<()> {
     // Rust's standard library does not expose a portable directory sync for all
     // platforms. Targets without a concrete implementation keep the previous
     // best-effort behavior.
@@ -61,7 +65,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::sync_parent_dir_after_rename;
+    use super::{sync_dir_after_renames, sync_parent_dir_after_rename};
 
     #[test]
     fn sync_parent_dir_after_rename_accepts_published_file() {
@@ -84,6 +88,7 @@ mod tests {
         fs::rename(&tmp_path, &published_path).expect("rename test file");
 
         sync_parent_dir_after_rename(&published_path).expect("sync parent directory");
+        sync_dir_after_renames(&root).expect("sync directory directly");
         assert_eq!(
             fs::read(&published_path).expect("read published file"),
             b"durable"

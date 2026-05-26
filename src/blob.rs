@@ -6,7 +6,6 @@ use std::{
 };
 
 use crate::{
-    durability::sync_parent_dir_after_rename,
     error::{Error, Result},
     internal_key::InternalKey,
 };
@@ -132,7 +131,6 @@ pub(crate) fn write_large_values(
     file.sync_all()?;
     drop(file);
     fs::rename(tmp_path, &path)?;
-    sync_parent_dir_after_rename(&path)?;
 
     Ok(rewritten)
 }

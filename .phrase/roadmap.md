@@ -187,3 +187,20 @@ handled.
 - Unix behavior remains unchanged.
 - Other targets are documented as best-effort.
 - The full local release gate still passes.
+
+### Phase 12: Benchmark-Backed Performance Tuning
+
+**Status**: Complete
+
+**Goal**: Improve one measured v1 benchmark hotspot before CI push without
+changing public API or storage formats.
+
+**Entry Condition**: Phase 11 complete and user requests benchmark/performance
+tuning.
+
+**Acceptance Gate**:
+
+- Current benchmark baseline is recorded.
+- A hotspot is selected from benchmark evidence before implementation.
+- The tuning change has before/after benchmark evidence and keeps the full
+  release gate passing.

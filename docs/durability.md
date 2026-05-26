@@ -100,11 +100,13 @@ published. If a crash leaves a formal table or blob file that is not referenced
 by the manifest, v1 fails closed at startup. Safe temporary files are handled by
 the repair policy described below.
 
-On Unix and Windows, table, blob, manifest, and repair-report publish paths sync
-the temporary file, rename it into place, and then sync the parent directory so
-the new directory entry is durable. Rust's standard library does not expose a
-portable directory sync for every target, so other targets keep a best-effort
-rename path and the same conservative recovery checks.
+On Unix and Windows, table and blob output paths sync the temporary file, rename
+it into place, and sync the database directory before the manifest points at
+those files. Manifest and repair-report publish paths sync their temporary file,
+rename it into place, and then sync the parent directory. Rust's standard
+library does not expose a portable directory sync for every target, so other
+targets keep a best-effort rename path and the same conservative recovery
+checks.
 
 ## SSTable And Blob Checks
 

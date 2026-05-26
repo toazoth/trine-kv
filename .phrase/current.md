@@ -6,35 +6,35 @@ Complete
 
 ## Goal
 
-Close the Windows side of the pre-publish directory-sync durability hardening
-without changing public API or the v1 storage contract.
+Run measured benchmark/performance tuning before CI push without changing
+public API or the v1 storage contract.
 
 ## Entry Condition
 
-- Phase 10 synced parent directories after atomic file publish on Unix.
-- User asked to handle non-Unix, with Windows as the concrete supported target.
+- Phase 11 Windows directory-sync hardening is complete.
+- User wants benchmark/performance tuning before pushing to CI.
 
 ## Scope
 
-- Windows implementation of parent-directory sync after rename.
-- Durability documentation for Unix, Windows, and other targets.
-- Local release gate after the hardening change.
-- Best available Windows target validation in this environment.
+- Run the existing v1 benchmark harness and compare against local baseline.
+- Choose one measured hotspot with a clear implementation path.
+- Apply a small tuning change with focused verification.
+- Update benchmark notes and phase evidence.
 
 ## Out Of Scope
 
 - Changing the table, manifest, WAL, blob, or recovery file formats.
 - Adding new public API.
 - Publishing the crate.
-- Platform-specific directory sync for targets other than Unix and Windows.
+- Broad benchmark harness redesign.
+- Speculative tuning without a benchmark signal.
 
 ## Acceptance Gate
 
-- Atomic publish paths sync the parent directory after rename on Unix and
-  Windows.
-- Other targets are explicitly documented as best-effort because no portable
-  `std` directory sync is available.
-- Existing persistent behavior remains unchanged.
+- Current benchmark baseline is recorded.
+- A measured hotspot is selected and classified before implementation.
+- After tuning, the relevant benchmark improves or evidence explains why the
+  change is rejected.
 - Local verification passes for `cargo fmt --check`,
   `cargo clippy --all-targets --all-features -- -D warnings`,
   `cargo test --all-targets --all-features`, examples, package list, package
@@ -43,21 +43,22 @@ without changing public API or the v1 storage contract.
 ## Active Task Slice
 
 ```text
-task046 [x] goal:Windows parent-directory sync is implemented and documented | scope:src/durability.rs,docs/durability.md,.phrase | verify:local release gate + Windows target check
+task047 [x] goal:one benchmark-backed performance tuning slice lands with before/after evidence | scope:benches,src,docs/benchmarks,.phrase | verify:cargo bench --bench v1_bench before/after + full release gate
 ```
 
 ## Known Blockers
 
 - GitHub Actions cannot be executed locally in this environment; remote CI must
   run after push.
-- The Windows branch was compile-checked with `x86_64-pc-windows-gnu`, but not
-  executed on a real Windows filesystem in this environment.
-- Targets other than Unix and Windows remain best-effort for parent-directory
-  sync.
+- Local benchmark numbers are machine- and load-sensitive; compare only within
+  this session.
+- The tuning improved the separated-blob benchmark path; flush did not improve
+  because its directory sync count is unchanged, and compaction remained noisy.
 
 ## Evidence To Record
 
-- Windows target validation result.
+- Benchmark baseline and after-tuning result.
+- Selected hotspot and rejected options.
 - Full local release gate result.
 
 ## Next Recommendation

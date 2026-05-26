@@ -10,7 +10,6 @@ use crate::{
     blob::ValueRef,
     cache::{BlockCache, BlockCacheKey},
     codec::{self, CodecId},
-    durability::sync_parent_dir_after_rename,
     error::{Error, Result},
     filter::{PointKeyFilter, PrefixFilter},
     internal_key::{InternalKey, ValueKind},
@@ -606,6 +605,9 @@ pub(crate) fn write_table(
         return Err(Error::invalid_options("cannot write an empty table"));
     }
 
+    // The caller batches the parent-directory sync after one or more table
+    // writes and before publishing the manifest. That keeps table/blob file
+    // names durable without forcing one directory sync per output file.
     let mut point_records = point_records.to_vec();
     point_records.sort_by(|left, right| left.0.cmp(&right.0));
     let db_path = path
@@ -662,7 +664,6 @@ pub(crate) fn write_table(
         file.sync_all()?;
     }
     fs::rename(tmp_path, path)?;
-    sync_parent_dir_after_rename(path)?;
 
     Ok(table)
 }

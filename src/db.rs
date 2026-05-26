@@ -12,7 +12,7 @@ use std::{
 
 use crate::{
     blob::{self, ValueRef},
-    cache, compaction,
+    cache, compaction, durability,
     error::{Error, Result},
     internal_key::{InternalKey, ValueKind},
     iterator::{Direction, Iter},
@@ -364,6 +364,11 @@ impl Db {
                 written_tables.push((input.keyspace.clone(), Arc::new(table)));
             }
 
+            if let Err(error) = durability::sync_dir_after_renames(&db_path) {
+                let _ = remove_storage_files(&db_path, &written_table_ids);
+                return Err(error);
+            }
+
             if let Err(error) = self.publish_flushed_tables(&written_tables, flush_sequence) {
                 let _ = remove_storage_files(&db_path, &written_table_ids);
                 return Err(error);
@@ -441,6 +446,13 @@ impl Db {
                 input_table_ids: input.input_table_ids.clone(),
                 table,
             });
+        }
+
+        if !written_table_ids.is_empty() {
+            if let Err(error) = durability::sync_dir_after_renames(&db_path) {
+                let _ = remove_storage_files(&db_path, &written_table_ids);
+                return Err(error);
+            }
         }
 
         if let Err(error) = self.publish_compacted_tables(&written_tables) {
