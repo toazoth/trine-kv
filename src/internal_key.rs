@@ -70,6 +70,19 @@ impl PartialOrd for InternalKey {
     }
 }
 
+pub(crate) fn first_internal_key_for_user(user_key: &[u8]) -> InternalKey {
+    InternalKey::new(
+        user_key.to_vec(),
+        Sequence::new(u64::MAX),
+        ValueKind::Put,
+        u32::MAX,
+    )
+}
+
+pub(crate) fn last_internal_key_for_user(user_key: &[u8]) -> InternalKey {
+    InternalKey::new(user_key.to_vec(), Sequence::ZERO, ValueKind::RangeDelete, 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{InternalKey, ValueKind};

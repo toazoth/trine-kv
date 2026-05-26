@@ -255,6 +255,23 @@ impl TableDataBlock {
             .collect()
     }
 
+    fn newest_visible_point_record_for_key<'records>(
+        &self,
+        point_records: &'records [TablePointRecord],
+        key: &[u8],
+        read_sequence: Sequence,
+        policy: IndexSearchPolicy,
+    ) -> Option<&'records TablePointRecord> {
+        let start = self.restart_index_for_key(point_records, key, policy);
+        point_records[start..self.record_range.end]
+            .iter()
+            .take_while(move |record| record.internal_key.user_key() <= key)
+            .find(move |record| {
+                record.internal_key.user_key() == key
+                    && record.internal_key.sequence() <= read_sequence
+            })
+    }
+
     fn point_records_in_range<'records>(
         &self,
         point_records: &'records [TablePointRecord],
@@ -437,6 +454,36 @@ impl Table {
         records
     }
 
+    pub(crate) fn newest_visible_point_record_for_key_with_cache(
+        &self,
+        key: &[u8],
+        read_sequence: Sequence,
+        policy: IndexSearchPolicy,
+        block_cache: Option<&BlockCache>,
+    ) -> Option<&TablePointRecord> {
+        let start = self.first_block_for_key(key, policy)?;
+
+        for (offset, block) in self.data_blocks[start..].iter().enumerate() {
+            if block.smallest_internal_key.user_key() > key {
+                break;
+            }
+            if !block.may_contain_key(key) {
+                continue;
+            }
+            self.record_block_cache_access(block_cache, start + offset);
+            if let Some(record) = block.newest_visible_point_record_for_key(
+                &self.point_records,
+                key,
+                read_sequence,
+                policy,
+            ) {
+                return Some(record);
+            }
+        }
+
+        None
+    }
+
     #[cfg(test)]
     pub(crate) fn point_records_in_range(
         &self,
@@ -519,9 +566,12 @@ impl Table {
 
     #[must_use]
     pub(crate) fn may_contain_key(&self, key: &[u8]) -> bool {
-        self.point_key_filter
-            .as_ref()
-            .is_none_or(|filter| filter.may_contain_key(key))
+        self.properties.smallest_user_key.as_slice() <= key
+            && key <= self.properties.largest_user_key.as_slice()
+            && self
+                .point_key_filter
+                .as_ref()
+                .is_none_or(|filter| filter.may_contain_key(key))
     }
 
     #[must_use]

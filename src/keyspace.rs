@@ -63,8 +63,12 @@ impl Keyspace {
     }
 
     pub fn get_at(&self, snapshot: &Snapshot, key: &[u8]) -> Result<Option<Value>> {
-        self.db
-            .get_at(self.name.as_str(), key, snapshot.read_sequence())
+        self.db.get_at_with_pin_state(
+            self.name.as_str(),
+            key,
+            snapshot.read_sequence(),
+            snapshot.is_pinned(),
+        )
     }
 
     pub fn insert(&self, key: impl Into<Vec<u8>>, value: impl Into<Value>) -> Result<()> {

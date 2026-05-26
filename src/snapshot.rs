@@ -91,6 +91,11 @@ impl Snapshot {
         self.read_sequence
     }
 
+    #[must_use]
+    pub(crate) fn is_pinned(&self) -> bool {
+        self.pin.is_some()
+    }
+
     pub fn get(&self, keyspace: &Keyspace, key: &[u8]) -> Result<Option<Value>> {
         keyspace.get_at(self, key)
     }

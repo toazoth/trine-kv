@@ -240,3 +240,22 @@ incorrect engine shape for v1.
   MVCC point/range-delete rules per returned row.
 - Existing scan, snapshot, range-delete, table, and persistent tests pass.
 - A focused test proves table blocks are not touched until `Iterator::next`.
+
+### Phase 15: Point Read Hot Path
+
+**Status**: Complete
+
+**Goal**: Remove avoidable contention and allocation from point reads without
+changing public API or v1 storage formats.
+
+**Entry Condition**: User benchmark review identifies repeated snapshot pinning,
+global block-cache locking, vector-based point lookup, and full memtable scans
+as point-read bottlenecks.
+
+**Acceptance Gate**:
+
+- Snapshot-backed point reads reuse the caller's existing snapshot pin.
+- Point reads seek memtable/table records for the requested user key and choose
+  the newest visible record without building and sorting a full record vector.
+- Block-cache hit tracking no longer depends on one global exclusive lock.
+- Existing MVCC, range-delete, persistent, transaction, and benchmark gates pass.

@@ -2280,3 +2280,59 @@ Record only evidence that can change planning or durable decisions.
 
 - Push and let CI run. If CI passes, continue with the next evidence-selected
   release-readiness task.
+
+## 2026-05-26: Point Read Hot Path Passed
+
+### Observation
+
+- User benchmark review identified four point-read costs: snapshot-backed reads
+  took a second snapshot pin, block-cache hits used one global exclusive lock,
+  point lookup collected and sorted records, and memtable point lookup scanned
+  the full active memtable.
+- Snapshot-backed `Keyspace::get_at` now tells `Db` when the caller already
+  holds a snapshot pin.
+- Point reads now seek the active memtable by internal-key bounds and keep only
+  one newest visible candidate across memtable and SSTables.
+- SSTable point reads now use a focused newest-visible-record path instead of
+  building a record vector for the key.
+- Block-cache metadata is split into 64 shards. Hits use a shard read lock;
+  misses use the shard write lock for insertion and eviction accounting.
+- Local release benchmark spot-check: random get improved from 10233 us to
+  783 us, missing get from 9276 us to 403 us, and block cache warm read from
+  1373 us to 913 us.
+
+### Interpretation
+
+- Task051 is complete.
+- Point read still returns an owned value because the v1 public API requires it,
+  but intermediate record vectors, sorting, and repeated snapshot pinning are
+  removed from the hot path.
+- The block-cache change should reduce multi-thread hit contention; the real
+  4-thread vs 32-thread proof still belongs to the external benchmark harness.
+
+### Verification
+
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --test in_memory_mvcc --test in_memory_range_delete --test persistent_wal`
+- `cargo test persistent_block_cache_records_hits_and_misses --test persistent_wal`
+- `cargo test --all-targets --all-features`
+- `cargo check --target x86_64-pc-windows-gnu`
+- `cargo fmt --check`
+- `cargo bench --bench v1_bench`
+- `cargo run --example quickstart`
+- `cargo run --example user_store`
+- `cargo run --example event_index`
+- `git diff --check`
+- forbidden terminology scan over source, tests, benches, docs, README, Cargo
+  metadata, changelog, examples, and phrase files
+
+### Remaining Blockers
+
+- GitHub Actions was not executed locally; remote CI must run after push.
+- The external multi-thread benchmark should be rerun to confirm 32-thread
+  scaling after the block-cache sharding and point-read changes.
+
+### Recommended Next Action
+
+- Run the external benchmark harness that exposed the 4-thread vs 32-thread
+  scaling issue.

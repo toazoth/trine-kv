@@ -3,7 +3,9 @@ use std::{cmp::Ordering as CmpOrdering, ops::Bound, path::PathBuf, sync::Arc};
 use crate::{
     blob::ValueRef,
     error::{Error, Result},
-    internal_key::{InternalKey, ValueKind},
+    internal_key::{
+        InternalKey, ValueKind, first_internal_key_for_user, last_internal_key_for_user,
+    },
     memtable::Memtable,
     snapshot::Snapshot,
     table::TablePointCursor,
@@ -473,19 +475,6 @@ fn memtable_end_bound(end: &Bound<Vec<u8>>) -> Bound<InternalKey> {
         Bound::Excluded(key) => Bound::Excluded(first_internal_key_for_user(key)),
         Bound::Unbounded => Bound::Unbounded,
     }
-}
-
-fn first_internal_key_for_user(user_key: &[u8]) -> InternalKey {
-    InternalKey::new(
-        user_key.to_vec(),
-        Sequence::new(u64::MAX),
-        ValueKind::Put,
-        u32::MAX,
-    )
-}
-
-fn last_internal_key_for_user(user_key: &[u8]) -> InternalKey {
-    InternalKey::new(user_key.to_vec(), Sequence::ZERO, ValueKind::RangeDelete, 0)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

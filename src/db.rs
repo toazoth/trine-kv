@@ -14,7 +14,9 @@ use crate::{
     blob::{self, ValueRef},
     cache, compaction, durability,
     error::{Error, Result},
-    internal_key::{InternalKey, ValueKind},
+    internal_key::{
+        InternalKey, ValueKind, first_internal_key_for_user, last_internal_key_for_user,
+    },
     iterator::{Direction, Iter, RecordSource, ScanRangeTombstone, ScanSelector},
     keyspace::{Keyspace, KeyspaceName},
     manifest::{self, ManifestState, ManifestStore},
@@ -25,7 +27,7 @@ use crate::{
     stats::{DbStats, LevelStats},
     table::{self, Table, TableRangeTombstone},
     transaction::{Transaction, TransactionOptions},
-    types::{KeyRange, KeyValue, Sequence},
+    types::{KeyRange, Sequence},
     wal::{self, WalWriter},
     write_batch::BatchOperation,
 };
@@ -124,6 +126,12 @@ struct CompactionOutput {
     keyspace: String,
     input_table_ids: Vec<table::TableId>,
     table: Option<Arc<Table>>,
+}
+
+#[derive(Debug, Clone)]
+struct PointRecordCandidate {
+    internal_key: InternalKey,
+    value: Option<ValueRef>,
 }
 
 impl Db {
@@ -614,20 +622,31 @@ impl Db {
         key: &[u8],
         read_sequence: Sequence,
     ) -> Result<Option<Vec<u8>>> {
+        self.get_at_with_pin_state(keyspace, key, read_sequence, false)
+    }
+
+    pub(crate) fn get_at_with_pin_state(
+        &self,
+        keyspace: &str,
+        key: &[u8],
+        read_sequence: Sequence,
+        read_pin_held: bool,
+    ) -> Result<Option<Vec<u8>>> {
         self.ensure_open()?;
-        let _read_pin = self.inner.snapshots.pinned_snapshot(read_sequence);
+        let _read_pin = if read_pin_held {
+            None
+        } else {
+            Some(self.inner.snapshots.pinned_snapshot(read_sequence))
+        };
 
         let state = self.keyspace_state(keyspace)?;
-        Ok(collect_visible_point(
+        read_visible_point(
             &state,
             key,
             read_sequence,
             self.persistent_path(),
             Some(self.inner.block_cache.as_ref()),
-        )?
-        .into_iter()
-        .next()
-        .map(|item| item.value))
+        )
     }
 
     pub(crate) fn range_at(
@@ -1588,83 +1607,135 @@ fn key_range_modified_after(
     range_tombstone_modified_after_range(state, range, read_sequence)
 }
 
-fn collect_visible_point(
+fn read_visible_point(
     state: &KeyspaceState,
     key: &[u8],
     read_sequence: Sequence,
     db_path: Option<&Path>,
     block_cache: Option<&cache::BlockCache>,
-) -> Result<Vec<KeyValue>> {
-    let point_records = collect_point_key_records(state, key, block_cache)?;
-    let range_tombstones = collect_range_tombstones(state)?;
-    let point_range = KeyRange {
-        start: Bound::Included(key.to_vec()),
-        end: Bound::Included(key.to_vec()),
-    };
-    collect_visible_records(
-        &point_records,
-        &range_tombstones,
-        &point_range,
-        read_sequence,
-        db_path,
-    )
-}
+) -> Result<Option<Vec<u8>>> {
+    // The point-read hot path only needs the newest visible record for one user
+    // key. Keep at most one candidate instead of collecting and sorting every
+    // version from every source.
+    let mut candidate = newest_visible_memtable_point_candidate(state, key, read_sequence)?;
+    let range_tombstones = state
+        .range_tombstones
+        .read()
+        .map_err(|_| lock_poisoned("range tombstones"))?;
+    let tables = state
+        .tables
+        .read()
+        .map_err(|_| lock_poisoned("table list"))?;
 
-// Point reads and lazy scans share the same MVCC rule: for a user key, the
-// newest visible point record decides whether a value is returned.
-fn collect_visible_records(
-    point_records: &[(InternalKey, Option<ValueRef>)],
-    range_tombstones: &[RangeTombstone],
-    range: &KeyRange,
-    read_sequence: Sequence,
-    db_path: Option<&Path>,
-) -> Result<Vec<KeyValue>> {
-    let mut items = Vec::new();
-    let mut decided_user_key: Option<Vec<u8>> = None;
-
-    for (internal_key, value) in point_records {
-        let user_key = internal_key.user_key();
-
-        // Internal keys are sorted by user key ascending, then newest visible
-        // version first. Once a visible record decides a user key, older
-        // versions for that same key cannot change the scan result.
-        if decided_user_key.as_deref() == Some(user_key) {
+    for table in tables.iter() {
+        if !table.may_contain_key(key) {
             continue;
         }
-        if key_is_before_start(user_key, &range.start) {
-            continue;
-        }
-        if key_is_after_end(user_key, &range.end) {
-            break;
-        }
-        if internal_key.sequence() > read_sequence {
-            continue;
-        }
-
-        match internal_key.kind() {
-            ValueKind::Put => {
-                if !range_tombstones_cover(
-                    range_tombstones,
-                    user_key,
-                    internal_key.sequence(),
-                    internal_key.batch_index(),
-                    read_sequence,
-                ) {
-                    items.push(KeyValue::new(
-                        user_key.to_vec(),
-                        value_bytes(value.as_ref(), db_path)?,
-                    ));
-                }
-                decided_user_key = Some(user_key.to_vec());
-            }
-            ValueKind::PointDelete => {
-                decided_user_key = Some(user_key.to_vec());
-            }
-            ValueKind::RangeDelete => {}
+        if let Some(record) = table.newest_visible_point_record_for_key_with_cache(
+            key,
+            read_sequence,
+            state.options.index_search_policy,
+            block_cache,
+        ) {
+            keep_newer_point_candidate(&mut candidate, &record.internal_key, record.value.as_ref());
         }
     }
 
-    Ok(items)
+    let Some(candidate) = candidate else {
+        return Ok(None);
+    };
+
+    match candidate.internal_key.kind() {
+        ValueKind::Put => {
+            let covered_by_memtable_tombstone = range_tombstones_cover(
+                &range_tombstones,
+                key,
+                candidate.internal_key.sequence(),
+                candidate.internal_key.batch_index(),
+                read_sequence,
+            );
+            let covered_by_table_tombstone = !covered_by_memtable_tombstone
+                && tables.iter().any(|table| {
+                    table.range_tombstones().iter().any(|tombstone| {
+                        table_range_tombstone_covers_visible_point(
+                            tombstone,
+                            key,
+                            candidate.internal_key.sequence(),
+                            candidate.internal_key.batch_index(),
+                            read_sequence,
+                        )
+                    })
+                });
+            if covered_by_memtable_tombstone || covered_by_table_tombstone {
+                Ok(None)
+            } else {
+                drop(tables);
+                drop(range_tombstones);
+                value_bytes(candidate.value.as_ref(), db_path).map(Some)
+            }
+        }
+        ValueKind::PointDelete | ValueKind::RangeDelete => Ok(None),
+    }
+}
+
+fn newest_visible_memtable_point_candidate(
+    state: &KeyspaceState,
+    key: &[u8],
+    read_sequence: Sequence,
+) -> Result<Option<PointRecordCandidate>> {
+    let active_memtable = state
+        .active_memtable
+        .read()
+        .map_err(|_| lock_poisoned("active memtable"))?
+        .clone();
+    let entries = active_memtable
+        .read_entries()
+        .map_err(|_| lock_poisoned("memtable entries"))?;
+    let start = Bound::Included(first_internal_key_for_user(key));
+    let end = Bound::Included(last_internal_key_for_user(key));
+
+    for (internal_key, value) in entries.range((start, end)) {
+        if internal_key.sequence() > read_sequence {
+            continue;
+        }
+        return Ok(Some(PointRecordCandidate {
+            internal_key: internal_key.clone(),
+            value: value.clone(),
+        }));
+    }
+
+    Ok(None)
+}
+
+fn keep_newer_point_candidate(
+    candidate: &mut Option<PointRecordCandidate>,
+    internal_key: &InternalKey,
+    value: Option<&ValueRef>,
+) {
+    let replace = candidate
+        .as_ref()
+        .is_none_or(|current| internal_key < &current.internal_key);
+    if replace {
+        *candidate = Some(PointRecordCandidate {
+            internal_key: internal_key.clone(),
+            value: value.cloned(),
+        });
+    }
+}
+
+fn table_range_tombstone_covers_visible_point(
+    tombstone: &TableRangeTombstone,
+    key: &[u8],
+    point_sequence: Sequence,
+    point_batch_index: u32,
+    read_sequence: Sequence,
+) -> bool {
+    if tombstone.sequence > read_sequence || !key_is_in_range(key, &tombstone.range) {
+        return false;
+    }
+
+    tombstone.sequence > point_sequence
+        || (tombstone.sequence == point_sequence && tombstone.batch_index > point_batch_index)
 }
 
 fn value_bytes(value: Option<&ValueRef>, db_path: Option<&Path>) -> Result<Vec<u8>> {
