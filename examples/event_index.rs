@@ -45,8 +45,8 @@ struct EventLog {
 impl EventLog {
     fn open(path: &Path) -> Result<Self> {
         let db = Db::open_persistent(path)?;
-        let events = db.open_bucket("events")?;
-        let by_account = db.open_bucket("events_by_account")?;
+        let events = db.bucket("events")?;
+        let by_account = db.bucket("events_by_account")?;
         Ok(Self {
             db,
             events,
@@ -56,12 +56,12 @@ impl EventLog {
 
     fn append(&self, event: &Event) -> Result<()> {
         let mut batch = WriteBatch::new();
-        batch.put("events", event_key(&event.id), event.encode()?);
-        batch.put(
+        batch.put_bucket("events", event_key(&event.id), event.encode()?)?;
+        batch.put_bucket(
             "events_by_account",
             account_event_key(&event.account_id, &event.id),
             event.id.as_bytes(),
-        );
+        )?;
         self.db.write(batch, WriteOptions::sync_all())?;
         Ok(())
     }

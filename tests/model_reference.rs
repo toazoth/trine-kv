@@ -20,9 +20,7 @@ fn persistent_snapshot_range_ignores_newer_point_delete() {
 
     {
         let db = Db::open(options).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
         bucket.put(b"key-06", b"value-06").expect("put");
         db.flush().expect("flush table");
 
@@ -56,24 +54,21 @@ fn randomized_operations_match_mvcc_reference_across_reopen() {
         block_bytes: 128,
         ..BucketOptions::default()
     };
+    options.default_bucket_options = bucket_options;
     let keys = model_keys();
     let mut rng = TestRng::new(0x6eed_5eed_d15e_a5e5);
     let mut model = BTreeMap::<Vec<u8>, Vec<u8>>::new();
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", bucket_options.clone())
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
         let mut run = ModelRun::new(&db, &bucket, &keys, &mut rng, &mut model);
         run.run();
     }
 
     {
         let db = Db::open(options).expect("persistent db reopens");
-        let bucket = db
-            .open_bucket_with_options("default", bucket_options)
-            .expect("bucket reopens");
+        let bucket = db.default_bucket().expect("bucket reopens");
         assert_range(&bucket, &model);
     }
 

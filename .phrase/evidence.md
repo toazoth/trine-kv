@@ -3360,3 +3360,173 @@ Record only evidence that can change planning or durable decisions.
 ### Recommended Next Action
 
 - Commit the Phase 31 API polish, then push to CI when ready.
+
+## 2026-05-26: Phase 32 Titan-Like Large-Value Storage Spec Completed
+
+### Observation
+
+- User requested a Titan-like large-value subsystem and explicitly required the
+  first implementation step to be a spec update.
+- Current Trine code already has `ValueRef::Inline` and primitive blob
+  references, but the existing blob file is just value bytes at offsets and
+  does not store the key/version metadata needed for robust GC validation.
+- The new protocol `.phrase/protocol/titan-like-blob-storage-spec.md` defines
+  the target design: small values stay inline, large values separate during
+  flush/compaction, `BlobIndex` carries checksummed record metadata, blob
+  records store internal-key metadata, and GC is snapshot-safe and recoverable.
+- The v1 protocol now points large-value behavior at the new blob storage
+  protocol.
+- The durable decision framework now records that Titan can be used as a design
+  reference only; Trine keeps its own code, file formats, tests, and recovery
+  contract.
+
+### Interpretation
+
+- Phase 32 acceptance is met as a spec-only phase.
+- The next implementation phase should stabilize `BlobIndex` and `BlobFile`
+  encode/decode tests before changing flush behavior.
+- Existing code still has the primitive blob path; that is intentional until
+  Phase 33 replaces the format under tests.
+
+### Verification
+
+- Reviewed `.phrase/decision.md`, `.phrase/current.md`, `.phrase/roadmap.md`,
+  and current blob-related protocol/code paths.
+- Reviewed Titan overview/config/repo/article as design references only.
+- Updated `.phrase/protocol/titan-like-blob-storage-spec.md`.
+- Updated `.phrase/protocol/trine-kv-v1-spec.md`.
+- Updated `.phrase/current.md`, `.phrase/roadmap.md`, `.phrase/evidence.md`,
+  and `.phrase/decision.md`.
+
+### Remaining Blockers
+
+- New `BlobIndex` and `BlobFile` format are not implemented yet.
+- Blob GC is not implemented yet.
+- Remote CI cannot be executed locally; it must run after push.
+
+### Recommended Next Action
+
+- Start Phase 33 with encode/decode tests for the new `BlobIndex` and
+  `BlobFile` format.
+
+## 2026-05-26: Phase 33 Bucket API Contract Hardening Completed
+
+### Observation
+
+- API audit found tests, benches, and protocol docs still treating `"default"`
+  as a named bucket in some places.
+- `WriteBatch` and `Transaction` default writes no longer require callers to
+  pass a bucket name.
+- Named-bucket staging methods now return `Result<()>` and reject empty names
+  plus the reserved `"default"` name before a batch is submitted.
+- Default bucket options are configured through `DbOptions`, including the new
+  `with_default_bucket_options` helper.
+- Usage docs and protocol docs now describe the default/named bucket boundary.
+
+### Interpretation
+
+- The public API is now clearer for the common path: `Db` operates directly on
+  the default bucket, while named bucket methods are explicit.
+- Rejecting `"default"` at `open_bucket` and named staging sites prevents the
+  default bucket from being used accidentally through the named-bucket API.
+- This is a pre-1.0 public API break and stays within the current Semantic
+  Versioning rule.
+
+### Verification
+
+- `cargo fmt --all --check`
+- `cargo check --all-targets --all-features`
+- `cargo test --test in_memory_iteration --test in_memory_mvcc --test in_memory_range_delete --test in_memory_transaction`
+- `cargo test --test persistent_wal --test scaffold`
+- `cargo run --example quickstart`
+- `cargo run --example user_store`
+- `cargo run --example event_index`
+- `cargo test --all-targets --all-features`
+- `cargo clippy --all-targets --all-features`
+- `git diff --check`
+- forbidden-term scan over `.phrase`, `src`, `tests`, `benches`, `examples`,
+  `docs`, and `README.md`
+
+### Remaining Blockers
+
+- Remote CI cannot be executed locally; it must run after push.
+
+### Recommended Next Action
+
+- Continue with Phase 34 `BlobIndex` and `BlobFile` format tests before wiring
+  flush to the new large-value file format.
+
+## 2026-05-26: Bucket API Naming Follow-Up Completed
+
+### Observation
+
+- User feedback identified `open_bucket` as too long and less accurate for the
+  intended get-or-create behavior.
+- `Db::bucket(name)` is now the primary named-bucket entrypoint.
+- `Db::bucket_with_options(name, options)` is now the explicit custom-options
+  entrypoint.
+- The older `open_*` named-bucket methods were removed from the public API
+  surface because this is still pre-1.0 API polish.
+
+### Interpretation
+
+- The common API now reads as `db.put(...)` for the default bucket and
+  `db.bucket("users")?` for an optional named bucket.
+- The custom-options path remains available only where the caller is deciding
+  durable bucket configuration.
+
+### Verification
+
+- `cargo fmt --all --check`
+- `cargo check --all-targets --all-features`
+- `cargo test --test in_memory_iteration --test in_memory_mvcc --test persistent_wal --test scaffold`
+- `cargo test --all-targets --all-features`
+- `cargo clippy --all-targets --all-features`
+- `cargo run --example quickstart`
+- `cargo run --example user_store`
+- `cargo run --example event_index`
+
+### Remaining Blockers
+
+- Remote CI cannot be executed locally; it must run after push.
+
+### Recommended Next Action
+
+- Continue with Phase 34 `BlobIndex` and `BlobFile` format tests.
+
+## 2026-05-26: README Capability Pass Completed
+
+### Observation
+
+- User feedback found the README too minimal for evaluating Trine's common
+  capabilities.
+- README now leads with a capability inventory and a common API example that
+  covers the default bucket, named buckets, custom prefix extraction,
+  snapshots, atomic batches, optimistic transactions, and range scans.
+- README still points to the runnable quickstart for persistent open, flush,
+  reopen, and stats.
+
+### Interpretation
+
+- New readers get a clearer first impression of what Trine can do before
+  opening the longer usage guide.
+- The README stays honest about boundaries by keeping durability and release
+  details in the existing docs.
+
+### Verification
+
+- `cargo run --example quickstart`
+- `git diff --check`
+- forbidden-term scan over `.phrase`, `src`, `tests`, `benches`, `examples`,
+  `docs`, and `README.md`
+- old bucket entrypoint scan over README, docs, examples, source, tests,
+  benches, and current protocol docs
+
+### Remaining Blockers
+
+- Remote CI cannot be executed locally; it must run after push.
+
+### Recommended Next Action
+
+- Commit the bucket API and README polish, then continue with Phase 34
+  `BlobIndex` and `BlobFile` format tests.

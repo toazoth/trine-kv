@@ -45,6 +45,8 @@ Evidence notes should separate:
 - Do not change MVCC, WAL, SSTable, manifest, compaction, transaction,
   prefix-filter, compression, or search-policy behavior without updating the
   protocol spec or adding a follow-up ADR.
+- Titan and other external storage engines may be used as design references,
+  but Trine must keep its own code, file formats, tests, and recovery contract.
 
 ## Phase Gate Rules
 

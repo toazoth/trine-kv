@@ -59,28 +59,6 @@ impl LsmTree {
     pub(crate) fn l0_table_count(&self) -> Result<usize> {
         Ok(self.current_version()?.l0_table_count())
     }
-
-    pub(crate) fn is_empty(&self) -> Result<bool> {
-        let active_empty = self
-            .active_memtable
-            .read()
-            .map_err(|_| lock_poisoned("active memtable"))?
-            .is_empty()
-            .map_err(|()| lock_poisoned("memtable entries"))?;
-        let tombstones_empty = self
-            .range_tombstones
-            .read()
-            .map_err(|_| lock_poisoned("range tombstones"))?
-            .is_empty();
-        let immutable_empty = self
-            .immutable_memtables
-            .read()
-            .map_err(|_| lock_poisoned("immutable memtable queue"))?
-            .is_empty();
-        let tables_empty = self.current_version()?.table_handles().is_empty();
-
-        Ok(active_empty && tombstones_empty && immutable_empty && tables_empty)
-    }
 }
 
 #[derive(Debug, Clone)]

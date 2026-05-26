@@ -1,13 +1,11 @@
-use trine_kv::{BucketOptions, Db, DbOptions, Error, WriteBatch, WriteOptions};
+use trine_kv::{Db, DbOptions, Error, WriteBatch, WriteOptions};
 
 #[test]
 fn write_buffer_freeze_reads_immutable_in_memory() {
     let mut options = DbOptions::memory();
     options.write_buffer_bytes = 1;
     let db = Db::memory(options).expect("memory db opens");
-    let bucket = db
-        .open_bucket_with_options("default", BucketOptions::default())
-        .expect("bucket opens");
+    let bucket = db.default_bucket().expect("bucket opens");
 
     bucket.put(b"user:1", b"ada").expect("write user");
 
@@ -21,9 +19,7 @@ fn write_buffer_freeze_reads_immutable_in_memory() {
 #[test]
 fn point_writes_deletes_and_snapshot_reads_are_mvcc_visible() {
     let db = Db::memory(DbOptions::memory()).expect("memory db opens");
-    let bucket = db
-        .open_bucket_with_options("default", BucketOptions::default())
-        .expect("bucket opens");
+    let bucket = db.default_bucket().expect("bucket opens");
 
     assert_eq!(bucket.get(b"a").expect("initial read"), None);
 
@@ -71,16 +67,16 @@ fn snapshots_pin_and_release_read_sequences() {
 #[test]
 fn write_batch_commits_multiple_buckets_at_one_sequence() {
     let db = Db::memory(DbOptions::memory()).expect("memory db opens");
-    let users = db
-        .open_bucket_with_options("users", BucketOptions::default())
-        .expect("users bucket opens");
-    let posts = db
-        .open_bucket_with_options("posts", BucketOptions::default())
-        .expect("posts bucket opens");
+    let users = db.bucket("users").expect("users bucket opens");
+    let posts = db.bucket("posts").expect("posts bucket opens");
 
     let mut batch = WriteBatch::new();
-    batch.put("users", b"1", b"ada");
-    batch.put("posts", b"1", b"hello");
+    batch
+        .put_bucket("users", b"1", b"ada")
+        .expect("stage users write");
+    batch
+        .put_bucket("posts", b"1", b"hello")
+        .expect("stage posts write");
 
     let info = db
         .write(batch, WriteOptions::default())
@@ -94,15 +90,31 @@ fn write_batch_commits_multiple_buckets_at_one_sequence() {
 }
 
 #[test]
+fn named_batch_methods_reject_reserved_default_bucket_name() {
+    let mut batch = WriteBatch::new();
+    let error = batch
+        .put_bucket("default", b"a", b"b")
+        .expect_err("default writes use batch.put");
+    assert!(matches!(error, Error::InvalidOptions { .. }));
+
+    let error = batch
+        .delete_bucket("", b"a")
+        .expect_err("empty named bucket is rejected");
+    assert!(matches!(error, Error::InvalidOptions { .. }));
+
+    assert!(batch.is_empty());
+}
+
+#[test]
 fn failed_batch_does_not_partially_apply() {
     let db = Db::memory(DbOptions::memory()).expect("memory db opens");
-    let bucket = db
-        .open_bucket_with_options("default", BucketOptions::default())
-        .expect("bucket opens");
+    let bucket = db.default_bucket().expect("bucket opens");
 
     let mut batch = WriteBatch::new();
-    batch.put("default", b"a", b"visible only if batch commits");
-    batch.put("missing", b"b", b"nope");
+    batch.put(b"a", b"visible only if batch commits");
+    batch
+        .put_bucket("missing", b"b", b"nope")
+        .expect("stage missing-bucket write");
 
     let error = db
         .write(batch, WriteOptions::default())
@@ -114,20 +126,18 @@ fn failed_batch_does_not_partially_apply() {
 #[test]
 fn duplicate_keys_in_one_batch_use_later_operation() {
     let db = Db::memory(DbOptions::memory()).expect("memory db opens");
-    let bucket = db
-        .open_bucket_with_options("default", BucketOptions::default())
-        .expect("bucket opens");
+    let bucket = db.default_bucket().expect("bucket opens");
 
     let mut put_then_delete = WriteBatch::new();
-    put_then_delete.put("default", b"a", b"v1");
-    put_then_delete.delete("default", b"a");
+    put_then_delete.put(b"a", b"v1");
+    put_then_delete.delete(b"a");
     db.write(put_then_delete, WriteOptions::default())
         .expect("batch commits");
     assert_eq!(bucket.get(b"a").expect("later delete wins"), None);
 
     let mut delete_then_put = WriteBatch::new();
-    delete_then_put.delete("default", b"a");
-    delete_then_put.put("default", b"a", b"v2");
+    delete_then_put.delete(b"a");
+    delete_then_put.put(b"a", b"v2");
     db.write(delete_then_put, WriteOptions::default())
         .expect("batch commits");
     assert_eq!(

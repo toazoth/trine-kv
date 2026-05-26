@@ -1,4 +1,4 @@
-use trine_kv::{BucketOptions, Db, DbOptions, Iter, KeyRange, KeyValue, WriteBatch, WriteOptions};
+use trine_kv::{Db, DbOptions, Iter, KeyRange, KeyValue, WriteBatch, WriteOptions};
 
 fn collect(iter: Iter) -> Vec<(Vec<u8>, Vec<u8>)> {
     iter.map(|item| {
@@ -11,9 +11,7 @@ fn collect(iter: Iter) -> Vec<(Vec<u8>, Vec<u8>)> {
 #[test]
 fn range_delete_hides_point_reads_and_scans_without_breaking_snapshots() {
     let db = Db::memory(DbOptions::memory()).expect("memory db opens");
-    let bucket = db
-        .open_bucket_with_options("default", BucketOptions::default())
-        .expect("bucket opens");
+    let bucket = db.default_bucket().expect("bucket opens");
 
     for (key, value) in [(b"a", b"a1"), (b"b", b"b1"), (b"c", b"c1"), (b"d", b"d1")] {
         bucket.put(key, value).expect("write key");
@@ -21,7 +19,7 @@ fn range_delete_hides_point_reads_and_scans_without_breaking_snapshots() {
     let snapshot = db.snapshot();
 
     let mut delete = WriteBatch::new();
-    delete.delete_range("default", KeyRange::half_open(b"b", b"d"));
+    delete.delete_range(KeyRange::half_open(b"b", b"d"));
     db.write(delete, WriteOptions::default())
         .expect("range delete commits");
 
@@ -54,16 +52,14 @@ fn range_delete_hides_point_reads_and_scans_without_breaking_snapshots() {
 #[test]
 fn range_delete_participates_in_prefix_scans() {
     let db = Db::memory(DbOptions::memory()).expect("memory db opens");
-    let bucket = db
-        .open_bucket_with_options("default", BucketOptions::default())
-        .expect("bucket opens");
+    let bucket = db.default_bucket().expect("bucket opens");
 
     bucket.put(b"user:1", b"old").expect("write user 1");
     bucket.put(b"user:2", b"old").expect("write user 2");
     bucket.put(b"order:1", b"keep").expect("write order");
 
     let mut delete = WriteBatch::new();
-    delete.delete_range("default", KeyRange::half_open(b"user:1", b"user:3"));
+    delete.delete_range(KeyRange::half_open(b"user:1", b"user:3"));
     db.write(delete, WriteOptions::default())
         .expect("range delete commits");
 
@@ -80,13 +76,11 @@ fn range_delete_participates_in_prefix_scans() {
 #[test]
 fn same_batch_order_decides_range_delete_conflicts() {
     let db = Db::memory(DbOptions::memory()).expect("memory db opens");
-    let bucket = db
-        .open_bucket_with_options("default", BucketOptions::default())
-        .expect("bucket opens");
+    let bucket = db.default_bucket().expect("bucket opens");
 
     let mut delete_then_put = WriteBatch::new();
-    delete_then_put.delete_range("default", KeyRange::half_open(b"a", b"z"));
-    delete_then_put.put("default", b"m", b"visible");
+    delete_then_put.delete_range(KeyRange::half_open(b"a", b"z"));
+    delete_then_put.put(b"m", b"visible");
     db.write(delete_then_put, WriteOptions::default())
         .expect("first batch commits");
     assert_eq!(
@@ -95,8 +89,8 @@ fn same_batch_order_decides_range_delete_conflicts() {
     );
 
     let mut put_then_delete = WriteBatch::new();
-    put_then_delete.put("default", b"n", b"hidden");
-    put_then_delete.delete_range("default", KeyRange::half_open(b"a", b"z"));
+    put_then_delete.put(b"n", b"hidden");
+    put_then_delete.delete_range(KeyRange::half_open(b"a", b"z"));
     db.write(put_then_delete, WriteOptions::default())
         .expect("second batch commits");
     assert_eq!(bucket.get(b"n").expect("later range delete wins"), None);

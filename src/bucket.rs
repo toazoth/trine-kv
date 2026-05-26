@@ -8,7 +8,12 @@ use crate::{
     write_batch::WriteBatch,
 };
 
-/// Name of an optional bucket opened through `Db::open_bucket`.
+pub(crate) const DEFAULT_BUCKET_NAME: &str = "default";
+
+/// Name of an optional bucket returned through `Db::bucket`.
+///
+/// `Db` validates bucket names when creating them. The reserved default bucket
+/// is reached through direct `Db` helpers or `Db::default_bucket`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BucketName(String);
 
@@ -95,7 +100,11 @@ impl Bucket {
         options: WriteOptions,
     ) -> Result<CommitInfo> {
         let mut batch = WriteBatch::new();
-        batch.put(self.name.as_str(), key, value);
+        if self.name.as_str() == DEFAULT_BUCKET_NAME {
+            batch.put(key, value);
+        } else {
+            batch.put_bucket(self.name.as_str(), key, value)?;
+        }
         self.db.write(batch, options)
     }
 
@@ -112,7 +121,11 @@ impl Bucket {
         options: WriteOptions,
     ) -> Result<CommitInfo> {
         let mut batch = WriteBatch::new();
-        batch.delete(self.name.as_str(), key);
+        if self.name.as_str() == DEFAULT_BUCKET_NAME {
+            batch.delete(key);
+        } else {
+            batch.delete_bucket(self.name.as_str(), key)?;
+        }
         self.db.write(batch, options)
     }
 
@@ -129,7 +142,11 @@ impl Bucket {
         options: WriteOptions,
     ) -> Result<CommitInfo> {
         let mut batch = WriteBatch::new();
-        batch.delete_range(self.name.as_str(), range);
+        if self.name.as_str() == DEFAULT_BUCKET_NAME {
+            batch.delete_range(range);
+        } else {
+            batch.delete_range_bucket(self.name.as_str(), range)?;
+        }
         self.db.write(batch, options)
     }
 

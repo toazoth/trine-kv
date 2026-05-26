@@ -1,11 +1,12 @@
 # Trine KV
 
-Trine KV is an embedded Rust key-value database with MVCC snapshots, optimistic
-transactions, WAL recovery, SSTables, compaction, prefix/range scans, block
-compression, and blob-backed large values.
+Trine KV is an embedded Rust key-value database for applications that need
+ordered local storage without running a separate server. It gives simple code a
+default bucket, and lets larger applications add named buckets with their own
+prefix, filter, compression, and large-value settings.
 
 The v1 engine is implemented and verified by the repository test suite,
-benchmark harness, and durability notes. Start with the runnable quickstart:
+benchmark harness, and durability notes. To see the main path work end to end:
 
 ```text
 cargo run --example quickstart
@@ -14,6 +15,23 @@ cargo run --example quickstart
 Then read [docs/usage.md](docs/usage.md) for the API path and
 [docs/durability.md](docs/durability.md) for persistence guarantees and limits.
 Release packaging notes live in [docs/release.md](docs/release.md).
+
+## Common Capabilities
+
+- Direct default-bucket reads and writes with `Db::put`, `Db::get`, `Db::range`,
+  and `Db::prefix`.
+- Optional named buckets through `db.bucket("users")?` when data needs logical
+  separation or independent tuning.
+- Atomic write batches across the default bucket and named buckets.
+- MVCC snapshots that keep old reads stable while newer writes commit.
+- Optimistic transactions with point and range conflict checks.
+- Ordered range scans and prefix scans.
+- Persistent mode with WAL replay, manifest recovery, directory locking, flush,
+  compaction, and read-only open.
+- Block-based SSTables with filters, block cache, compression, and configurable
+  index search policies.
+- Large values can use the current blob-value path instead of staying inline in
+  every SSTable block.
 
 ## Install
 
@@ -32,19 +50,57 @@ For local development, depend on a path:
 trine-kv = { path = "../trine-kv" }
 ```
 
-## Minimal Example
+## Common API Example
 
 ```rust
-use trine_kv::Db;
+use trine_kv::{
+    BucketOptions, Db, KeyRange, PrefixExtractor, TransactionOptions, WriteBatch, WriteOptions,
+};
 
 fn main() -> trine_kv::Result<()> {
     let db = Db::open_memory()?;
 
-    db.put(b"user:001", b"Ada")?;
-    assert_eq!(db.get(b"user:001")?, Some(b"Ada".to_vec()));
+    // Simple applications can use the built-in default bucket directly.
+    db.put(b"settings:theme", b"dark")?;
+    assert_eq!(db.get(b"settings:theme")?, Some(b"dark".to_vec()));
+
+    // Named buckets are created on demand and can carry their own options.
+    let users = db.bucket_with_options(
+        "users",
+        BucketOptions::default().with_prefix_extractor(PrefixExtractor::Separator(b':')),
+    )?;
+    users.put(b"user:001", b"Ada")?;
+
+    // Snapshots keep a stable read sequence while newer writes continue.
+    let snapshot = db.snapshot();
+    users.put(b"user:002", b"Lin")?;
+    assert_eq!(snapshot.get(&users, b"user:002")?, None);
+
+    // Batches can atomically span buckets.
+    let mut batch = WriteBatch::new();
+    batch.put(b"audit:001", b"user-created");
+    batch.put_bucket("users", b"user:003", b"Grace")?;
+    db.write(batch, WriteOptions::sync_all())?;
+
+    // Transactions validate their read set when they commit.
+    let mut txn = db.transaction(TransactionOptions::default());
+    assert_eq!(txn.get_bucket("users", b"user:001")?, Some(b"Ada".to_vec()));
+    txn.put_bucket("users", b"user:004", b"Barbara")?;
+    txn.commit()?;
+
+    let rows = users
+        .range(&KeyRange::half_open(b"user:001", b"user:999"))?
+        .collect::<trine_kv::Result<Vec<_>>>()?;
+    assert_eq!(rows.len(), 4);
 
     Ok(())
 }
+```
+
+For persistent open, flush, reopen, and stats in one runnable program, use:
+
+```text
+cargo run --example quickstart
 ```
 
 ## Common Commands

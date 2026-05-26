@@ -11,9 +11,7 @@ fn collect(iter: Iter) -> Vec<(Vec<u8>, Vec<u8>)> {
 #[test]
 fn range_iteration_returns_ordered_live_keys() {
     let db = Db::memory(DbOptions::memory()).expect("memory db opens");
-    let bucket = db
-        .open_bucket_with_options("default", BucketOptions::default())
-        .expect("bucket opens");
+    let bucket = db.default_bucket().expect("bucket opens");
 
     bucket.put(b"b", b"b1").expect("write b1");
     bucket.put(b"a", b"a1").expect("write a1");
@@ -49,9 +47,7 @@ fn range_iteration_returns_ordered_live_keys() {
 #[test]
 fn bounded_range_and_reverse_iteration_obey_key_order() {
     let db = Db::memory(DbOptions::memory()).expect("memory db opens");
-    let bucket = db
-        .open_bucket_with_options("default", BucketOptions::default())
-        .expect("bucket opens");
+    let bucket = db.default_bucket().expect("bucket opens");
 
     for key in [b"a", b"b", b"c", b"d", b"e"] {
         bucket.put(key, key).expect("write key");
@@ -78,14 +74,14 @@ fn bounded_range_and_reverse_iteration_obey_key_order() {
 
 #[test]
 fn prefix_iteration_uses_snapshot_visibility() {
-    let db = Db::memory(DbOptions::memory()).expect("memory db opens");
     let options = BucketOptions {
         prefix_extractor: PrefixExtractor::Separator(b':'),
         ..BucketOptions::default()
     };
-    let bucket = db
-        .open_bucket_with_options("default", options)
-        .expect("bucket opens");
+    let mut db_options = DbOptions::memory();
+    db_options.default_bucket_options = options;
+    let db = Db::memory(db_options).expect("memory db opens");
+    let bucket = db.default_bucket().expect("bucket opens");
 
     bucket.put(b"user:1", b"old").expect("write old");
     bucket.put(b"order:1", b"order").expect("write order");
@@ -109,20 +105,23 @@ fn prefix_iteration_uses_snapshot_visibility() {
 }
 
 #[test]
-fn reopening_bucket_with_different_options_is_rejected() {
+fn opening_default_bucket_as_named_bucket_is_rejected() {
     let db = Db::memory(DbOptions::memory()).expect("memory db opens");
-    db.open_bucket_with_options("default", BucketOptions::default())
-        .expect("first bucket open");
     db.put(b"already-written", b"value")
         .expect("default bucket write fixes options");
+
+    let error = db
+        .bucket("default")
+        .expect_err("default is not a named bucket");
+    assert!(matches!(error, Error::InvalidOptions { .. }));
 
     let options = BucketOptions {
         allow_empty_keys: false,
         ..BucketOptions::default()
     };
     let error = db
-        .open_bucket_with_options("default", options)
-        .expect_err("conflicting options must be explicit");
+        .bucket_with_options("default", options)
+        .expect_err("default is not a named bucket");
 
     assert!(matches!(error, Error::InvalidOptions { .. }));
 }

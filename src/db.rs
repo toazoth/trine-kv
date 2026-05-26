@@ -11,7 +11,7 @@ use std::{
 
 use crate::{
     blob::{self, ValueRef},
-    bucket::{Bucket, BucketName},
+    bucket::{Bucket, BucketName, DEFAULT_BUCKET_NAME},
     cache, compaction, durability,
     error::{Error, Result},
     iterator::{Direction, Iter, ScanSelector},
@@ -35,8 +35,6 @@ use crate::{
 };
 
 mod commit;
-
-pub(crate) const DEFAULT_BUCKET_NAME: &str = "default";
 
 #[derive(Debug, Clone)]
 pub struct Db {
@@ -321,17 +319,22 @@ impl Db {
         ))
     }
 
-    /// Opens an existing named bucket or creates it with default bucket
+    /// Returns an existing named bucket or creates it with default bucket
     /// options.
-    pub fn open_bucket(&self, name: impl Into<BucketName>) -> Result<Bucket> {
-        self.open_bucket_with_options(name, BucketOptions::default())
+    ///
+    /// The built-in default bucket is reserved for direct `Db` helpers and
+    /// `Db::default_bucket`; using `"default"` as a named bucket returns an
+    /// error.
+    pub fn bucket(&self, name: impl Into<BucketName>) -> Result<Bucket> {
+        self.bucket_with_options(name, BucketOptions::default())
     }
 
-    /// Opens an existing named bucket or creates it with explicit options.
+    /// Returns an existing named bucket or creates it with explicit options.
     ///
-    /// Bucket options are fixed after creation. Reopening an existing named
-    /// bucket with different options returns an error.
-    pub fn open_bucket_with_options(
+    /// Bucket options are fixed after creation. Calling this for an existing
+    /// named bucket with different options returns an error. The built-in
+    /// default bucket is configured through `DbOptions::default_bucket_options`.
+    pub fn bucket_with_options(
         &self,
         name: impl Into<BucketName>,
         options: BucketOptions,
@@ -342,14 +345,16 @@ impl Db {
         if name.as_str().is_empty() {
             return Err(Error::invalid_options("bucket name cannot be empty"));
         }
+        if name.as_str() == DEFAULT_BUCKET_NAME {
+            return Err(Error::invalid_options(
+                "default bucket is accessed through Db helpers",
+            ));
+        }
 
         validate_bucket_options(&options)?;
 
         if let Some(existing_options) = self.existing_bucket_options(name.as_str())? {
             if existing_options != options {
-                if name.as_str() == DEFAULT_BUCKET_NAME {
-                    return self.reconfigure_empty_default_bucket(options);
-                }
                 return Err(Error::invalid_options(
                     "existing bucket options do not match requested options",
                 ));
@@ -390,71 +395,6 @@ impl Db {
         Ok(Bucket::new(self.clone(), name, bucket_options))
     }
 
-    fn reconfigure_empty_default_bucket(&self, options: BucketOptions) -> Result<Bucket> {
-        if self.inner.options.read_only {
-            return Err(Error::ReadOnly);
-        }
-        validate_bucket_options(&options)?;
-
-        let _writer = self
-            .inner
-            .writer
-            .lock()
-            .map_err(|_| lock_poisoned("writer coordinator"))?;
-        {
-            let buckets = self
-                .inner
-                .buckets
-                .read()
-                .map_err(|_| lock_poisoned("bucket registry"))?;
-            let state = buckets
-                .get(DEFAULT_BUCKET_NAME)
-                .ok_or_else(|| Error::BucketMissing {
-                    name: DEFAULT_BUCKET_NAME.to_owned(),
-                })?;
-            if !state.is_empty()? {
-                return Err(Error::invalid_options(
-                    "default bucket options cannot change after writes",
-                ));
-            }
-        }
-
-        if let Some(manifest) = &self.inner.manifest {
-            manifest
-                .lock()
-                .map_err(|_| lock_poisoned("manifest store"))?
-                .update_bucket_options(DEFAULT_BUCKET_NAME, options.clone())?;
-        }
-
-        {
-            let mut buckets = self
-                .inner
-                .buckets
-                .write()
-                .map_err(|_| lock_poisoned("bucket registry"))?;
-            let state = buckets
-                .get(DEFAULT_BUCKET_NAME)
-                .ok_or_else(|| Error::BucketMissing {
-                    name: DEFAULT_BUCKET_NAME.to_owned(),
-                })?;
-            if !state.is_empty()? {
-                return Err(Error::invalid_options(
-                    "default bucket options cannot change after writes",
-                ));
-            }
-            buckets.insert(
-                DEFAULT_BUCKET_NAME.to_owned(),
-                Arc::new(LsmTree::new(options.clone(), Vec::new())?),
-            );
-        }
-
-        Ok(Bucket::new(
-            self.clone(),
-            BucketName::new(DEFAULT_BUCKET_NAME),
-            options,
-        ))
-    }
-
     /// Reads the newest committed value for `key` from the default bucket.
     pub fn get(&self, key: &[u8]) -> Result<Option<Value>> {
         self.get_at_sequence(DEFAULT_BUCKET_NAME, key, self.last_committed_sequence())
@@ -487,7 +427,7 @@ impl Db {
         options: WriteOptions,
     ) -> Result<CommitInfo> {
         let mut batch = crate::WriteBatch::new();
-        batch.put(DEFAULT_BUCKET_NAME, key, value);
+        batch.put(key, value);
         self.write(batch, options)
     }
 
@@ -506,7 +446,7 @@ impl Db {
         options: WriteOptions,
     ) -> Result<CommitInfo> {
         let mut batch = crate::WriteBatch::new();
-        batch.delete(DEFAULT_BUCKET_NAME, key);
+        batch.delete(key);
         self.write(batch, options)
     }
 
@@ -524,7 +464,7 @@ impl Db {
         options: WriteOptions,
     ) -> Result<CommitInfo> {
         let mut batch = crate::WriteBatch::new();
-        batch.delete_range(DEFAULT_BUCKET_NAME, range);
+        batch.delete_range(range);
         self.write(batch, options)
     }
 

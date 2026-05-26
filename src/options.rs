@@ -130,6 +130,15 @@ impl DbOptions {
         self
     }
 
+    /// Sets the options used by the built-in default bucket.
+    ///
+    /// Named buckets still use the options passed to `Db::bucket_with_options`.
+    #[must_use]
+    pub fn with_default_bucket_options(mut self, options: BucketOptions) -> Self {
+        self.default_bucket_options = options;
+        self
+    }
+
     #[must_use]
     pub const fn read_only(mut self) -> Self {
         self.read_only = true;

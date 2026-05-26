@@ -10,13 +10,13 @@ fn main() -> trine_kv::Result<()> {
     }
 
     let db = Db::open(DbOptions::persistent(&path).with_durability(DurabilityMode::Flush))?;
-    let users = db.open_bucket_with_options("users", user_bucket_options())?;
+    let users = db.bucket_with_options("users", user_bucket_options())?;
 
     users.put_with_options(b"user:001", b"Ada", WriteOptions::sync_all())?;
 
     let mut batch = WriteBatch::new();
-    batch.put("users", b"user:002", b"Lin");
-    batch.put("users", b"team:core", b"database");
+    batch.put_bucket("users", b"user:002", b"Lin")?;
+    batch.put_bucket("users", b"team:core", b"database")?;
     db.write(batch, WriteOptions::sync_all())?;
 
     assert_eq!(users.get(b"user:001")?, Some(b"Ada".to_vec()));
@@ -40,8 +40,8 @@ fn main() -> trine_kv::Result<()> {
     assert_eq!(range_values, ["Ada", "Lin", "Grace"]);
 
     let mut txn = db.transaction(TransactionOptions::default());
-    assert_eq!(txn.get("users", b"user:001")?, Some(b"Ada".to_vec()));
-    txn.put("users", b"user:004", b"Barbara");
+    assert_eq!(txn.get_bucket("users", b"user:001")?, Some(b"Ada".to_vec()));
+    txn.put_bucket("users", b"user:004", b"Barbara")?;
     txn.commit()?;
 
     db.flush()?;
@@ -51,7 +51,7 @@ fn main() -> trine_kv::Result<()> {
     drop(db);
 
     let reopened = Db::open(DbOptions::persistent(&path))?;
-    let users = reopened.open_bucket_with_options("users", user_bucket_options())?;
+    let users = reopened.bucket_with_options("users", user_bucket_options())?;
     assert_eq!(users.get(b"user:004")?, Some(b"Barbara".to_vec()));
 
     let stats = reopened.stats();

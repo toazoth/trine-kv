@@ -88,23 +88,41 @@ assert_eq!(db.get(b"user:001")?, Some(b"Ada".to_vec()));
 let rows = db.range(&trine_kv::KeyRange::all())?;
 ```
 
+Configure the default bucket through `DbOptions`; do not open it by name:
+
+```rust
+use trine_kv::{BucketOptions, Db, DbOptions, PrefixExtractor};
+
+let options = DbOptions::memory().with_default_bucket_options(
+    BucketOptions::default().with_prefix_extractor(PrefixExtractor::Separator(b':')),
+);
+let db = Db::memory(options)?;
+```
+
 ## Create A Bucket
 
-A bucket is a named collection of keys with fixed options. Reopening an
-existing bucket with different options returns an error, because the options
-are part of the on-disk contract.
+A bucket is a named collection of keys with fixed options. `bucket` returns an
+existing bucket or creates it with default `BucketOptions`.
+
+```rust
+let users = db.bucket("users")?;
+```
+
+Use `bucket_with_options` when the bucket needs prefix filters or custom
+storage tuning. If the bucket already exists, the options must match because
+they are part of the on-disk contract:
 
 ```rust
 use trine_kv::{BucketOptions, PrefixExtractor};
 
-let users = db.open_bucket_with_options(
+let users = db.bucket_with_options(
     "users",
     BucketOptions::default().with_prefix_extractor(PrefixExtractor::Separator(b':')),
 )?;
 ```
 
-Use `BucketOptions::default()` when you do not need prefix filters or custom
-storage tuning.
+The name `"default"` is reserved for the built-in default bucket and cannot be
+used as a named bucket.
 
 ## Write And Read Keys
 
@@ -146,8 +164,10 @@ Use `WriteBatch` when several changes must commit at the same sequence:
 use trine_kv::{WriteBatch, WriteOptions};
 
 let mut batch = WriteBatch::new();
-batch.put("users", b"user:003", b"Grace");
-batch.delete("users", b"user:001");
+batch.put(b"audit:001", b"created");
+batch.delete(b"audit:000");
+batch.put_bucket("users", b"user:003", b"Grace")?;
+batch.delete_bucket("users", b"user:001")?;
 
 let commit = db.write(
     batch,
@@ -157,7 +177,9 @@ let commit = db.write(
 println!("committed sequence {}", commit.sequence().get());
 ```
 
-Batch writes can span buckets. If validation fails, the batch is rejected
+Batch writes can span buckets. Named-bucket staging methods return `Result`
+because empty names and the reserved `"default"` name are rejected before the
+batch is submitted. If validation fails during commit, the batch is rejected
 before it changes memtables.
 
 ## Range And Prefix Scans
@@ -229,8 +251,11 @@ Transactions read at a fixed sequence and validate their read set at commit:
 use trine_kv::{Error, TransactionOptions};
 
 let mut txn = db.transaction(TransactionOptions::default());
-let previous = txn.get("users", b"user:001")?;
-txn.put("users", b"user:005", b"Margaret");
+let previous_default = txn.get(b"settings:theme")?;
+txn.put(b"settings:theme", b"dark");
+
+let previous_user = txn.get_bucket("users", b"user:001")?;
+txn.put_bucket("users", b"user:005", b"Margaret")?;
 
 match txn.commit() {
     Ok(info) => println!("committed sequence {}", info.sequence().get()),
@@ -241,7 +266,8 @@ match txn.commit() {
 
 Point reads conflict with later point writes, point deletes, or covering range
 deletes. Range reads conflict with later point changes inside the range or later
-overlapping range deletes.
+overlapping range deletes. Named-bucket write methods return `Result` for the
+same bucket-name validation used by `WriteBatch`.
 
 ## Durability
 
@@ -252,7 +278,7 @@ visible in memtables. Choose a durability mode per write:
 use trine_kv::{WriteBatch, WriteOptions};
 
 let mut batch = WriteBatch::new();
-batch.put("users", b"user:006", b"Edsger");
+batch.put_bucket("users", b"user:006", b"Edsger")?;
 
 db.write(
     batch,

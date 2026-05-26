@@ -18,8 +18,8 @@ fn scaffold_exposes_v1_public_boundaries() {
     assert_eq!(CompressionProfile::Fast.codec_id(), CodecId::FastLz4Block);
 
     let mut batch = WriteBatch::new();
-    batch.put("default", b"a", b"b");
-    batch.delete_range("default", KeyRange::half_open(b"a", b"z"));
+    batch.put(b"a", b"b");
+    batch.delete_range(KeyRange::half_open(b"a", b"z"));
     assert_eq!(batch.len(), 2);
 
     let iter = trine_kv::Bucket::empty_iter(Direction::Forward);

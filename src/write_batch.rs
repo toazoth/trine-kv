@@ -1,4 +1,8 @@
-use crate::types::{KeyRange, Value};
+use crate::{
+    bucket::DEFAULT_BUCKET_NAME,
+    error::{Error, Result},
+    types::{KeyRange, Value},
+};
 
 /// One operation inside an atomic write batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +34,9 @@ impl BatchOperation {
 }
 
 /// Atomic group of writes that may span multiple buckets.
+///
+/// Methods without a bucket suffix target the built-in default bucket. Methods
+/// ending in `_bucket` target an optional named bucket returned by `Db::bucket`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WriteBatch {
     operations: Vec<BatchOperation>,
@@ -44,34 +51,74 @@ impl WriteBatch {
         }
     }
 
-    /// Adds a key/value write for `bucket`.
-    pub fn put(
-        &mut self,
-        bucket: impl Into<String>,
-        key: impl Into<Vec<u8>>,
-        value: impl Into<Value>,
-    ) {
+    /// Adds a key/value write to the default bucket.
+    pub fn put(&mut self, key: impl Into<Vec<u8>>, value: impl Into<Value>) {
         self.operations.push(BatchOperation::Put {
-            bucket: bucket.into(),
+            bucket: DEFAULT_BUCKET_NAME.to_owned(),
             key: key.into(),
             value: value.into(),
         });
     }
 
-    /// Adds a point delete for `bucket`.
-    pub fn delete(&mut self, bucket: impl Into<String>, key: impl Into<Vec<u8>>) {
+    /// Adds a key/value write for a named bucket.
+    pub fn put_bucket(
+        &mut self,
+        bucket: impl Into<String>,
+        key: impl Into<Vec<u8>>,
+        value: impl Into<Value>,
+    ) -> Result<()> {
+        let bucket = bucket.into();
+        validate_named_bucket(&bucket)?;
+        self.operations.push(BatchOperation::Put {
+            bucket,
+            key: key.into(),
+            value: value.into(),
+        });
+        Ok(())
+    }
+
+    /// Adds a point delete to the default bucket.
+    pub fn delete(&mut self, key: impl Into<Vec<u8>>) {
         self.operations.push(BatchOperation::Delete {
-            bucket: bucket.into(),
+            bucket: DEFAULT_BUCKET_NAME.to_owned(),
             key: key.into(),
         });
     }
 
-    /// Adds a range delete for `bucket`.
-    pub fn delete_range(&mut self, bucket: impl Into<String>, range: KeyRange) {
+    /// Adds a point delete for a named bucket.
+    pub fn delete_bucket(
+        &mut self,
+        bucket: impl Into<String>,
+        key: impl Into<Vec<u8>>,
+    ) -> Result<()> {
+        let bucket = bucket.into();
+        validate_named_bucket(&bucket)?;
+        self.operations.push(BatchOperation::Delete {
+            bucket,
+            key: key.into(),
+        });
+        Ok(())
+    }
+
+    /// Adds a range delete to the default bucket.
+    pub fn delete_range(&mut self, range: KeyRange) {
         self.operations.push(BatchOperation::DeleteRange {
-            bucket: bucket.into(),
+            bucket: DEFAULT_BUCKET_NAME.to_owned(),
             range,
         });
+    }
+
+    /// Adds a range delete for a named bucket.
+    pub fn delete_range_bucket(
+        &mut self,
+        bucket: impl Into<String>,
+        range: KeyRange,
+    ) -> Result<()> {
+        let bucket = bucket.into();
+        validate_named_bucket(&bucket)?;
+        self.operations
+            .push(BatchOperation::DeleteRange { bucket, range });
+        Ok(())
     }
 
     #[must_use]
@@ -93,4 +140,16 @@ impl WriteBatch {
     pub fn is_empty(&self) -> bool {
         self.operations.is_empty()
     }
+}
+
+fn validate_named_bucket(bucket: &str) -> Result<()> {
+    if bucket.is_empty() {
+        return Err(Error::invalid_options("bucket name cannot be empty"));
+    }
+    if bucket == DEFAULT_BUCKET_NAME {
+        return Err(Error::invalid_options(
+            "default bucket writes use default batch methods",
+        ));
+    }
+    Ok(())
 }

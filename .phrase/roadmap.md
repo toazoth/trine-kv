@@ -609,9 +609,73 @@ shape before release.
 
 - `Db::put/get/range/prefix` operate on the default bucket without an explicit
   bucket open.
-- `Db::open_bucket` and `Db::open_bucket_with_options` support optional named
+- `Db::bucket` and `Db::bucket_with_options` support optional named
   buckets.
 - `BucketOptions` replaces the public options type for bucket configuration.
 - The default bucket exists in memory and persistent modes after open.
 - Protocol, usage docs, examples, tests, and benches use bucket terminology.
 - Full local Rust verification passes.
+
+### Phase 32: Titan-Like Large-Value Storage Spec
+
+**Status**: Complete
+
+**Goal**: Define the durable storage contract for Titan-like large-value
+separation before implementation.
+
+**Entry Condition**: Phase 31 complete and user requests a Titan-like
+large-value subsystem with spec-first implementation order.
+
+**Acceptance Gate**:
+
+- Protocol records that small values stay inline and large values separate
+  during flush/compaction only.
+- `BlobIndex`, `BlobRecord`, `BlobFile`, manifest metadata, read path, GC,
+  recovery, stats, tests, and implementation order are specified.
+- V1 protocol links to the new large-value storage contract.
+- External Titan references are design references only, not code or format
+  dependencies.
+
+### Phase 33: Bucket API Contract Hardening
+
+**Status**: Complete
+
+**Goal**: Tighten the default/named bucket API contract before value separation
+changes introduce more storage metadata.
+
+**Entry Condition**: Phase 32 spec is complete and user asks to handle bucket
+API concerns before key-value separation.
+
+**Acceptance Gate**:
+
+- Direct `Db` helpers and default `WriteBatch`/`Transaction` methods operate on
+  the built-in default bucket.
+- `Db::bucket` is the common get-or-create entry for named buckets.
+- `Db::bucket_with_options` is the explicit entry for fixed non-default bucket
+  options.
+- Named bucket methods are explicitly suffixed with `_bucket`.
+- `"default"` is reserved and rejected by `bucket` and
+  `bucket_with_options`.
+- Default bucket options are configured through `DbOptions`.
+- Protocol, usage docs, examples, benches, and tests use the tightened API.
+- Focused bucket API tests and full Rust verification pass.
+
+### Phase 34: Titan-Like Blob Format Foundation
+
+**Status**: Planned
+
+**Goal**: Stabilize the new `BlobIndex` and `BlobFile` encode/decode format
+with focused tests before changing flush behavior.
+
+**Entry Condition**: Phase 33 complete and the large-value storage protocol is
+accepted as the implementation source of truth.
+
+**Acceptance Gate**:
+
+- `ValueRef::BlobIndex` carries encoded length, decoded length, value checksum,
+  record checksum, and compression id.
+- Blob file encode/decode validates header, ordered records, properties,
+  footer, and checksums.
+- Corruption tests cover missing/corrupt header, footer, record checksum, value
+  checksum, and unsupported compression id.
+- Existing small-value behavior remains unchanged.

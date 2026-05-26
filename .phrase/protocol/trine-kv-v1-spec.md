@@ -104,8 +104,9 @@ Db::put(key, value) -> Result<()>
 Db::get(key) -> Result<Option<Value>>
 Db::range(range) -> Result<Iter>
 Db::prefix(prefix) -> Result<Iter>
-Db::open_bucket(name) -> Result<Bucket>
-Db::open_bucket_with_options(name, options) -> Result<Bucket>
+Db::default_bucket() -> Result<Bucket>
+Db::bucket(name) -> Result<Bucket>
+Db::bucket_with_options(name, options) -> Result<Bucket>
 Db::persist(mode) -> Result<()>
 Db::flush() -> Result<()>
 Db::compact_range(range) -> Result<()>
@@ -113,16 +114,31 @@ Db::snapshot() -> Snapshot
 Db::transaction(options) -> Transaction
 Db::stats() -> DbStats
 
+DbOptions::with_default_bucket_options(options) -> DbOptions
+
 Bucket::get(key) -> Result<Option<Value>>
 Bucket::put(key, value) -> Result<()>
 Bucket::delete(key) -> Result<()>
 Bucket::range(range) -> Result<Iter>
 Bucket::prefix(prefix) -> Result<Iter>
 
-WriteBatch::put(bucket, key, value)
-WriteBatch::delete(bucket, key)
-WriteBatch::delete_range(bucket, range)
+WriteBatch::put(key, value)
+WriteBatch::delete(key)
+WriteBatch::delete_range(range)
+WriteBatch::put_bucket(bucket, key, value) -> Result<()>
+WriteBatch::delete_bucket(bucket, key) -> Result<()>
+WriteBatch::delete_range_bucket(bucket, range) -> Result<()>
 Db::write(batch, write_options) -> Result<CommitInfo>
+
+Transaction::get(key) -> Result<Option<Value>>
+Transaction::put(key, value)
+Transaction::delete(key)
+Transaction::read_range(range) -> Result<()>
+Transaction::get_bucket(bucket, key) -> Result<Option<Value>>
+Transaction::put_bucket(bucket, key, value) -> Result<()>
+Transaction::delete_bucket(bucket, key) -> Result<()>
+Transaction::delete_range_bucket(bucket, range) -> Result<()>
+Transaction::read_range_bucket(bucket, range) -> Result<()>
 ```
 
 API rules:
@@ -130,6 +146,14 @@ API rules:
 - `Db`, `Bucket`, and `Snapshot` handles are cloneable and thread-safe.
 - the default bucket always exists and is the target for direct `Db` reads and
   writes;
+- the default bucket is configured with `DbOptions::default_bucket_options`;
+- `"default"` is reserved; `Db::bucket("default")` and
+  `Db::bucket_with_options("default", ...)` return an invalid-options
+  error;
+- `Db::bucket(name)` returns an existing named bucket or creates one with
+  default `BucketOptions`;
+- `Db::bucket_with_options(name, options)` returns an existing named bucket
+  only when options match, or creates one with those fixed options;
 - named buckets are optional and used for logical isolation or different
   per-bucket options;
 - Iterators keep the read VersionSet alive.
@@ -562,23 +586,42 @@ compatibility names.
 
 ## 18. Large Values
 
-V1 reserves a `ValueRef` representation:
+V1 uses `.phrase/protocol/titan-like-blob-storage-spec.md` as the stable
+large-value storage contract. The older primitive blob-offload shape is
+superseded by a Titan-like design that separates only large values during flush
+and compaction.
+
+Stable value references:
 
 ```text
 Inline(bytes)
-Blob { file_id, offset, len, checksum }
+BlobIndex {
+  file_id,
+  offset,
+  encoded_len,
+  value_len,
+  value_checksum,
+  record_checksum,
+  compression,
+}
 ```
 
-The v1 complete target supports both inline values and separated blob values.
-Small values may stay inline. Large value threshold is configurable per
-bucket.
+Small values stay inline. Values at or above `blob_threshold_bytes` may be
+stored in blob files. WAL records and memtables still store complete user
+values; separation happens when immutable data is written to SSTables.
 
 Rules:
 
-- blob references are visible only through committed WAL and published tables;
-- blob files include checksums;
-- compaction can rewrite, retain, or drop blob references;
-- cleanup cannot remove a blob referenced by any live table or active snapshot.
+- blob references are visible only through committed WAL replay or published
+  SSTables;
+- blob records include key/version metadata so GC can check whether a blob is
+  still referenced by the current LSM state;
+- blob files include header, ordered records, properties, footer, and checksums;
+- ordinary compaction may keep existing `BlobIndex` records instead of
+  rewriting large values;
+- blob GC is snapshot-safe and recoverable;
+- cleanup cannot remove a blob file referenced by any live table, active
+  snapshot, read pin, or pending old tree version.
 
 ## 19. Manifest And VersionSet
 
@@ -817,12 +860,14 @@ V1 exposes structured stats:
 - block cache hits and misses;
 - filter hits and misses;
 - prefix filter hits, misses, false-positive probes, and skipped partitions;
+- blob read count and bytes;
 - compression ratio and compression/decompression time by codec id;
 - index seek count by search policy;
 - index search comparison/probe counts where practical;
 - compaction input/output bytes;
 - tombstone counts;
 - blob bytes live, stale, and obsolete;
+- blob GC runs, input bytes, output bytes, and discarded bytes;
 - recovery replay bytes and time.
 
 ## 29. Required Tests

@@ -25,9 +25,7 @@ fn temp_db_path(name: &str) -> PathBuf {
 fn flushed_default_table_path(path: &std::path::Path, options: &DbOptions) -> PathBuf {
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
         bucket.put(b"a", b"a1").expect("write a");
         db.flush().expect("flush table");
     }
@@ -156,15 +154,14 @@ fn corruption_message(error: Error) -> String {
 #[test]
 fn persistent_api_helpers_cover_open_options_and_bucket_writes() {
     let path = temp_db_path("api-helpers");
-    let options = DbOptions::persistent(&path).with_durability(DurabilityMode::Flush);
+    let mut options = DbOptions::persistent(&path).with_durability(DurabilityMode::Flush);
     let bucket_options =
         BucketOptions::default().with_prefix_extractor(PrefixExtractor::Separator(b':'));
+    options.default_bucket_options = bucket_options;
 
     {
         let db = Db::open(options).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", bucket_options.clone())
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
 
         let put_info = bucket
             .put_with_options(b"user:001", b"Ada", WriteOptions::sync_all())
@@ -189,9 +186,7 @@ fn persistent_api_helpers_cover_open_options_and_bucket_writes() {
 
     {
         let db = Db::open_read_only(&path).expect("read-only db opens");
-        let bucket = db
-            .open_bucket_with_options("default", bucket_options.clone())
-            .expect("read-only bucket opens");
+        let bucket = db.default_bucket().expect("read-only bucket opens");
         assert_eq!(
             bucket.get(b"user:001").expect("user reads"),
             Some(b"Ada".to_vec())
@@ -209,9 +204,7 @@ fn persistent_wal_replays_point_and_range_batches() {
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
 
         bucket.put(b"a", b"a1").expect("write a");
         bucket.put(b"b", b"b1").expect("write b");
@@ -225,9 +218,7 @@ fn persistent_wal_replays_point_and_range_batches() {
 
     {
         let db = Db::open(options).expect("persistent db reopens");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket reopens");
+        let bucket = db.default_bucket().expect("bucket reopens");
 
         assert_eq!(db.stats().live_buckets, 1);
         assert_eq!(bucket.get(b"a").expect("a replays"), Some(b"a1".to_vec()));
@@ -235,7 +226,7 @@ fn persistent_wal_replays_point_and_range_batches() {
         assert_eq!(bucket.get(b"c").expect("range delete replays"), None);
 
         let mut batch = WriteBatch::new();
-        batch.put("default", b"d", b"d1");
+        batch.put(b"d", b"d1");
         let info = db
             .write(
                 batch,
@@ -257,14 +248,16 @@ fn persistent_wal_replays_cross_bucket_batch() {
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        db.open_bucket_with_options("users", BucketOptions::default())
-            .expect("users bucket opens");
-        db.open_bucket_with_options("posts", BucketOptions::default())
-            .expect("posts bucket opens");
+        db.bucket("users").expect("users bucket opens");
+        db.bucket("posts").expect("posts bucket opens");
 
         let mut batch = WriteBatch::new();
-        batch.put("users", b"1", b"ada");
-        batch.put("posts", b"1", b"hello");
+        batch
+            .put_bucket("users", b"1", b"ada")
+            .expect("stage users write");
+        batch
+            .put_bucket("posts", b"1", b"hello")
+            .expect("stage posts write");
         db.write(
             batch,
             WriteOptions {
@@ -276,12 +269,8 @@ fn persistent_wal_replays_cross_bucket_batch() {
 
     {
         let db = Db::open(options).expect("persistent db reopens");
-        let users = db
-            .open_bucket_with_options("users", BucketOptions::default())
-            .expect("users bucket reopens");
-        let posts = db
-            .open_bucket_with_options("posts", BucketOptions::default())
-            .expect("posts bucket reopens");
+        let users = db.bucket("users").expect("users bucket reopens");
+        let posts = db.bucket("posts").expect("posts bucket reopens");
 
         assert_eq!(
             users.get(b"1").expect("users replay"),
@@ -314,7 +303,7 @@ fn persistent_manifest_keeps_bucket_options_across_reopen() {
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
         let bucket = db
-            .open_bucket_with_options("users", bucket_options.clone())
+            .bucket_with_options("users", bucket_options.clone())
             .expect("bucket opens");
 
         bucket.put(b"user:1", b"ada").expect("write user row");
@@ -331,7 +320,7 @@ fn persistent_manifest_keeps_bucket_options_across_reopen() {
         assert_eq!(db.stats().live_buckets, 2);
 
         let bucket = db
-            .open_bucket_with_options("users", bucket_options)
+            .bucket_with_options("users", bucket_options)
             .expect("bucket reopens with manifest options");
         assert_eq!(
             bucket.get(b"user:1").expect("user row replays"),
@@ -339,7 +328,7 @@ fn persistent_manifest_keeps_bucket_options_across_reopen() {
         );
 
         let error = db
-            .open_bucket_with_options("users", BucketOptions::default())
+            .bucket("users")
             .expect_err("wrong bucket options are rejected");
         assert!(matches!(error, Error::InvalidOptions { .. }));
     }
@@ -458,9 +447,7 @@ fn persistent_recovery_repairs_safe_temporary_files_and_writes_report() {
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
         bucket.put(b"a", b"a1").expect("write row");
         db.flush().expect("flush table");
     }
@@ -477,9 +464,7 @@ fn persistent_recovery_repairs_safe_temporary_files_and_writes_report() {
     options.fail_on_corruption = FailOnCorruptionPolicy::RepairSafeTemporaryFiles;
     {
         let db = Db::open(options).expect("repair recovery opens");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket reopens");
+        let bucket = db.default_bucket().expect("bucket reopens");
         assert_eq!(
             bucket.get(b"a").expect("row survives repair"),
             Some(b"a1".to_vec())
@@ -512,9 +497,7 @@ fn persistent_recovery_fails_closed_on_unreferenced_table_file() {
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
         bucket.put(b"a", b"a1").expect("write row");
         db.flush().expect("flush table");
 
@@ -552,12 +535,11 @@ fn persistent_recovery_fails_closed_on_unreferenced_blob_file_even_with_temp_rep
         blob_threshold_bytes: 8,
         ..BucketOptions::default()
     };
+    options.default_bucket_options = bucket_options;
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", bucket_options.clone())
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
         bucket
             .put(b"a", b"large-value-a-large-value-a".to_vec())
             .expect("write blob value");
@@ -589,8 +571,7 @@ fn persistent_recovery_fails_closed_on_malformed_formal_storage_file_name() {
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        db.open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket opens");
+        db.default_bucket().expect("bucket opens");
     }
 
     write_file(&malformed_table_path, b"not a valid table file");
@@ -613,7 +594,7 @@ fn persistent_wal_rejects_bucket_missing_from_manifest() {
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let bucket = db.open_bucket("users").expect("bucket opens");
+        let bucket = db.bucket("users").expect("bucket opens");
         bucket.put(b"a", b"a1").expect("write a");
         db.persist(DurabilityMode::Flush).expect("flush WAL");
     }
@@ -633,9 +614,7 @@ fn persistent_flush_writes_table_and_reopen_can_skip_wal() {
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
 
         bucket.put(b"a", b"a1").expect("write a");
         bucket.put(b"b", b"b1").expect("write b");
@@ -678,9 +657,7 @@ fn persistent_flush_writes_table_and_reopen_can_skip_wal() {
 
     {
         let db = Db::open(options).expect("persistent db reopens from table");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket reopens");
+        let bucket = db.default_bucket().expect("bucket reopens");
 
         assert_eq!(
             bucket.get(b"a").expect("a reads after reopen"),
@@ -693,7 +670,7 @@ fn persistent_flush_writes_table_and_reopen_can_skip_wal() {
         );
 
         let mut batch = WriteBatch::new();
-        batch.put("default", b"d", b"d1");
+        batch.put(b"d", b"d1");
         let info = db
             .write(
                 batch,
@@ -717,9 +694,7 @@ fn persistent_write_buffer_freezes_active_memtable_and_reads_immutable() {
 
     {
         let db = Db::open(options).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
 
         bucket.put(b"user:1", b"ada").expect("write user");
 
@@ -752,12 +727,8 @@ fn persistent_write_buffer_freezes_only_large_bucket() {
 
     {
         let db = Db::open(options).expect("persistent db opens");
-        let cold = db
-            .open_bucket_with_options("cold", BucketOptions::default())
-            .expect("cold bucket opens");
-        let hot = db
-            .open_bucket_with_options("hot", BucketOptions::default())
-            .expect("hot bucket opens");
+        let cold = db.bucket("cold").expect("cold bucket opens");
+        let hot = db.bucket("hot").expect("hot bucket opens");
 
         cold.put(b"c", b"v").expect("cold write stays active");
         assert_eq!(db.stats().immutable_memtables, 0);
@@ -789,12 +760,8 @@ fn persistent_immutable_pressure_flushes_only_pressure_buckets() {
 
     {
         let db = Db::open(options).expect("persistent db opens");
-        let cold = db
-            .open_bucket_with_options("cold", BucketOptions::default())
-            .expect("cold bucket opens");
-        let hot = db
-            .open_bucket_with_options("hot", BucketOptions::default())
-            .expect("hot bucket opens");
+        let cold = db.bucket("cold").expect("cold bucket opens");
+        let hot = db.bucket("hot").expect("hot bucket opens");
 
         cold.put(b"cold", b"c1").expect("cold write freezes once");
         hot.put(b"h1", b"v1").expect("hot write freezes once");
@@ -840,9 +807,7 @@ fn persistent_immutable_range_tombstone_hides_point_records() {
 
     {
         let db = Db::open(options).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
 
         bucket.put(b"k1", b"v1").expect("write k1");
         bucket
@@ -870,9 +835,7 @@ fn persistent_immutable_pressure_flushes_before_next_write_and_keeps_new_wal_bat
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
 
         let first = bucket
             .put_with_options(b"a", b"a1", WriteOptions::sync_all())
@@ -913,9 +876,7 @@ fn persistent_immutable_pressure_flushes_before_next_write_and_keeps_new_wal_bat
 
     {
         let db = Db::open(options).expect("persistent db reopens");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket reopens");
+        let bucket = db.default_bucket().expect("bucket reopens");
         assert_eq!(
             bucket.get(b"a").expect("flushed row survives reopen"),
             Some(b"a1".to_vec())
@@ -938,19 +899,17 @@ fn persistent_transaction_conflict_checks_immutable_memtables() {
 
     {
         let db = Db::open(options).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
         bucket.put(b"a", b"a1").expect("write first value");
 
         let mut txn = db.transaction(TransactionOptions::default());
         assert_eq!(
-            txn.get("default", b"a").expect("transaction reads a"),
+            txn.get(b"a").expect("transaction reads a"),
             Some(b"a1".to_vec())
         );
 
         bucket.put(b"a", b"a2").expect("write conflicting value");
-        txn.put("default", b"b", b"b1");
+        txn.put(b"b", b"b1");
         let error = txn
             .commit()
             .expect_err("immutable memtable update should conflict");
@@ -963,18 +922,17 @@ fn persistent_transaction_conflict_checks_immutable_memtables() {
 #[test]
 fn persistent_flush_publish_failure_removes_unpublished_table_and_blob_files() {
     let path = temp_db_path("flush-publish-cleanup");
-    let options = DbOptions::persistent(&path);
+    let mut options = DbOptions::persistent(&path);
     let bucket_options = BucketOptions {
         blob_threshold_bytes: 8,
         ..BucketOptions::default()
     };
+    options.default_bucket_options = bucket_options;
     let value = b"large-value-a-large-value-a".to_vec();
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", bucket_options.clone())
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
         bucket.put(b"a", value.clone()).expect("write blob value");
 
         let manifest_tmp_dir = manifest::manifest_path(&path).with_extension("tmp");
@@ -1010,9 +968,7 @@ fn persistent_compaction_levels_preserve_newer_l0_reads() {
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
 
         bucket.put(b"a", b"old-a").expect("write old a");
         db.flush().expect("flush first L0 table");
@@ -1049,9 +1005,7 @@ fn persistent_compaction_levels_preserve_newer_l0_reads() {
 
     {
         let db = Db::open(options).expect("persistent db reopens");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket reopens");
+        let bucket = db.default_bucket().expect("bucket reopens");
         assert_eq!(default_table_levels(&path), vec![1]);
         assert_eq!(
             bucket.get(b"a").expect("newer L0 a reopens"),
@@ -1074,9 +1028,7 @@ fn persistent_single_l0_compaction_moves_table_without_rewrite() {
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
 
         bucket.put(b"a", b"a1").expect("write a");
         db.flush().expect("flush L0 table");
@@ -1103,9 +1055,7 @@ fn persistent_single_l0_compaction_moves_table_without_rewrite() {
 
     {
         let db = Db::open(options).expect("persistent db reopens");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket reopens");
+        let bucket = db.default_bucket().expect("bucket reopens");
         assert_eq!(default_table_ids(&path), before_table_ids);
         assert_eq!(default_table_levels(&path), vec![1]);
         assert_eq!(
@@ -1125,9 +1075,7 @@ fn persistent_flush_auto_compacts_when_l0_pressure_exceeds_limit() {
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
 
         bucket.put(b"a", b"a1").expect("write a");
         db.flush().expect("first flush stays L0");
@@ -1156,9 +1104,7 @@ fn persistent_flush_auto_compacts_when_l0_pressure_exceeds_limit() {
 
     {
         let db = Db::open(options).expect("persistent db reopens");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket reopens");
+        let bucket = db.default_bucket().expect("bucket reopens");
         assert_eq!(default_table_levels(&path), vec![0, 1]);
         assert_eq!(
             bucket.get(b"a").expect("newer a reopens"),
@@ -1181,9 +1127,7 @@ fn persistent_background_workers_flush_and_compact_pressure() {
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
 
         bucket.put(b"a", b"a1").expect("write a");
         wait_until("background flush of first immutable memtable", || {
@@ -1209,9 +1153,7 @@ fn persistent_background_workers_flush_and_compact_pressure() {
 
     {
         let db = Db::open(options).expect("persistent db reopens");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket reopens");
+        let bucket = db.default_bucket().expect("bucket reopens");
         assert_eq!(default_table_levels(&path), vec![1]);
         assert_eq!(bucket.get(b"a").expect("a reopens"), Some(b"a1".to_vec()));
         assert_eq!(bucket.get(b"b").expect("b reopens"), Some(b"b1".to_vec()));
@@ -1230,9 +1172,7 @@ fn persistent_background_maintenance_error_surfaces_to_later_write() {
 
     {
         let db = Db::open(options).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
 
         let manifest_tmp_dir = manifest::manifest_path(&path).with_extension("tmp");
         fs::create_dir(&manifest_tmp_dir).expect("block manifest tmp path");
@@ -1276,12 +1216,11 @@ fn persistent_compaction_splits_outputs_and_moves_overfull_l1_down() {
         block_bytes: 256,
         ..BucketOptions::default()
     };
+    options.default_bucket_options = bucket_options;
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", bucket_options.clone())
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
 
         for index in 0..30 {
             let key = format!("key-{index:03}").into_bytes();
@@ -1321,9 +1260,7 @@ fn persistent_compaction_splits_outputs_and_moves_overfull_l1_down() {
 
     {
         let db = Db::open(options).expect("persistent db reopens");
-        let bucket = db
-            .open_bucket_with_options("default", bucket_options)
-            .expect("bucket reopens");
+        let bucket = db.default_bucket().expect("bucket reopens");
         let levels = default_table_levels(&path);
         assert!(levels.contains(&1));
         assert!(levels.contains(&2));
@@ -1345,12 +1282,11 @@ fn persistent_stats_report_tables_blobs_and_compactions() {
         blob_threshold_bytes: 4,
         ..BucketOptions::default()
     };
+    options.default_bucket_options = bucket_options;
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", bucket_options)
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
         assert_eq!(db.stats().live_buckets, 1);
 
         let large_a = b"large-a".to_vec();
@@ -1406,9 +1342,7 @@ fn persistent_block_cache_records_hits_and_misses() {
 
     {
         let db = Db::open(options).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
         for index in 0..64 {
             bucket
                 .put(
@@ -1454,9 +1388,7 @@ fn persistent_range_iterator_defers_table_block_reads_until_next() {
 
     {
         let db = Db::open(options).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
         for index in 0..64 {
             bucket
                 .put(
@@ -1501,9 +1433,7 @@ fn persistent_range_iterator_keeps_active_memtable_after_flush() {
 
     {
         let db = Db::open(options).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
         bucket.put(b"key-010", b"before-a").expect("write row");
         bucket.put(b"key-020", b"before-b").expect("write row");
 
@@ -1532,9 +1462,7 @@ fn persistent_transaction_read_range_consumes_scan_before_tracking() {
 
     {
         let db = Db::open(options).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
         for index in 0..64 {
             bucket
                 .put(
@@ -1547,7 +1475,7 @@ fn persistent_transaction_read_range_consumes_scan_before_tracking() {
         assert_eq!(db.stats().block_cache_misses, 0);
 
         let mut txn = db.transaction(TransactionOptions::default());
-        txn.read_range("default", KeyRange::all())
+        txn.read_range(KeyRange::all())
             .expect("transaction range read succeeds");
 
         assert!(
@@ -1566,9 +1494,7 @@ fn persistent_flush_preserves_snapshot_versions() {
 
     {
         let db = Db::open(options).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
 
         bucket.put(b"a", b"v1").expect("write v1");
         let snapshot = db.snapshot();
@@ -1596,9 +1522,7 @@ fn persistent_table_block_index_reads_points_and_ranges() {
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
 
         for index in 0..160 {
             bucket
@@ -1648,9 +1572,7 @@ fn persistent_table_block_index_reads_points_and_ranges() {
 
     {
         let db = Db::open(options).expect("persistent db reopens from indexed table");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket reopens");
+        let bucket = db.default_bucket().expect("bucket reopens");
 
         assert_eq!(
             bucket.get(b"key-127").expect("point reads after reopen"),
@@ -1711,7 +1633,7 @@ fn persistent_index_search_policies_preserve_table_reads() {
                 ..BucketOptions::default()
             };
             let bucket = db
-                .open_bucket_with_options(name, bucket_options)
+                .bucket_with_options(name, bucket_options)
                 .expect("policy bucket opens");
             for index in 0..80 {
                 bucket
@@ -1731,7 +1653,7 @@ fn persistent_index_search_policies_preserve_table_reads() {
                 ..BucketOptions::default()
             };
             let bucket = db
-                .open_bucket_with_options(name, bucket_options)
+                .bucket_with_options(name, bucket_options)
                 .expect("policy bucket reuses options");
             assert_eq!(
                 bucket.get(b"key-042").expect("policy point reads"),
@@ -1776,7 +1698,7 @@ fn persistent_index_search_policies_preserve_table_reads() {
                 ..BucketOptions::default()
             };
             let bucket = db
-                .open_bucket_with_options(name, bucket_options)
+                .bucket_with_options(name, bucket_options)
                 .expect("policy bucket reopens");
             assert_eq!(
                 bucket.get(b"key-042").expect("policy point reopens"),
@@ -1801,10 +1723,10 @@ fn persistent_table_compression_profiles_round_trip() {
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
         let fast = db
-            .open_bucket_with_options("fast", fast_options.clone())
+            .bucket_with_options("fast", fast_options.clone())
             .expect("fast bucket opens");
         let plain = db
-            .open_bucket_with_options("plain", plain_options.clone())
+            .bucket_with_options("plain", plain_options.clone())
             .expect("plain bucket opens");
 
         for index in 0..64 {
@@ -1844,10 +1766,10 @@ fn persistent_table_compression_profiles_round_trip() {
     {
         let db = Db::open(options).expect("persistent db reopens from compressed tables");
         let fast = db
-            .open_bucket_with_options("fast", fast_options)
+            .bucket_with_options("fast", fast_options)
             .expect("fast bucket reopens");
         let plain = db
-            .open_bucket_with_options("plain", plain_options)
+            .bucket_with_options("plain", plain_options)
             .expect("plain bucket reopens");
 
         assert_eq!(
@@ -1866,7 +1788,7 @@ fn persistent_table_compression_profiles_round_trip() {
 #[test]
 fn persistent_prefix_filter_keeps_range_tombstones_authoritative() {
     let path = temp_db_path("prefix-filter-tombstones");
-    let options = DbOptions::persistent(&path);
+    let mut options = DbOptions::persistent(&path);
     let bucket_options = BucketOptions {
         prefix_extractor: PrefixExtractor::Separator(b':'),
         prefix_filter_policy: PrefixFilterPolicy::Bloom {
@@ -1874,12 +1796,11 @@ fn persistent_prefix_filter_keeps_range_tombstones_authoritative() {
         },
         ..BucketOptions::default()
     };
+    options.default_bucket_options = bucket_options;
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", bucket_options.clone())
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
 
         bucket.put(b"user:1", b"old").expect("write old user");
         bucket.put(b"user:2", b"live").expect("write live user");
@@ -1905,9 +1826,7 @@ fn persistent_prefix_filter_keeps_range_tombstones_authoritative() {
 
     {
         let db = Db::open(options).expect("persistent db reopens");
-        let bucket = db
-            .open_bucket_with_options("default", bucket_options)
-            .expect("bucket reopens");
+        let bucket = db.default_bucket().expect("bucket reopens");
 
         assert_eq!(
             collect_rows(bucket.prefix(b"user:").expect("prefix reads after reopen")),
@@ -1929,9 +1848,7 @@ fn persistent_point_filter_keeps_range_tombstones_authoritative() {
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
 
         bucket.put(b"user:1", b"old").expect("write old user");
         db.flush().expect("flush user table");
@@ -1953,9 +1870,7 @@ fn persistent_point_filter_keeps_range_tombstones_authoritative() {
 
     {
         let db = Db::open(options).expect("persistent db reopens");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket reopens");
+        let bucket = db.default_bucket().expect("bucket reopens");
 
         assert_eq!(bucket.get(b"user:1").expect("user remains hidden"), None);
         assert_eq!(
@@ -1970,19 +1885,18 @@ fn persistent_point_filter_keeps_range_tombstones_authoritative() {
 #[test]
 fn persistent_blob_values_survive_flush_reopen_and_compaction() {
     let path = temp_db_path("blob-values");
-    let options = DbOptions::persistent(&path);
+    let mut options = DbOptions::persistent(&path);
     let bucket_options = BucketOptions {
         blob_threshold_bytes: 8,
         ..BucketOptions::default()
     };
+    options.default_bucket_options = bucket_options;
     let large_a = b"large-value-a-large-value-a".to_vec();
     let large_c = b"large-value-c-large-value-c".to_vec();
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", bucket_options.clone())
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
 
         bucket.put(b"a", large_a.clone()).expect("write blob a");
         bucket.put(b"b", b"small").expect("write inline b");
@@ -2015,9 +1929,7 @@ fn persistent_blob_values_survive_flush_reopen_and_compaction() {
 
     {
         let db = Db::open(options).expect("persistent db reopens with blob refs");
-        let bucket = db
-            .open_bucket_with_options("default", bucket_options)
-            .expect("bucket reopens");
+        let bucket = db.default_bucket().expect("bucket reopens");
 
         assert_eq!(bucket.get(b"a").expect("blob a reopens"), Some(large_a));
         assert_eq!(
@@ -2033,17 +1945,16 @@ fn persistent_blob_values_survive_flush_reopen_and_compaction() {
 #[test]
 fn persistent_reopen_fails_when_referenced_blob_file_is_missing() {
     let path = temp_db_path("missing-blob");
-    let options = DbOptions::persistent(&path);
+    let mut options = DbOptions::persistent(&path);
     let bucket_options = BucketOptions {
         blob_threshold_bytes: 8,
         ..BucketOptions::default()
     };
+    options.default_bucket_options = bucket_options;
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", bucket_options.clone())
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
         bucket
             .put(b"a", b"large-value-a-large-value-a".to_vec())
             .expect("write blob a");
@@ -2069,19 +1980,18 @@ fn persistent_reopen_fails_when_referenced_blob_file_is_missing() {
 #[test]
 fn persistent_compaction_removes_blob_files_for_dropped_versions() {
     let path = temp_db_path("compact-dropped-blob-versions");
-    let options = DbOptions::persistent(&path);
+    let mut options = DbOptions::persistent(&path);
     let bucket_options = BucketOptions {
         blob_threshold_bytes: 8,
         ..BucketOptions::default()
     };
+    options.default_bucket_options = bucket_options;
     let old_value = b"large-value-a-old-large-value-a-old".to_vec();
     let new_value = b"large-value-a-new-large-value-a-new".to_vec();
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", bucket_options.clone())
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
 
         bucket.put(b"a", old_value).expect("write old blob value");
         db.flush().expect("flush old blob table");
@@ -2109,9 +2019,7 @@ fn persistent_compaction_removes_blob_files_for_dropped_versions() {
 
     {
         let db = Db::open(options).expect("persistent db reopens after blob cleanup");
-        let bucket = db
-            .open_bucket_with_options("default", bucket_options)
-            .expect("bucket reopens");
+        let bucket = db.default_bucket().expect("bucket reopens");
         assert_eq!(bucket.get(b"a").expect("blob reopens"), Some(new_value));
         assert_eq!(blob_file_paths(&path).len(), 1);
     }
@@ -2122,19 +2030,18 @@ fn persistent_compaction_removes_blob_files_for_dropped_versions() {
 #[test]
 fn persistent_compaction_publish_failure_removes_unpublished_table_and_blob_files() {
     let path = temp_db_path("compact-publish-cleanup");
-    let options = DbOptions::persistent(&path);
+    let mut options = DbOptions::persistent(&path);
     let bucket_options = BucketOptions {
         blob_threshold_bytes: 8,
         ..BucketOptions::default()
     };
+    options.default_bucket_options = bucket_options;
     let old_value = b"large-value-a-old-large-value-a-old".to_vec();
     let new_value = b"large-value-a-new-large-value-a-new".to_vec();
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", bucket_options)
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
 
         bucket.put(b"a", old_value).expect("write old blob value");
         db.flush().expect("flush old blob table");
@@ -2184,17 +2091,16 @@ fn persistent_compaction_publish_failure_removes_unpublished_table_and_blob_file
 #[test]
 fn persistent_compaction_removes_blob_files_after_delete_cleanup() {
     let path = temp_db_path("compact-deleted-blob");
-    let options = DbOptions::persistent(&path);
+    let mut options = DbOptions::persistent(&path);
     let bucket_options = BucketOptions {
         blob_threshold_bytes: 8,
         ..BucketOptions::default()
     };
+    options.default_bucket_options = bucket_options;
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", bucket_options.clone())
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
 
         bucket
             .put(b"a", b"large-value-a-large-value-a".to_vec())
@@ -2222,9 +2128,7 @@ fn persistent_compaction_removes_blob_files_after_delete_cleanup() {
 
     {
         let db = Db::open(options).expect("persistent db reopens after deleted blob cleanup");
-        let bucket = db
-            .open_bucket_with_options("default", bucket_options)
-            .expect("bucket reopens");
+        let bucket = db.default_bucket().expect("bucket reopens");
         assert_eq!(bucket.get(b"a").expect("deleted key reopens"), None);
         assert!(blob_file_paths(&path).is_empty());
     }
@@ -2239,9 +2143,7 @@ fn persistent_compaction_keeps_lazy_iterator_table_files_until_pin_released() {
 
     {
         let db = Db::open(options).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
         for index in 0..64 {
             bucket
                 .put(
@@ -2314,9 +2216,7 @@ fn persistent_compaction_rewrites_tables_and_preserves_reads() {
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
 
         bucket.put(b"a", b"v1").expect("write a v1");
         db.flush().expect("flush first table");
@@ -2389,9 +2289,7 @@ fn persistent_compaction_rewrites_tables_and_preserves_reads() {
 
     {
         let db = Db::open(options).expect("persistent db reopens after compaction");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket reopens");
+        let bucket = db.default_bucket().expect("bucket reopens");
 
         assert_eq!(
             bucket.get(b"a").expect("a reads after reopen"),
@@ -2411,9 +2309,7 @@ fn persistent_compaction_removes_obsolete_point_delete_without_replacement() {
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
 
         bucket.put(b"a", b"v1").expect("write a");
         db.flush().expect("flush value table");
@@ -2444,9 +2340,7 @@ fn persistent_compaction_removes_obsolete_point_delete_without_replacement() {
 
     {
         let db = Db::open(options).expect("persistent db reopens after empty compaction");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket reopens");
+        let bucket = db.default_bucket().expect("bucket reopens");
         assert_eq!(bucket.get(b"a").expect("deleted key reopens"), None);
     }
 
@@ -2460,12 +2354,8 @@ fn persistent_compaction_keeps_buckets_separate() {
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let users = db
-            .open_bucket_with_options("users", BucketOptions::default())
-            .expect("users bucket opens");
-        let posts = db
-            .open_bucket_with_options("posts", BucketOptions::default())
-            .expect("posts bucket opens");
+        let users = db.bucket("users").expect("users bucket opens");
+        let posts = db.bucket("posts").expect("posts bucket opens");
 
         users.put(b"1", b"ada").expect("write first user");
         posts.put(b"1", b"hello").expect("write first post");
@@ -2514,12 +2404,8 @@ fn persistent_compaction_keeps_buckets_separate() {
 
     {
         let db = Db::open(options).expect("persistent db reopens after compaction");
-        let users = db
-            .open_bucket_with_options("users", BucketOptions::default())
-            .expect("users bucket reopens");
-        let posts = db
-            .open_bucket_with_options("posts", BucketOptions::default())
-            .expect("posts bucket reopens");
+        let users = db.bucket("users").expect("users bucket reopens");
+        let posts = db.bucket("posts").expect("posts bucket reopens");
 
         assert_eq!(
             users.get(b"1").expect("user survives reopen"),
@@ -2578,9 +2464,7 @@ fn persistent_reopen_defers_data_block_checksum_until_read() {
     corrupt_first_data_block_payload(&table_path);
 
     let db = Db::open(options).expect("metadata-only table open succeeds");
-    let bucket = db
-        .open_bucket_with_options("default", BucketOptions::default())
-        .expect("bucket reopens");
+    let bucket = db.default_bucket().expect("bucket reopens");
     let error = bucket
         .get(b"a")
         .expect_err("corrupt data block fails when read");
@@ -2597,9 +2481,7 @@ fn persistent_filter_miss_does_not_read_corrupt_data_block() {
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
         bucket.put(b"a", b"a1").expect("write a");
         bucket.put(b"c", b"c1").expect("write c");
         db.flush().expect("flush table");
@@ -2618,9 +2500,7 @@ fn persistent_filter_miss_does_not_read_corrupt_data_block() {
     corrupt_first_data_block_payload(&table_path);
 
     let db = Db::open(options).expect("metadata-only table open succeeds");
-    let bucket = db
-        .open_bucket_with_options("default", BucketOptions::default())
-        .expect("bucket reopens");
+    let bucket = db.default_bucket().expect("bucket reopens");
     assert_eq!(
         bucket
             .get(b"b")
@@ -2644,17 +2524,16 @@ fn persistent_filter_miss_does_not_read_corrupt_data_block() {
 #[test]
 fn persistent_prefix_filter_stats_skip_nonmatching_tables() {
     let path = temp_db_path("prefix-filter-stats-skip");
-    let options = DbOptions::persistent(&path);
+    let mut options = DbOptions::persistent(&path);
     let bucket_options = BucketOptions {
         prefix_extractor: PrefixExtractor::Separator(b':'),
         ..BucketOptions::default()
     };
+    options.default_bucket_options = bucket_options;
 
     {
         let db = Db::open(options).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", bucket_options)
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
         bucket.put(b"user:1", b"ada").expect("write user");
         bucket.put(b"post:1", b"hello").expect("write post");
         db.flush().expect("flush table");
@@ -2735,9 +2614,7 @@ fn persistent_wal_ignores_torn_final_record() {
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
         bucket.put(b"a", b"a1").expect("write a");
         db.persist(DurabilityMode::Flush).expect("flush WAL");
     }
@@ -2751,9 +2628,7 @@ fn persistent_wal_ignores_torn_final_record() {
 
     {
         let db = Db::open(options).expect("torn final record is ignored");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket reopens");
+        let bucket = db.default_bucket().expect("bucket reopens");
         assert_eq!(bucket.get(b"a").expect("a replays"), Some(b"a1".to_vec()));
     }
 
@@ -2767,9 +2642,7 @@ fn persistent_wal_checksum_corruption_fails_closed() {
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let bucket = db
-            .open_bucket_with_options("default", BucketOptions::default())
-            .expect("bucket opens");
+        let bucket = db.default_bucket().expect("bucket opens");
         bucket.put(b"a", b"a1").expect("write a");
         db.persist(DurabilityMode::Flush).expect("flush WAL");
     }

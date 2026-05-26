@@ -1,4 +1,5 @@
 use crate::{
+    bucket::DEFAULT_BUCKET_NAME,
     db::Db,
     error::Result,
     options::WriteOptions,
@@ -12,6 +13,9 @@ pub struct TransactionOptions {
 }
 
 /// Optimistic transaction over one read snapshot and a staged write batch.
+///
+/// Methods without a bucket suffix read or write the built-in default bucket.
+/// Methods ending in `_bucket` operate on optional named buckets.
 #[derive(Debug, Clone)]
 pub struct Transaction {
     db: Db,
@@ -63,8 +67,13 @@ impl Transaction {
         self.options
     }
 
-    /// Reads a key from `bucket` and tracks it for commit conflict checks.
-    pub fn get(&mut self, bucket: impl Into<String>, key: &[u8]) -> Result<Option<Value>> {
+    /// Reads a default-bucket key and tracks it for commit conflict checks.
+    pub fn get(&mut self, key: &[u8]) -> Result<Option<Value>> {
+        self.get_bucket(DEFAULT_BUCKET_NAME, key)
+    }
+
+    /// Reads a named-bucket key and tracks it for commit conflict checks.
+    pub fn get_bucket(&mut self, bucket: impl Into<String>, key: &[u8]) -> Result<Option<Value>> {
         let bucket = bucket.into();
         let value = self.db.get_at_sequence(&bucket, key, self.read_sequence)?;
         // Record the exact user key read at the transaction's read sequence.
@@ -78,8 +87,13 @@ impl Transaction {
         Ok(value)
     }
 
-    /// Reads a range from `bucket` and tracks it for commit conflict checks.
-    pub fn read_range(&mut self, bucket: impl Into<String>, range: KeyRange) -> Result<()> {
+    /// Reads a default-bucket range and tracks it for commit conflict checks.
+    pub fn read_range(&mut self, range: KeyRange) -> Result<()> {
+        self.read_range_bucket(DEFAULT_BUCKET_NAME, range)
+    }
+
+    /// Reads a named-bucket range and tracks it for commit conflict checks.
+    pub fn read_range_bucket(&mut self, bucket: impl Into<String>, range: KeyRange) -> Result<()> {
         self.db.ensure_open()?;
         let bucket = bucket.into();
         let iter = self.db.range_at_sequence(
@@ -101,24 +115,47 @@ impl Transaction {
         Ok(())
     }
 
-    /// Stages one key/value write for `bucket`.
-    pub fn put(
+    /// Stages one key/value write for the default bucket.
+    pub fn put(&mut self, key: impl Into<Vec<u8>>, value: impl Into<Value>) {
+        self.writes.put(key, value);
+    }
+
+    /// Stages one key/value write for a named bucket.
+    pub fn put_bucket(
         &mut self,
         bucket: impl Into<String>,
         key: impl Into<Vec<u8>>,
         value: impl Into<Value>,
-    ) {
-        self.writes.put(bucket, key, value);
+    ) -> Result<()> {
+        self.writes.put_bucket(bucket, key, value)
     }
 
-    /// Stages a point delete for `bucket`.
-    pub fn delete(&mut self, bucket: impl Into<String>, key: impl Into<Vec<u8>>) {
-        self.writes.delete(bucket, key);
+    /// Stages a point delete for the default bucket.
+    pub fn delete(&mut self, key: impl Into<Vec<u8>>) {
+        self.writes.delete(key);
     }
 
-    /// Stages a range delete for `bucket`.
-    pub fn delete_range(&mut self, bucket: impl Into<String>, range: KeyRange) {
-        self.writes.delete_range(bucket, range);
+    /// Stages a point delete for a named bucket.
+    pub fn delete_bucket(
+        &mut self,
+        bucket: impl Into<String>,
+        key: impl Into<Vec<u8>>,
+    ) -> Result<()> {
+        self.writes.delete_bucket(bucket, key)
+    }
+
+    /// Stages a range delete for the default bucket.
+    pub fn delete_range(&mut self, range: KeyRange) {
+        self.writes.delete_range(range);
+    }
+
+    /// Stages a range delete for a named bucket.
+    pub fn delete_range_bucket(
+        &mut self,
+        bucket: impl Into<String>,
+        range: KeyRange,
+    ) -> Result<()> {
+        self.writes.delete_range_bucket(bucket, range)
     }
 
     pub fn commit(self) -> Result<CommitInfo> {

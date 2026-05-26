@@ -46,7 +46,7 @@ struct UserStore {
 impl UserStore {
     fn open(path: &Path) -> Result<Self> {
         let db = Db::open(DbOptions::persistent(path).with_durability(DurabilityMode::Flush))?;
-        let users = db.open_bucket_with_options(
+        let users = db.bucket_with_options(
             "users",
             BucketOptions::default().with_prefix_extractor(PrefixExtractor::Separator(b':')),
         )?;
@@ -79,7 +79,7 @@ impl UserStore {
     ) -> Result<bool> {
         let key = user_key(id);
         let mut transaction = self.db.transaction(TransactionOptions::default());
-        let Some(bytes) = transaction.get("users", &key)? else {
+        let Some(bytes) = transaction.get_bucket("users", &key)? else {
             return Ok(false);
         };
         let mut user = User::decode(&bytes)?;
@@ -88,7 +88,7 @@ impl UserStore {
         }
 
         new_name.clone_into(&mut user.display_name);
-        transaction.put("users", key, user.encode()?);
+        transaction.put_bucket("users", key, user.encode()?)?;
         transaction.commit()?;
         Ok(true)
     }
