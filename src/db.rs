@@ -5,9 +5,10 @@ use std::{
     ops::Bound,
     path::Path,
     sync::{
-        Arc, Mutex, RwLock,
+        Arc, Condvar, Mutex, RwLock, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    thread,
 };
 
 use crate::{
@@ -63,6 +64,7 @@ pub(crate) struct DbInner {
     compaction_output_tables: AtomicU64,
     compaction_input_bytes: AtomicU64,
     compaction_output_bytes: AtomicU64,
+    maintenance: Arc<MaintenanceCoordinator>,
 }
 
 #[derive(Debug)]
@@ -161,6 +163,84 @@ struct CompactionTablePayload {
     range_tombstones: Vec<TableRangeTombstone>,
 }
 
+#[derive(Debug)]
+struct MaintenanceCoordinator {
+    state: Mutex<MaintenanceState>,
+    wake: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct MaintenanceState {
+    requested: bool,
+    shutdown: bool,
+    last_error: Option<String>,
+}
+
+impl MaintenanceCoordinator {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(MaintenanceState::default()),
+            wake: Condvar::new(),
+        }
+    }
+
+    fn request(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.requested = true;
+            self.wake.notify_one();
+        }
+    }
+
+    fn wait_for_request(&self) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        while !state.requested && !state.shutdown {
+            let Ok(next_state) = self.wake.wait(state) else {
+                return false;
+            };
+            state = next_state;
+        }
+        if state.shutdown {
+            return false;
+        }
+        state.requested = false;
+        true
+    }
+
+    fn record_error(&self, error: &Error) {
+        if let Ok(mut state) = self.state.lock() {
+            state.last_error = Some(error.to_string());
+        }
+    }
+
+    fn take_error(&self) -> Option<String> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|mut state| state.last_error.take())
+    }
+
+    fn shutdown(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.shutdown = true;
+            self.wake.notify_all();
+        }
+    }
+}
+
+fn record_maintenance_success(_maintenance: &MaintenanceCoordinator) {
+    // A later successful maintenance pass must not hide a failure that no
+    // caller has observed yet. `take_error` is the only path that clears it.
+}
+
+impl Drop for DbInner {
+    fn drop(&mut self) {
+        self.closed.store(true, Ordering::Release);
+        self.maintenance.shutdown();
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PointRecordCandidate {
     internal_key: InternalKey,
@@ -209,6 +289,7 @@ impl Db {
                 compaction_output_tables: AtomicU64::new(0),
                 compaction_input_bytes: AtomicU64::new(0),
                 compaction_output_bytes: AtomicU64::new(0),
+                maintenance: Arc::new(MaintenanceCoordinator::new()),
             }),
         })
     }
@@ -280,9 +361,11 @@ impl Db {
                 compaction_output_tables: AtomicU64::new(0),
                 compaction_input_bytes: AtomicU64::new(0),
                 compaction_output_bytes: AtomicU64::new(0),
+                maintenance: Arc::new(MaintenanceCoordinator::new()),
             }),
         };
         db.replay_wal_batches(batches, replay_floor)?;
+        db.start_background_workers()?;
 
         Ok(db)
     }
@@ -364,6 +447,7 @@ impl Db {
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);
         }
+        self.take_background_maintenance_error()?;
 
         let StorageMode::Persistent { path } = &self.inner.options.storage_mode else {
             return Ok(());
@@ -395,6 +479,12 @@ impl Db {
     // `Db::compact_range(range) -> Result<()>`.
     #[allow(clippy::needless_pass_by_value)]
     pub fn compact_range(&self, range: KeyRange) -> Result<()> {
+        self.take_background_maintenance_error()?;
+        self.compact_range_internal(range)
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn compact_range_internal(&self, range: KeyRange) -> Result<()> {
         self.ensure_open()?;
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);
@@ -621,6 +711,7 @@ impl Db {
 
     pub fn close(&self) {
         self.inner.closed.store(true, Ordering::Release);
+        self.inner.maintenance.shutdown();
         // The directory lock is released only after the writer coordinator is
         // idle. Otherwise a second process could open while this one is still
         // publishing files for a commit, flush, or compaction.
@@ -638,6 +729,80 @@ impl Db {
         } else {
             Ok(())
         }
+    }
+
+    fn start_background_workers(&self) -> Result<()> {
+        if !self.background_workers_enabled() {
+            return Ok(());
+        }
+
+        for worker_index in 0..self.inner.options.background_worker_count {
+            let inner = Arc::downgrade(&self.inner);
+            let maintenance = Arc::clone(&self.inner.maintenance);
+            thread::Builder::new()
+                .name(format!("trine-kv-maintenance-{worker_index}"))
+                .spawn(move || background_worker_loop(&inner, &maintenance))
+                .map_err(Error::Io)?;
+        }
+        self.request_background_maintenance();
+
+        Ok(())
+    }
+
+    fn background_workers_enabled(&self) -> bool {
+        !self.inner.options.read_only
+            && self.inner.options.background_worker_count != 0
+            && matches!(
+                self.inner.options.storage_mode,
+                StorageMode::Persistent { .. }
+            )
+    }
+
+    fn request_background_maintenance(&self) {
+        if self.background_workers_enabled() {
+            self.inner.maintenance.request();
+        }
+    }
+
+    fn take_background_maintenance_error(&self) -> Result<()> {
+        if let Some(error) = self.inner.maintenance.take_error() {
+            Err(Error::Corruption {
+                message: format!("background maintenance failed: {error}"),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn run_background_maintenance(&self) -> Result<()> {
+        self.ensure_open()?;
+        if self.inner.options.read_only {
+            return Ok(());
+        }
+
+        let StorageMode::Persistent { path } = &self.inner.options.storage_mode else {
+            return Ok(());
+        };
+        let db_path = path.clone();
+        let should_compact = {
+            let _writer = self
+                .inner
+                .writer
+                .lock()
+                .map_err(|_| lock_poisoned("writer coordinator"))?;
+            let flushed_needs_compaction = if self.has_immutable_memtables()? {
+                self.flush_memtables_locked(&db_path, None)?
+            } else {
+                false
+            };
+            flushed_needs_compaction || self.l0_pressure_exceeded()?
+        };
+
+        if should_compact {
+            self.compact_range_internal(KeyRange::all())?;
+        }
+
+        Ok(())
     }
 
     pub(crate) fn get_at(
@@ -796,23 +961,30 @@ impl Db {
     }
 
     fn flush_immutable_memtables_for_write_locked(&self, db_path: &Path) -> Result<()> {
-        if self.immutable_memtable_pressure_reached()? {
-            let _should_compact = self.flush_memtables_locked(db_path, None)?;
+        if self.immutable_memtable_pressure_reached()?
+            && self.flush_memtables_locked(db_path, None)?
+        {
+            self.request_background_maintenance();
         }
 
         Ok(())
     }
 
-    fn freeze_large_active_memtables_after_commit_locked(&self, sequence: Sequence) -> Result<()> {
+    fn freeze_large_active_memtables_after_commit_locked(
+        &self,
+        sequence: Sequence,
+    ) -> Result<bool> {
         let StorageMode::Persistent { .. } = self.inner.options.storage_mode else {
-            return Ok(());
+            return Ok(false);
         };
 
         if self.active_write_buffer_reached()? {
-            self.freeze_all_active_memtables(sequence)?;
+            return self
+                .freeze_all_active_memtables(sequence)
+                .map(|frozen_count| frozen_count != 0);
         }
 
-        Ok(())
+        Ok(false)
     }
 
     fn active_write_buffer_reached(&self) -> Result<bool> {
@@ -846,6 +1018,26 @@ impl Db {
                 .read()
                 .map_err(|_| lock_poisoned("immutable memtable queue"))?;
             if immutable_memtables.len() >= max_immutable_memtables {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    fn has_immutable_memtables(&self) -> Result<bool> {
+        let keyspaces = self
+            .inner
+            .keyspaces
+            .read()
+            .map_err(|_| lock_poisoned("keyspace registry"))?;
+
+        for state in keyspaces.values() {
+            let immutable_memtables = state
+                .immutable_memtables
+                .read()
+                .map_err(|_| lock_poisoned("immutable memtable queue"))?;
+            if !immutable_memtables.is_empty() {
                 return Ok(true);
             }
         }
@@ -1284,6 +1476,24 @@ fn validate_options(options: &DbOptions) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn background_worker_loop(inner: &Weak<DbInner>, maintenance: &MaintenanceCoordinator) {
+    while maintenance.wait_for_request() {
+        let Some(inner) = inner.upgrade() else {
+            break;
+        };
+        if inner.closed.load(Ordering::Acquire) {
+            break;
+        }
+
+        let db = Db { inner };
+        match db.run_background_maintenance() {
+            Ok(()) => record_maintenance_success(maintenance),
+            Err(Error::Closed) => break,
+            Err(error) => maintenance.record_error(&error),
+        }
+    }
 }
 
 fn keyspaces_from_manifest(
@@ -2566,10 +2776,27 @@ fn remove_storage_files(db_path: &Path, table_ids: &[table::TableId]) -> Result<
 #[cfg(test)]
 mod tests {
     use super::{
-        InternalKey, TableRangeTombstone, ValueKind, ValueRef, cleanup_point_tombstones,
-        cleanup_range_tombstones, compact_point_records,
+        Error, InternalKey, MaintenanceCoordinator, TableRangeTombstone, ValueKind, ValueRef,
+        cleanup_point_tombstones, cleanup_range_tombstones, compact_point_records,
+        record_maintenance_success,
     };
     use crate::types::{KeyRange, Sequence};
+
+    #[test]
+    fn maintenance_success_does_not_clear_unreported_error() {
+        let coordinator = MaintenanceCoordinator::new();
+        coordinator.record_error(&Error::Corruption {
+            message: "publish failed".to_string(),
+        });
+
+        record_maintenance_success(&coordinator);
+
+        let error = coordinator
+            .take_error()
+            .expect("unreported background error remains visible");
+        assert!(error.contains("publish failed"));
+        assert!(coordinator.take_error().is_none());
+    }
 
     #[test]
     fn compaction_keeps_newer_versions_and_snapshot_floor() {

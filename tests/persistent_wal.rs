@@ -3,6 +3,7 @@ use std::{
     fs::OpenOptions,
     io::Write,
     path::PathBuf,
+    thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -119,6 +120,16 @@ fn write_file(path: &std::path::Path, bytes: &[u8]) {
         .open(path)
         .expect("open test file");
     file.write_all(bytes).expect("write test file");
+}
+
+fn wait_until(label: &str, mut condition: impl FnMut() -> bool) {
+    for _ in 0..100 {
+        if condition() {
+            return;
+        }
+        thread::sleep(std::time::Duration::from_millis(20));
+    }
+    panic!("timed out waiting for {label}");
 }
 
 fn corruption_message(error: Error) -> String {
@@ -1019,6 +1030,101 @@ fn persistent_flush_auto_compacts_when_l0_pressure_exceeds_limit() {
             Some(b"a2".to_vec())
         );
         assert_eq!(keyspace.get(b"b").expect("b reopens"), Some(b"b1".to_vec()));
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_background_workers_flush_and_compact_pressure() {
+    let path = temp_db_path("background-maintenance");
+    let mut options = DbOptions::persistent(&path);
+    options.write_buffer_bytes = 1;
+    options.max_immutable_memtables = 4;
+    options.max_l0_files = 1;
+    options.background_worker_count = 1;
+
+    {
+        let db = Db::open(options.clone()).expect("persistent db opens");
+        let keyspace = db
+            .keyspace("default", KeyspaceOptions::default())
+            .expect("keyspace opens");
+
+        keyspace.insert(b"a", b"a1").expect("write a");
+        wait_until("background flush of first immutable memtable", || {
+            let stats = db.stats();
+            stats.total_tables == 1 && stats.immutable_memtables == 0
+        });
+
+        keyspace.insert(b"b", b"b1").expect("write b");
+        wait_until("background compaction after L0 pressure", || {
+            default_table_levels(&path) == vec![1]
+        });
+
+        assert_eq!(
+            keyspace.get(b"a").expect("a reads after background work"),
+            Some(b"a1".to_vec())
+        );
+        assert_eq!(
+            keyspace.get(b"b").expect("b reads after background work"),
+            Some(b"b1".to_vec())
+        );
+        db.close();
+    }
+
+    {
+        let db = Db::open(options).expect("persistent db reopens");
+        let keyspace = db
+            .keyspace("default", KeyspaceOptions::default())
+            .expect("keyspace reopens");
+        assert_eq!(default_table_levels(&path), vec![1]);
+        assert_eq!(keyspace.get(b"a").expect("a reopens"), Some(b"a1".to_vec()));
+        assert_eq!(keyspace.get(b"b").expect("b reopens"), Some(b"b1".to_vec()));
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_background_maintenance_error_surfaces_to_later_write() {
+    let path = temp_db_path("background-maintenance-error");
+    let mut options = DbOptions::persistent(&path);
+    options.write_buffer_bytes = 1;
+    options.max_immutable_memtables = 4;
+    options.background_worker_count = 1;
+
+    {
+        let db = Db::open(options).expect("persistent db opens");
+        let keyspace = db
+            .keyspace("default", KeyspaceOptions::default())
+            .expect("keyspace opens");
+
+        let manifest_tmp_dir = manifest::manifest_path(&path).with_extension("tmp");
+        fs::create_dir(&manifest_tmp_dir).expect("block manifest tmp path");
+        keyspace.insert(b"a", b"a1").expect("write schedules flush");
+
+        let mut surfaced = false;
+        for index in 0..100 {
+            thread::sleep(std::time::Duration::from_millis(20));
+            let key = format!("probe-{index:03}").into_bytes();
+            match keyspace.insert(key, b"value") {
+                Err(Error::Corruption { message })
+                    if message.contains("background maintenance failed") =>
+                {
+                    surfaced = true;
+                    break;
+                }
+                Ok(()) => {}
+                Err(error) => panic!("unexpected write error: {error}"),
+            }
+        }
+        assert!(
+            surfaced,
+            "background maintenance failure should reach a later write"
+        );
+
+        fs::remove_dir(&manifest_tmp_dir).expect("remove manifest tmp blocker");
+        db.close();
     }
 
     fs::remove_dir_all(path).expect("cleanup test db");

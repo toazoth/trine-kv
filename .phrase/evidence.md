@@ -2556,3 +2556,52 @@ Record only evidence that can change planning or durable decisions.
 - Move to iterator merge hardening if read-path benchmarks remain the sharpest
   risk; otherwise move to background flush/compaction scheduling and write
   backpressure.
+
+## 2026-05-26: Iterator Merge And Background Maintenance Passed
+
+### Observation
+
+- Lazy scan source selection now uses a heap keyed by user key and scan
+  direction instead of checking every source on each `next()`.
+- Source groups with the same user key are consumed together so MVCC visibility
+  and range deletes still see the complete candidate set for that key.
+- Persistent databases start maintenance worker threads when
+  `background_worker_count > 0`.
+- `background_worker_count == 0` keeps flush and compaction on explicit or
+  foreground pressure paths.
+- Background maintenance flushes immutable memtables first and then compacts L0
+  pressure when needed.
+- Background maintenance failures are stored once and returned by later writes,
+  `flush()`, or `compact_range()`.
+- In-memory databases still avoid background worker threads.
+
+### Interpretation
+
+- Phase 20 is complete for the P5/P6 slice.
+- Range and prefix iterators now pay heap cost per candidate group instead of a
+  linear scan across all sources per step.
+- The write path now has an opt-in persistent background maintenance loop while
+  preserving explicit maintenance semantics by default.
+
+### Verification
+
+- `cargo test --all-targets --all-features`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- Focused coverage:
+  - `source_heap_orders_forward_and_reverse_keys`
+  - `lazy_scan_heap_merge_preserves_forward_and_reverse_order`
+  - `maintenance_success_does_not_clear_unreported_error`
+  - `persistent_background_workers_flush_and_compact_pressure`
+  - `persistent_background_maintenance_error_surfaces_to_later_write`
+
+### Remaining Blockers
+
+- GitHub Actions was not executed locally; remote CI must run after push.
+- Background work is thread-based and currently scoped to persistent databases.
+- Benchmark follow-up should measure heap merge behavior against wide-source
+  scan workloads and maintenance behavior under sustained write pressure.
+
+### Recommended Next Action
+
+- Run benchmark-guided follow-up for wide iterator merges and sustained
+  write-load maintenance, or move to release-readiness review if CI is clean.

@@ -149,7 +149,7 @@ impl Default for DbOptions {
             level_size_multiplier: 10,
             max_l0_files: 8,
             block_cache_bytes: Self::DEFAULT_BLOCK_CACHE_BYTES,
-            background_worker_count: 1,
+            background_worker_count: 0,
             fail_on_corruption: FailOnCorruptionPolicy::FailClosed,
         }
     }

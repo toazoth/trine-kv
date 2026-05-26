@@ -258,10 +258,15 @@ must not require the writer coordinator.
 
 Background work:
 
+- `background_worker_count == 0` disables background maintenance;
+- persistent databases with `background_worker_count > 0` start maintenance
+  workers after open;
 - flush immutable memtables;
 - compact SSTables;
 - clean obsolete files after snapshot safety allows it;
 - never publish partially written tables.
+- background maintenance failures must be returned by a later write, `flush`,
+  or `compact_range` call instead of being silently ignored.
 
 ## 11. Durability Modes
 
@@ -660,6 +665,8 @@ Iterator rules:
 - preserve lexicographic ordering;
 - hold a VersionSet guard for repeatability;
 - expose fallible iteration because storage reads can fail;
+- merge source cursors through heap selection so one returned key advances only
+  the sources that currently point at that key;
 - use `advance_to` rather than restarting from the beginning when a merge or
   range cursor can provide a position hint.
 

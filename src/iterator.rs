@@ -1,4 +1,6 @@
-use std::{cmp::Ordering as CmpOrdering, ops::Bound, path::PathBuf, sync::Arc};
+use std::{
+    cmp::Ordering as CmpOrdering, collections::BinaryHeap, ops::Bound, path::PathBuf, sync::Arc,
+};
 
 use crate::{
     blob::ValueRef,
@@ -67,6 +69,8 @@ impl Iter {
                 db_path,
                 range_tombstones: RangeTombstoneIndex::new(range_tombstones),
                 sources,
+                source_heap: BinaryHeap::new(),
+                source_heap_initialized: false,
             }),
         }
     }
@@ -96,38 +100,53 @@ struct LazyScan {
     db_path: Option<PathBuf>,
     range_tombstones: RangeTombstoneIndex<ScanRangeTombstone>,
     sources: Vec<RecordSource>,
+    source_heap: BinaryHeap<SourceHeapEntry>,
+    source_heap_initialized: bool,
 }
 
 impl LazyScan {
     fn next(&mut self) -> Option<Result<KeyValue>> {
+        if !self.source_heap_initialized {
+            if let Err(error) = self.initialize_source_heap() {
+                return Some(Err(error));
+            }
+        }
+
         loop {
-            let user_key = match self.next_user_key() {
-                Ok(Some(user_key)) => user_key,
-                Ok(None) => return None,
-                Err(error) => return Some(Err(error)),
-            };
+            let entry = self.source_heap.pop()?;
+            let user_key = entry.user_key;
+            let mut source_indices = vec![entry.source_index];
+            while self
+                .source_heap
+                .peek()
+                .is_some_and(|entry| entry.user_key == user_key)
+            {
+                let entry = self
+                    .source_heap
+                    .pop()
+                    .expect("heap peek promised another source entry");
+                source_indices.push(entry.source_index);
+            }
+
             let mut first_record = None;
             let mut rest_records = Vec::new();
 
-            for source in &mut self.sources {
-                let source_matches = match source.current_key() {
-                    Ok(Some(source_key)) => source_key == user_key.as_slice(),
-                    Ok(None) => false,
-                    Err(error) => return Some(Err(error)),
-                };
-                if source_matches {
-                    match source.take_current_group() {
-                        Ok(Some(group)) => {
-                            push_group_records(&mut first_record, &mut rest_records, group);
-                        }
-                        Ok(None) => {}
-                        Err(error) => return Some(Err(error)),
+            for source_index in source_indices {
+                match self.sources[source_index].take_current_group() {
+                    Ok(Some(group)) => {
+                        push_group_records(&mut first_record, &mut rest_records, group);
                     }
+                    Ok(None) => {}
+                    Err(error) => return Some(Err(error)),
+                }
+                if let Err(error) = self.push_source_heap_entry(source_index) {
+                    return Some(Err(error));
                 }
             }
 
-            let first_record =
-                first_record.expect("selected user key must have at least one source record");
+            let Some(first_record) = first_record else {
+                continue;
+            };
             match self.visible_item_from_records(first_record, rest_records) {
                 Ok(Some(item)) => return Some(Ok(item)),
                 Ok(None) => {}
@@ -136,22 +155,27 @@ impl LazyScan {
         }
     }
 
-    fn next_user_key(&mut self) -> Result<Option<Vec<u8>>> {
-        let mut selected: Option<Vec<u8>> = None;
-
-        for source in &mut self.sources {
-            let Some(user_key) = source.current_key()? else {
-                continue;
-            };
-            let replace = selected.as_ref().is_none_or(|selected| {
-                compare_scan_keys(user_key, selected, self.direction) == CmpOrdering::Less
-            });
-            if replace {
-                selected = Some(user_key.to_vec());
-            }
+    fn initialize_source_heap(&mut self) -> Result<()> {
+        for source_index in 0..self.sources.len() {
+            self.push_source_heap_entry(source_index)?;
         }
+        self.source_heap_initialized = true;
+        Ok(())
+    }
 
-        Ok(selected)
+    fn push_source_heap_entry(&mut self, source_index: usize) -> Result<()> {
+        let Some(user_key) = self.sources[source_index]
+            .current_key()?
+            .map(<[u8]>::to_vec)
+        else {
+            return Ok(());
+        };
+        self.source_heap.push(SourceHeapEntry {
+            user_key,
+            source_index,
+            direction: self.direction,
+        });
+        Ok(())
     }
 
     fn visible_item_from_records(
@@ -201,6 +225,30 @@ impl LazyScan {
         }
 
         Ok(None)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceHeapEntry {
+    user_key: Vec<u8>,
+    source_index: usize,
+    direction: Direction,
+}
+
+impl Ord for SourceHeapEntry {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        debug_assert_eq!(self.direction, other.direction);
+        match compare_scan_keys(&self.user_key, &other.user_key, self.direction) {
+            CmpOrdering::Less => CmpOrdering::Greater,
+            CmpOrdering::Equal => other.source_index.cmp(&self.source_index),
+            CmpOrdering::Greater => CmpOrdering::Less,
+        }
+    }
+}
+
+impl PartialOrd for SourceHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -658,4 +706,125 @@ fn key_is_after_end(key: &[u8], end: &Bound<Vec<u8>>) -> bool {
 
 fn key_is_in_range(key: &[u8], range: &KeyRange) -> bool {
     !key_is_before_start(key, &range.start) && !key_is_after_end(key, &range.end)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::BinaryHeap, sync::Arc};
+
+    use super::{Direction, Iter, RecordSource, ScanSelector, SourceHeapEntry};
+    use crate::{
+        blob::ValueRef,
+        internal_key::{InternalKey, ValueKind},
+        memtable::Memtable,
+        snapshot::Snapshot,
+        types::{KeyRange, Sequence},
+    };
+
+    #[test]
+    fn source_heap_orders_forward_and_reverse_keys() {
+        let mut forward = BinaryHeap::new();
+        forward.push(heap_entry(b"c", 0, Direction::Forward));
+        forward.push(heap_entry(b"a", 1, Direction::Forward));
+        forward.push(heap_entry(b"b", 2, Direction::Forward));
+
+        assert_eq!(forward.pop().expect("entry").user_key, b"a");
+        assert_eq!(forward.pop().expect("entry").user_key, b"b");
+        assert_eq!(forward.pop().expect("entry").user_key, b"c");
+
+        let mut reverse = BinaryHeap::new();
+        reverse.push(heap_entry(b"c", 0, Direction::Reverse));
+        reverse.push(heap_entry(b"a", 1, Direction::Reverse));
+        reverse.push(heap_entry(b"b", 2, Direction::Reverse));
+
+        assert_eq!(reverse.pop().expect("entry").user_key, b"c");
+        assert_eq!(reverse.pop().expect("entry").user_key, b"b");
+        assert_eq!(reverse.pop().expect("entry").user_key, b"a");
+    }
+
+    #[test]
+    fn lazy_scan_heap_merge_preserves_forward_and_reverse_order() {
+        let left = memtable_with(&[(b"a", b"a1"), (b"c", b"c1")]);
+        let right = memtable_with(&[(b"b", b"b1"), (b"d", b"d1")]);
+
+        let forward = Iter::from_sources(
+            Direction::Forward,
+            Sequence::new(4),
+            Snapshot::new(Sequence::new(4)),
+            None,
+            Vec::new(),
+            vec![
+                RecordSource::memtable(
+                    Arc::clone(&left),
+                    ScanSelector::Range(KeyRange::all()),
+                    Direction::Forward,
+                ),
+                RecordSource::memtable(
+                    Arc::clone(&right),
+                    ScanSelector::Range(KeyRange::all()),
+                    Direction::Forward,
+                ),
+            ],
+        );
+        assert_eq!(
+            collect_keys(forward),
+            vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec(), b"d".to_vec()]
+        );
+
+        let reverse = Iter::from_sources(
+            Direction::Reverse,
+            Sequence::new(4),
+            Snapshot::new(Sequence::new(4)),
+            None,
+            Vec::new(),
+            vec![
+                RecordSource::memtable(
+                    left,
+                    ScanSelector::Range(KeyRange::all()),
+                    Direction::Reverse,
+                ),
+                RecordSource::memtable(
+                    right,
+                    ScanSelector::Range(KeyRange::all()),
+                    Direction::Reverse,
+                ),
+            ],
+        );
+        assert_eq!(
+            collect_keys(reverse),
+            vec![b"d".to_vec(), b"c".to_vec(), b"b".to_vec(), b"a".to_vec()]
+        );
+    }
+
+    fn heap_entry(user_key: &[u8], source_index: usize, direction: Direction) -> SourceHeapEntry {
+        SourceHeapEntry {
+            user_key: user_key.to_vec(),
+            source_index,
+            direction,
+        }
+    }
+
+    fn memtable_with(records: &[(&[u8], &[u8])]) -> Arc<Memtable> {
+        let memtable = Arc::new(Memtable::default());
+        {
+            let mut entries = memtable.write_entries().expect("memtable lock");
+            for (index, (key, value)) in records.iter().enumerate() {
+                entries.insert(
+                    InternalKey::new(
+                        *key,
+                        Sequence::new(u64::try_from(index + 1).expect("test sequence fits")),
+                        ValueKind::Put,
+                        0,
+                    ),
+                    Some(ValueRef::Inline((*value).to_vec())),
+                );
+            }
+        }
+        memtable
+    }
+
+    fn collect_keys(iter: Iter) -> Vec<Vec<u8>> {
+        iter.map(|item| item.expect("iterator item").key)
+            .collect::<Vec<_>>()
+    }
 }

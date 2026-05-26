@@ -48,6 +48,7 @@ impl Db {
         if self.inner.options.read_only && !operations.is_empty() {
             return Err(Error::ReadOnly);
         }
+        self.take_background_maintenance_error()?;
 
         // Check every batch-wide precondition before taking the writer lock or
         // touching memtables, so a rejected batch cannot leave partial state.
@@ -109,7 +110,9 @@ impl Db {
         self.inner
             .last_sequence
             .store(sequence.get(), Ordering::Release);
-        self.freeze_large_active_memtables_after_commit_locked(sequence)?;
+        if self.freeze_large_active_memtables_after_commit_locked(sequence)? {
+            self.request_background_maintenance();
+        }
         Ok(CommitInfo::new(sequence))
     }
 

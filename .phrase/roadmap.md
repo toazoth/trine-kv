@@ -353,3 +353,27 @@ sizing plus tombstone lookup as the next production-readiness risks.
 - Compaction outputs split by `target_table_bytes` at user-key boundaries.
 - Existing in-memory, persistent, MVCC, range-delete, blob, and table tests keep
   passing.
+
+### Phase 20: Iterator Merge And Background Maintenance
+
+**Status**: Complete
+
+**Goal**: Harden lazy scan source selection and make persistent background
+maintenance honor `background_worker_count`.
+
+**Entry Condition**: Phase 19 complete and evidence identifies linear iterator
+source selection plus foreground-only flush/compaction scheduling as the next
+risks.
+
+**Acceptance Gate**:
+
+- Lazy range and prefix iterators choose source groups through a heap keyed by
+  user key and scan direction.
+- Forward and reverse scans preserve MVCC visibility and range-delete behavior.
+- Persistent databases start background maintenance workers when
+  `background_worker_count > 0`, while `0` keeps maintenance explicit.
+- Background maintenance can flush immutable memtables and compact L0 pressure.
+- Background errors surface through later writes, `flush()`, or
+  `compact_range()`.
+- In-memory mode does not start background worker threads.
+- Full local Rust verification passes.
