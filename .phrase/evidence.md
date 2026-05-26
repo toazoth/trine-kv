@@ -3725,3 +3725,65 @@ Record only evidence that can change planning or durable decisions.
 
 - Commit Phase 37. If more performance work is desired, start a focused
   GC-throughput or value-lazy-iterator phase with fresh benchmark evidence.
+
+## 2026-05-26: Phase 38 Blob Maintenance And Value-Lazy Iteration Completed
+
+### Observation
+
+- `BucketOptions::blob_level_merge_enabled` now defaults to false and is
+  persisted in manifest v6.
+- Manifest v5 bucket options decode with `blob_level_merge_enabled = false`.
+- When Level Merge is enabled for a bucket, compaction reads retained
+  `BlobIndex` values and writes fresh output blob records instead of carrying
+  old blob indexes forward.
+- `Db`, `Bucket`, and `Snapshot` now expose value-lazy range and prefix
+  iterators.
+- Value-lazy blob rows share the iterator read pin through `Arc<Snapshot>` and
+  read blob bytes only when callers ask for the value.
+- Blob GC candidate selection now reads blob footer/properties metadata without
+  decoding every record payload.
+- Blob GC rewrite copies live records by exact `BlobIndex` and internal key
+  instead of building a full offset map from a decoded blob file.
+- A table-driven recovery fault matrix now covers temporary manifest publish,
+  missing table, missing blob, corrupt blob, and unreferenced formal blob
+  failures.
+- Benchmark harness rows now include `blob range lazy keys` and
+  `blob level merge`.
+
+### Interpretation
+
+- The large-value subsystem now has a usable first pass for all requested
+  post-GC pieces: optional Level Merge, value-lazy iteration, a narrower GC
+  read path, and broader recovery fault coverage.
+- Automatic Level Merge policy and multi-candidate GC batching remain policy
+  work, not correctness gaps in this phase.
+
+### Verification
+
+- `cargo test blob::tests --all-features`
+- `cargo test --test persistent_wal --all-features`
+- `cargo test --test in_memory_iteration --all-features`
+- `cargo test manifest_decode_v5_bucket_options_default_blob_level_merge --all-features`
+- `cargo bench --bench v1_bench`
+  - `blob range scan`: 17705 us for 32 scans.
+  - `blob range lazy keys`: 174 us for 32 scans.
+  - `blob GC rewrite`: 154265 us.
+  - `blob level merge`: 143299 us.
+- `cargo test --all-targets --all-features`
+- `cargo clippy --all-targets --all-features`
+- `cargo fmt --all --check`
+- `git diff --check`
+- forbidden-term scan over `.phrase`, `src`, `tests`, `benches`, `examples`,
+  `docs`, and `README.md`
+
+### Remaining Blockers
+
+- Remote CI cannot be executed locally; it must run after push.
+- Level Merge is explicit per bucket. Automatic policy should wait for
+  workload evidence.
+- Blob GC rewrites one selected candidate per maintenance pass.
+
+### Recommended Next Action
+
+- Commit Phase 38, then push to CI. Future large-value work should use the new
+  benchmark rows to tune Level Merge policy and GC candidate batching.

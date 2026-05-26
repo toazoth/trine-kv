@@ -222,6 +222,7 @@ pub struct BucketOptions {
     pub prefix_filter_policy: PrefixFilterPolicy,
     pub index_search_policy: IndexSearchPolicy,
     pub blob_threshold_bytes: usize,
+    pub blob_level_merge_enabled: bool,
 }
 
 impl BucketOptions {
@@ -239,6 +240,12 @@ impl BucketOptions {
         self.blob_threshold_bytes = blob_threshold_bytes;
         self
     }
+
+    #[must_use]
+    pub const fn with_blob_level_merge_enabled(mut self, enabled: bool) -> Self {
+        self.blob_level_merge_enabled = enabled;
+        self
+    }
 }
 
 impl Default for BucketOptions {
@@ -252,6 +259,7 @@ impl Default for BucketOptions {
             prefix_filter_policy: PrefixFilterPolicy::default(),
             index_search_policy: IndexSearchPolicy::Auto,
             blob_threshold_bytes: Self::DEFAULT_BLOB_THRESHOLD_BYTES,
+            blob_level_merge_enabled: false,
         }
     }
 }

@@ -14,7 +14,7 @@ use crate::{
     bucket::{Bucket, BucketName, DEFAULT_BUCKET_NAME},
     cache, compaction, durability,
     error::{Error, Result},
-    iterator::{Direction, Iter, ScanSelector},
+    iterator::{Direction, Iter, LazyIter, ScanSelector},
     lsm::{
         CompactionInput as LsmCompactionInput, CompactionOutput as LsmCompactionOutput,
         FlushInput as LsmFlushInput, LsmTree,
@@ -535,9 +535,30 @@ impl Db {
         )
     }
 
+    /// Returns a forward default-bucket iterator whose blob values are read on
+    /// demand.
+    pub fn range_lazy(&self, range: &KeyRange) -> Result<LazyIter> {
+        self.range_lazy_at_sequence(
+            DEFAULT_BUCKET_NAME,
+            range,
+            self.last_committed_sequence(),
+            Direction::Forward,
+        )
+    }
+
     /// Returns a forward default-bucket iterator over `range` at `snapshot`.
     pub fn range_at(&self, snapshot: &Snapshot, range: &KeyRange) -> Result<Iter> {
         self.range_at_sequence(
+            DEFAULT_BUCKET_NAME,
+            range,
+            snapshot.read_sequence(),
+            Direction::Forward,
+        )
+    }
+
+    /// Returns a forward value-lazy default-bucket iterator at `snapshot`.
+    pub fn range_lazy_at(&self, snapshot: &Snapshot, range: &KeyRange) -> Result<LazyIter> {
+        self.range_lazy_at_sequence(
             DEFAULT_BUCKET_NAME,
             range,
             snapshot.read_sequence(),
@@ -555,9 +576,30 @@ impl Db {
         )
     }
 
+    /// Returns a reverse default-bucket iterator whose blob values are read on
+    /// demand.
+    pub fn range_lazy_reverse(&self, range: &KeyRange) -> Result<LazyIter> {
+        self.range_lazy_at_sequence(
+            DEFAULT_BUCKET_NAME,
+            range,
+            self.last_committed_sequence(),
+            Direction::Reverse,
+        )
+    }
+
     /// Returns a reverse default-bucket iterator over `range` at `snapshot`.
     pub fn range_reverse_at(&self, snapshot: &Snapshot, range: &KeyRange) -> Result<Iter> {
         self.range_at_sequence(
+            DEFAULT_BUCKET_NAME,
+            range,
+            snapshot.read_sequence(),
+            Direction::Reverse,
+        )
+    }
+
+    /// Returns a reverse value-lazy default-bucket iterator at `snapshot`.
+    pub fn range_lazy_reverse_at(&self, snapshot: &Snapshot, range: &KeyRange) -> Result<LazyIter> {
+        self.range_lazy_at_sequence(
             DEFAULT_BUCKET_NAME,
             range,
             snapshot.read_sequence(),
@@ -577,10 +619,38 @@ impl Db {
         )
     }
 
+    /// Returns a forward default-bucket prefix iterator whose blob values are
+    /// read on demand.
+    pub fn prefix_lazy(&self, prefix: impl Into<Vec<u8>>) -> Result<LazyIter> {
+        let prefix = prefix.into();
+        self.prefix_lazy_at_sequence(
+            DEFAULT_BUCKET_NAME,
+            &prefix,
+            self.last_committed_sequence(),
+            Direction::Forward,
+        )
+    }
+
     /// Returns a forward default-bucket prefix iterator at `snapshot`.
     pub fn prefix_at(&self, snapshot: &Snapshot, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
         let prefix = prefix.into();
         self.prefix_at_sequence(
+            DEFAULT_BUCKET_NAME,
+            &prefix,
+            snapshot.read_sequence(),
+            Direction::Forward,
+        )
+    }
+
+    /// Returns a forward value-lazy default-bucket prefix iterator at
+    /// `snapshot`.
+    pub fn prefix_lazy_at(
+        &self,
+        snapshot: &Snapshot,
+        prefix: impl Into<Vec<u8>>,
+    ) -> Result<LazyIter> {
+        let prefix = prefix.into();
+        self.prefix_lazy_at_sequence(
             DEFAULT_BUCKET_NAME,
             &prefix,
             snapshot.read_sequence(),
@@ -600,6 +670,18 @@ impl Db {
         )
     }
 
+    /// Returns a reverse default-bucket prefix iterator whose blob values are
+    /// read on demand.
+    pub fn prefix_lazy_reverse(&self, prefix: impl Into<Vec<u8>>) -> Result<LazyIter> {
+        let prefix = prefix.into();
+        self.prefix_lazy_at_sequence(
+            DEFAULT_BUCKET_NAME,
+            &prefix,
+            self.last_committed_sequence(),
+            Direction::Reverse,
+        )
+    }
+
     /// Returns a reverse default-bucket prefix iterator at `snapshot`.
     pub fn prefix_reverse_at(
         &self,
@@ -608,6 +690,22 @@ impl Db {
     ) -> Result<Iter> {
         let prefix = prefix.into();
         self.prefix_at_sequence(
+            DEFAULT_BUCKET_NAME,
+            &prefix,
+            snapshot.read_sequence(),
+            Direction::Reverse,
+        )
+    }
+
+    /// Returns a reverse value-lazy default-bucket prefix iterator at
+    /// `snapshot`.
+    pub fn prefix_lazy_reverse_at(
+        &self,
+        snapshot: &Snapshot,
+        prefix: impl Into<Vec<u8>>,
+    ) -> Result<LazyIter> {
+        let prefix = prefix.into();
+        self.prefix_lazy_at_sequence(
             DEFAULT_BUCKET_NAME,
             &prefix,
             snapshot.read_sequence(),
@@ -1045,6 +1143,32 @@ impl Db {
         ))
     }
 
+    pub(crate) fn range_lazy_at_sequence(
+        &self,
+        bucket: &str,
+        range: &KeyRange,
+        read_sequence: Sequence,
+        direction: Direction,
+    ) -> Result<LazyIter> {
+        self.ensure_open()?;
+        let read_pin = self.inner.snapshots.pinned_snapshot(read_sequence);
+
+        let state = self.bucket_state(bucket)?;
+        let selector = ScanSelector::Range(range.clone());
+        let scan = state.scan(&selector, direction, Some(&self.inner.block_cache))?;
+        let db_path = self.persistent_path().map(Path::to_path_buf);
+
+        Ok(LazyIter::from_sources(
+            direction,
+            read_sequence,
+            read_pin,
+            db_path,
+            Some(Arc::clone(&self.inner.blob_reads)),
+            scan.range_tombstones,
+            scan.sources,
+        ))
+    }
+
     pub(crate) fn prefix_at_sequence(
         &self,
         bucket: &str,
@@ -1061,6 +1185,32 @@ impl Db {
         let db_path = self.persistent_path().map(Path::to_path_buf);
 
         Ok(Iter::from_sources(
+            direction,
+            read_sequence,
+            read_pin,
+            db_path,
+            Some(Arc::clone(&self.inner.blob_reads)),
+            scan.range_tombstones,
+            scan.sources,
+        ))
+    }
+
+    pub(crate) fn prefix_lazy_at_sequence(
+        &self,
+        bucket: &str,
+        prefix: &[u8],
+        read_sequence: Sequence,
+        direction: Direction,
+    ) -> Result<LazyIter> {
+        self.ensure_open()?;
+        let read_pin = self.inner.snapshots.pinned_snapshot(read_sequence);
+
+        let state = self.bucket_state(bucket)?;
+        let selector = ScanSelector::Prefix(prefix.to_vec());
+        let scan = state.scan(&selector, direction, Some(&self.inner.block_cache))?;
+        let db_path = self.persistent_path().map(Path::to_path_buf);
+
+        Ok(LazyIter::from_sources(
             direction,
             read_sequence,
             read_pin,
@@ -1499,11 +1649,6 @@ impl Db {
         let Some(candidate) = self.choose_blob_gc_candidate(db_path)? else {
             return Ok(None);
         };
-        let blob_file = blob::read_blob_file(db_path, candidate.file_id)?;
-        let mut records_by_offset = BTreeMap::new();
-        for record in blob_file.records {
-            records_by_offset.insert(record.index.offset, record);
-        }
 
         let mut next_table_id = self.next_table_id()?;
         let new_blob_file_id = next_table_id.get();
@@ -1534,20 +1679,11 @@ impl Db {
                     if index.file_id != candidate.file_id {
                         continue;
                     }
-                    let blob_record =
-                        records_by_offset
-                            .get(&index.offset)
-                            .ok_or_else(|| Error::Corruption {
-                                message: "blob GC input record is missing from blob file"
-                                    .to_owned(),
-                            })?;
-                    if blob_record.index != *index
-                        || blob_record.record.internal_key != point_record.internal_key
-                    {
-                        return Err(Error::Corruption {
-                            message: "blob GC input record metadata mismatch".to_owned(),
-                        });
-                    }
+                    let blob_record = blob::read_record_for_index(
+                        db_path,
+                        index,
+                        Some(&point_record.internal_key),
+                    )?;
                     rewrite_records.push(BlobGcRewriteRecord {
                         internal_key: point_record.internal_key.clone(),
                         value: blob_record.record.value.clone(),
@@ -1588,7 +1724,7 @@ impl Db {
         let mut best = None;
 
         for (file_id, live_bytes) in live_bytes_by_file {
-            let properties = blob::validate_blob_file(db_path, file_id)?;
+            let properties = blob::read_blob_file_properties(db_path, file_id)?;
             let total_bytes = properties.encoded_bytes;
             if total_bytes < self.inner.options.blob_gc_min_file_bytes {
                 continue;
@@ -2010,7 +2146,7 @@ fn add_obsolete_blob_stats(
     stats: &mut DbStats,
 ) {
     for (file_id, live_bytes) in live_blob_bytes_by_file {
-        let Ok(properties) = blob::validate_blob_file(db_path, *file_id) else {
+        let Ok(properties) = blob::read_blob_file_properties(db_path, *file_id) else {
             continue;
         };
         if properties.encoded_bytes > *live_bytes {
@@ -2079,6 +2215,7 @@ fn blob_gc_table_write_options(options: &BucketOptions) -> table::TableWriteOpti
         prefix_extractor: options.prefix_extractor.clone(),
         prefix_filter_policy: options.prefix_filter_policy,
         blob_threshold_bytes: usize::MAX,
+        rewrite_blob_indexes: false,
     }
 }
 

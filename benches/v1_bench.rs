@@ -42,7 +42,9 @@ fn main() {
     results.push(bench_separated_blob_values());
     results.push(bench_blob_point_read());
     results.push(bench_blob_range_scan());
+    results.push(bench_blob_range_lazy_keys());
     results.push(bench_blob_gc_rewrite());
+    results.push(bench_blob_level_merge());
     results.push(bench_block_cache_warm_read());
     results.push(bench_cold_table_read());
     results.extend(bench_index_seek_policies());
@@ -420,6 +422,26 @@ fn bench_blob_range_scan() -> BenchResult {
     result
 }
 
+fn bench_blob_range_lazy_keys() -> BenchResult {
+    let (dir, db, bucket) = large_blob_db("blob-range-lazy-keys", LARGE_ROWS);
+    let result = measure("blob range lazy keys", 32, || {
+        let mut checksum = 0;
+        for start in 0..32 {
+            let first = (start * 3) % (LARGE_ROWS - 8);
+            let iter = bucket
+                .range_lazy(&KeyRange::half_open(key(first), key(first + 8)))
+                .expect("blob lazy range succeeds");
+            checksum += iter
+                .map(|item| item.expect("blob lazy range item").key.len() as u64)
+                .sum::<u64>();
+        }
+        checksum
+    });
+    drop(db);
+    cleanup_dir(&dir);
+    result
+}
+
 fn bench_blob_gc_rewrite() -> BenchResult {
     measure("blob GC rewrite", LARGE_ROWS, || {
         let dir = temp_dir("blob-gc");
@@ -450,6 +472,40 @@ fn bench_blob_gc_rewrite() -> BenchResult {
             .blob_gc_input_bytes
             .saturating_add(stats.blob_gc_output_bytes)
             .saturating_add(stats.blob_gc_discarded_bytes);
+        drop(db);
+        cleanup_dir(&dir);
+        checksum
+    })
+}
+
+fn bench_blob_level_merge() -> BenchResult {
+    measure("blob level merge", LARGE_ROWS, || {
+        let dir = temp_dir("blob-level-merge");
+        let mut options = DbOptions::persistent(&dir);
+        options.blob_gc_enabled = false;
+        options.default_bucket_options = BucketOptions {
+            blob_level_merge_enabled: true,
+            ..large_blob_options()
+        };
+        let db = Db::open(options).expect("persistent db opens");
+        let bucket = db.default_bucket().expect("bucket opens");
+
+        for index in 0..LARGE_ROWS {
+            bucket
+                .put(key(index), large_value(index))
+                .expect("initial large put succeeds");
+        }
+        db.flush().expect("initial blob flush succeeds");
+        for index in (0..LARGE_ROWS).step_by(2) {
+            bucket
+                .put(key(index), large_value(index + LARGE_ROWS))
+                .expect("overwrite large put succeeds");
+        }
+        db.flush().expect("overwrite blob flush succeeds");
+        db.compact_range(KeyRange::all())
+            .expect("level merge compaction succeeds");
+
+        let checksum = db.stats().live_blob_bytes;
         drop(db);
         cleanup_dir(&dir);
         checksum

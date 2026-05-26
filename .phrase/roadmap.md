@@ -746,3 +746,27 @@ benchmark baseline.
 - `BlobIndex` point reads seek to the indexed blob record and verify only that
   record.
 - Full local Rust verification passes.
+
+### Phase 38: Blob Maintenance And Value-Lazy Iteration
+
+**Status**: Complete
+
+**Goal**: Finish the first post-GC large-value maintenance pass with optional
+Level Merge, value-lazy reads, GC rewrite path tightening, and broader recovery
+fault injection.
+
+**Entry Condition**: Phase 37 complete and user asks to finish Titan Level
+Merge, value-lazy iterator, blob GC throughput optimization, and systematic
+crash/recovery fault injection.
+
+**Acceptance Gate**:
+
+- `blob_level_merge_enabled` controls compaction-time rewriting of retained
+  large values into output blob files.
+- Value-lazy range/prefix APIs avoid blob reads until callers request values.
+- GC candidate selection uses blob properties metadata and live-record copying
+  uses indexed blob reads.
+- Recovery fault matrix covers representative temp publish, missing file,
+  corrupt file, and unreferenced formal file cases.
+- Protocol/docs and benchmark notes describe the implemented behavior.
+- Full local Rust verification passes.

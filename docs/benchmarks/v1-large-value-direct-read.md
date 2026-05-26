@@ -53,7 +53,9 @@ on the full-file scan path.
 - `BlobIndex` reads validate the blob header, seek to the indexed record frame,
   verify the record checksum, decode that one record, and compare the decoded
   metadata with the expected index and internal key.
-- Full blob-file decoding remains in recovery validation and GC scanning.
+- At the time of this phase, full blob-file decoding remained in recovery
+  validation and GC scanning. Later blob maintenance work can narrow the GC
+  path separately.
 
 ## Verification
 

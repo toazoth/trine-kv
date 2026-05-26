@@ -6,7 +6,7 @@ use std::{
 use crate::{
     bucket::Bucket,
     error::Result,
-    iterator::Iter,
+    iterator::{Iter, LazyIter},
     types::{KeyRange, Sequence, Value},
 };
 
@@ -104,16 +104,36 @@ impl Snapshot {
         bucket.range_at(self, range)
     }
 
+    pub fn range_lazy(&self, bucket: &Bucket, range: &KeyRange) -> Result<LazyIter> {
+        bucket.range_lazy_at(self, range)
+    }
+
     pub fn range_reverse(&self, bucket: &Bucket, range: &KeyRange) -> Result<Iter> {
         bucket.range_reverse_at(self, range)
+    }
+
+    pub fn range_lazy_reverse(&self, bucket: &Bucket, range: &KeyRange) -> Result<LazyIter> {
+        bucket.range_lazy_reverse_at(self, range)
     }
 
     pub fn prefix(&self, bucket: &Bucket, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
         bucket.prefix_at(self, prefix)
     }
 
+    pub fn prefix_lazy(&self, bucket: &Bucket, prefix: impl Into<Vec<u8>>) -> Result<LazyIter> {
+        bucket.prefix_lazy_at(self, prefix)
+    }
+
     pub fn prefix_reverse(&self, bucket: &Bucket, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
         bucket.prefix_reverse_at(self, prefix)
+    }
+
+    pub fn prefix_lazy_reverse(
+        &self,
+        bucket: &Bucket,
+        prefix: impl Into<Vec<u8>>,
+    ) -> Result<LazyIter> {
+        bucket.prefix_lazy_reverse_at(self, prefix)
     }
 }
 

@@ -26,12 +26,16 @@ Release packaging notes live in [docs/release.md](docs/release.md).
 - MVCC snapshots that keep old reads stable while newer writes commit.
 - Optimistic transactions with point and range conflict checks.
 - Ordered range scans and prefix scans.
+- Value-lazy range and prefix scans for large-value workloads that need keys
+  before reading blob bytes.
 - Persistent mode with WAL replay, manifest recovery, directory locking, flush,
   compaction, and read-only open.
 - Block-based SSTables with filters, block cache, compression, and configurable
   index search policies.
 - Large values can be separated into Titan-like blob files with `BlobIndex`
   records in SSTables.
+- Optional blob Level Merge rewrites retained large values into output blob
+  files during compaction when a bucket enables it.
 - Snapshot-safe blob GC rewrites still-live large values out of stale blob
   files and delays old-file deletion while a read can still reach them.
 - Live stats report table, cache, filter, blob read, blob byte, and blob GC
@@ -134,6 +138,7 @@ cargo bench --bench v1_bench
 - [Release packaging](docs/release.md)
 - [V1 benchmark baseline](docs/benchmarks/v1-baseline.md)
 - [Large-value direct read tuning](docs/benchmarks/v1-large-value-direct-read.md)
+- [Blob maintenance and lazy value benchmark](docs/benchmarks/v1-blob-level-merge-lazy-gc.md)
 
 ## Current Boundaries
 

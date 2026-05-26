@@ -241,8 +241,9 @@ For retained records:
 - existing `BlobIndex` records may be kept unchanged during normal compaction;
 - large inline values created by WAL replay or legacy tables are separated when
   written into new SSTables;
-- Level Merge may later rewrite selected blob values during compaction, but it
-  is disabled until correctness and benchmark evidence exist.
+- if `blob_level_merge_enabled` is true for the bucket, compaction reads
+  retained `BlobIndex` values, writes them into the output blob file, and stores
+  fresh `BlobIndex` records in the output SSTable.
 
 For dropped records:
 
@@ -318,8 +319,8 @@ Point read:
 Range/prefix scan:
 
 - current value-returning iterators read blob bytes as rows are returned;
-- future key-only or value-lazy APIs may avoid blob reads until callers ask for
-  the value;
+- value-lazy iterators (`range_lazy` and `prefix_lazy`) return keys plus lazy
+  values, and read blob bytes only when the caller asks for the value;
 - stats must count blob read operations and bytes.
 
 Blob reads must validate:
@@ -332,8 +333,9 @@ Blob reads must validate:
   caller has enough context to check it.
 
 Point reads should use `BlobIndex.offset` to read the indexed record directly.
-Full blob-file decode is still required for recovery validation and GC scans,
-but not for a single visible value.
+Full blob-file decode is still required for recovery validation. Point reads,
+value-lazy reads, and GC live-record copying should use indexed blob reads when
+the exact `BlobIndex` is known.
 
 ## 13. Blob GC
 
@@ -351,8 +353,10 @@ Estimate maintenance:
 GC rewrite:
 
 1. pin the current LSM versions and snapshot floor;
-2. read the selected blob file sequentially;
-3. for each live SSTable reference to that blob file, validate that the
+2. read candidate blob-file properties from the footer/properties block without
+   decoding every record payload;
+3. for each live SSTable reference to that blob file, read the referenced blob
+   record by `BlobIndex.offset` and validate that the
    `BlobRecord` metadata matches the exact internal key and old `BlobIndex`;
 4. copy still-referenced values into a new blob file and publish equivalent
    `BlobIndex` records for the same internal keys;

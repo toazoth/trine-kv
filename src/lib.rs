@@ -38,7 +38,7 @@ pub mod write_batch;
 pub use bucket::{Bucket, BucketName};
 pub use db::Db;
 pub use error::{Error, Result};
-pub use iterator::{Direction, Iter};
+pub use iterator::{Direction, Iter, LazyIter, LazyKeyValue, LazyValue};
 pub use mvcc::SnapshotSequence;
 pub use options::{
     BlobGcRatio, BucketOptions, CompressionProfile, DbOptions, DurabilityMode,

@@ -1,7 +1,7 @@
 use crate::{
     db::Db,
     error::Result,
-    iterator::{Direction, Iter},
+    iterator::{Direction, Iter, LazyIter},
     options::{BucketOptions, WriteOptions},
     snapshot::Snapshot,
     types::{CommitInfo, KeyRange, Value},
@@ -155,9 +155,19 @@ impl Bucket {
         self.range_at_sequence(range, self.db.last_committed_sequence(), Direction::Forward)
     }
 
+    /// Returns a forward iterator whose blob values are read on demand.
+    pub fn range_lazy(&self, range: &KeyRange) -> Result<LazyIter> {
+        self.range_lazy_at_sequence(range, self.db.last_committed_sequence(), Direction::Forward)
+    }
+
     /// Returns a forward iterator over `range` at `snapshot`.
     pub fn range_at(&self, snapshot: &Snapshot, range: &KeyRange) -> Result<Iter> {
         self.range_at_sequence(range, snapshot.read_sequence(), Direction::Forward)
+    }
+
+    /// Returns a forward value-lazy iterator at `snapshot`.
+    pub fn range_lazy_at(&self, snapshot: &Snapshot, range: &KeyRange) -> Result<LazyIter> {
+        self.range_lazy_at_sequence(range, snapshot.read_sequence(), Direction::Forward)
     }
 
     /// Returns a reverse iterator over visible rows in `range`.
@@ -165,9 +175,19 @@ impl Bucket {
         self.range_at_sequence(range, self.db.last_committed_sequence(), Direction::Reverse)
     }
 
+    /// Returns a reverse iterator whose blob values are read on demand.
+    pub fn range_lazy_reverse(&self, range: &KeyRange) -> Result<LazyIter> {
+        self.range_lazy_at_sequence(range, self.db.last_committed_sequence(), Direction::Reverse)
+    }
+
     /// Returns a reverse iterator over `range` at `snapshot`.
     pub fn range_reverse_at(&self, snapshot: &Snapshot, range: &KeyRange) -> Result<Iter> {
         self.range_at_sequence(range, snapshot.read_sequence(), Direction::Reverse)
+    }
+
+    /// Returns a reverse value-lazy iterator at `snapshot`.
+    pub fn range_lazy_reverse_at(&self, snapshot: &Snapshot, range: &KeyRange) -> Result<LazyIter> {
+        self.range_lazy_at_sequence(range, snapshot.read_sequence(), Direction::Reverse)
     }
 
     /// Returns a forward iterator over rows whose keys begin with `prefix`.
@@ -180,16 +200,46 @@ impl Bucket {
         )
     }
 
+    /// Returns a forward prefix iterator whose blob values are read on demand.
+    pub fn prefix_lazy(&self, prefix: impl Into<Vec<u8>>) -> Result<LazyIter> {
+        let prefix = prefix.into();
+        self.prefix_lazy_at_sequence(
+            &prefix,
+            self.db.last_committed_sequence(),
+            Direction::Forward,
+        )
+    }
+
     /// Returns a forward prefix iterator at `snapshot`.
     pub fn prefix_at(&self, snapshot: &Snapshot, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
         let prefix = prefix.into();
         self.prefix_at_sequence(&prefix, snapshot.read_sequence(), Direction::Forward)
     }
 
+    /// Returns a forward value-lazy prefix iterator at `snapshot`.
+    pub fn prefix_lazy_at(
+        &self,
+        snapshot: &Snapshot,
+        prefix: impl Into<Vec<u8>>,
+    ) -> Result<LazyIter> {
+        let prefix = prefix.into();
+        self.prefix_lazy_at_sequence(&prefix, snapshot.read_sequence(), Direction::Forward)
+    }
+
     /// Returns a reverse iterator over rows whose keys begin with `prefix`.
     pub fn prefix_reverse(&self, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
         let prefix = prefix.into();
         self.prefix_at_sequence(
+            &prefix,
+            self.db.last_committed_sequence(),
+            Direction::Reverse,
+        )
+    }
+
+    /// Returns a reverse prefix iterator whose blob values are read on demand.
+    pub fn prefix_lazy_reverse(&self, prefix: impl Into<Vec<u8>>) -> Result<LazyIter> {
+        let prefix = prefix.into();
+        self.prefix_lazy_at_sequence(
             &prefix,
             self.db.last_committed_sequence(),
             Direction::Reverse,
@@ -204,6 +254,16 @@ impl Bucket {
     ) -> Result<Iter> {
         let prefix = prefix.into();
         self.prefix_at_sequence(&prefix, snapshot.read_sequence(), Direction::Reverse)
+    }
+
+    /// Returns a reverse value-lazy prefix iterator at `snapshot`.
+    pub fn prefix_lazy_reverse_at(
+        &self,
+        snapshot: &Snapshot,
+        prefix: impl Into<Vec<u8>>,
+    ) -> Result<LazyIter> {
+        let prefix = prefix.into();
+        self.prefix_lazy_at_sequence(&prefix, snapshot.read_sequence(), Direction::Reverse)
     }
 
     #[must_use]
@@ -222,6 +282,16 @@ impl Bucket {
             .range_at_sequence(self.name.as_str(), range, read_sequence, direction)
     }
 
+    fn range_lazy_at_sequence(
+        &self,
+        range: &KeyRange,
+        read_sequence: crate::types::Sequence,
+        direction: Direction,
+    ) -> Result<LazyIter> {
+        self.db
+            .range_lazy_at_sequence(self.name.as_str(), range, read_sequence, direction)
+    }
+
     fn prefix_at_sequence(
         &self,
         prefix: &[u8],
@@ -230,5 +300,15 @@ impl Bucket {
     ) -> Result<Iter> {
         self.db
             .prefix_at_sequence(self.name.as_str(), prefix, read_sequence, direction)
+    }
+
+    fn prefix_lazy_at_sequence(
+        &self,
+        prefix: &[u8],
+        read_sequence: crate::types::Sequence,
+        direction: Direction,
+    ) -> Result<LazyIter> {
+        self.db
+            .prefix_lazy_at_sequence(self.name.as_str(), prefix, read_sequence, direction)
     }
 }

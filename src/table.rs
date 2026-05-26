@@ -162,6 +162,7 @@ pub(crate) struct TableWriteOptions {
     pub(crate) prefix_extractor: PrefixExtractor,
     pub(crate) prefix_filter_policy: PrefixFilterPolicy,
     pub(crate) blob_threshold_bytes: usize,
+    pub(crate) rewrite_blob_indexes: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1548,6 +1549,13 @@ pub(crate) fn write_table(
     let db_path = path
         .parent()
         .ok_or_else(|| Error::invalid_options("table path has no parent"))?;
+    let point_records = if options.rewrite_blob_indexes {
+        // Level Merge keeps the same MVCC records but gives retained large
+        // values a fresh blob layout beside the output table.
+        crate::blob::inline_blob_values(db_path, &point_records)?
+    } else {
+        point_records
+    };
     let point_records = crate::blob::write_large_values(
         db_path,
         table_id.get(),
@@ -3785,6 +3793,7 @@ mod tests {
                 PrefixFilterPolicy::Disabled
             },
             blob_threshold_bytes: BucketOptions::DEFAULT_BLOB_THRESHOLD_BYTES,
+            rewrite_blob_indexes: false,
         }
     }
 

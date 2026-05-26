@@ -6,72 +6,80 @@ Complete
 
 ## Goal
 
-Add benchmark coverage for the Titan-like large-value path, then harden the
-measured blob point-read hotspot without changing visible KV semantics.
+Finish the first pass of post-GC large-value maintenance: optional Titan-style
+Level Merge, value-lazy iteration, GC rewrite throughput tightening, and a
+more systematic recovery fault matrix.
 
 ## Entry Condition
 
-- Phase 36 completed snapshot-safe blob GC correctness.
-- Evidence says blob GC throughput lacks a dedicated benchmark baseline.
-- Code audit shows `BlobIndex` point reads can still decode a whole blob file
-  instead of reading the indexed record by offset.
+- Phase 37 completed direct `BlobIndex` read tuning and benchmark coverage.
+- User asked to finish Level Merge, value-lazy iterator, blob GC throughput
+  optimization, and broader crash/recovery fault injection.
 
 ## Scope
 
-- Add benchmark rows for large-value point reads, range scans, and GC rewrite.
-- Record a pre-tuning benchmark baseline.
-- Change `BlobIndex` reads to seek to the indexed blob record and verify only
-  that record.
-- Keep full blob-file decode for recovery validation and GC scanning.
-- Record post-tuning benchmark evidence and update docs.
+- Add bucket-level `blob_level_merge_enabled` and persist it in manifest v6.
+- Let compaction rewrite retained `BlobIndex` values into output blob files
+  only when the bucket enables Level Merge.
+- Add public value-lazy range and prefix iterator APIs for `Db`, `Bucket`, and
+  `Snapshot`.
+- Make blob GC candidate selection read only blob footer/properties metadata,
+  and make GC live-record copying use direct indexed blob reads.
+- Add focused persistent and in-memory tests plus a table-driven recovery fault
+  matrix.
+- Update the Titan-like blob protocol, usage docs, README, and benchmark notes.
 
 ## Out Of Scope
 
-- Titan Level Merge policy and range-locality optimization.
-- WAL-time value separation.
-- Hole punching or in-place blob-file rewriting.
-- A separate in-memory blob store.
-- Public API changes.
+- Automatic Level Merge policy selection.
+- Value caching inside `LazyValue`.
+- Multi-file batch planning for blob GC.
+- New on-disk blob format changes beyond manifest v6 bucket options.
 
 ## Acceptance Gate
 
-- Benchmark harness reports large-value point read, range scan, and GC rewrite
-  rows.
-- Pre/post benchmark evidence exists for the selected read-path change.
-- `BlobIndex` reads use the stored offset and still verify record checksum,
-  value checksum, compression id, index metadata, and expected internal key.
-- Recovery validation still decodes full blob files.
-- Existing blob correctness and full Rust verification pass.
-- Rust verification passes.
+- Level Merge rewrites retained large values only when explicitly enabled.
+- Value-lazy iterators do not read blob bytes until the caller asks for the
+  value, and in-memory mode still returns inline values.
+- GC candidate selection no longer decodes every blob record payload.
+- Recovery fault matrix covers representative publish, missing-file,
+  corruption, and unreferenced-file failures.
+- Protocol/docs describe the implemented behavior.
+- Full local Rust verification passes.
 
 ## Active Task Slice
 
 ```text
-task123 [x] goal:add large-value benchmark rows | scope:benches/v1_bench.rs docs/benchmarks | verify:cargo bench --bench v1_bench
-task124 [x] goal:read BlobIndex by offset | scope:src/blob.rs tests/persistent_wal.rs | verify:blob read tests + benchmark delta
-task125 [x] goal:run full verification and record evidence | scope:repo .phrase docs | verify:cargo test + clippy + diff checks
+task126 [x] goal:add optional blob Level Merge | scope:options manifest table compaction tests | verify:persistent_blob_level_merge_rewrites_retained_blob_indexes
+task127 [x] goal:add value-lazy iterator API | scope:iterator db bucket snapshot docs tests | verify:persistent_value_lazy_iterator_defers_blob_reads_until_value_access + in-memory lazy test
+task128 [x] goal:tighten blob GC throughput path | scope:blob db bench protocol tests | verify:properties_read_skips_record_payload_decode + cargo bench row
+task129 [x] goal:add recovery fault matrix | scope:tests/persistent_wal.rs | verify:persistent_recovery_fault_injection_matrix_fails_closed
+task130 [x] goal:record docs/evidence and run full gate | scope:.phrase docs README | verify:full Rust verification
 ```
 
 ## Known Blockers
 
 - Remote CI cannot be executed locally; it must run after push.
-- Benchmarks are local and noisy; use them to choose direction, not as a
-  permanent performance guarantee.
+- Level Merge policy is explicit and manual. Automatic policy should be
+  benchmark-driven later.
+- GC still rewrites one selected candidate per maintenance pass.
 
 ## Evidence
 
-- Phase 36 verification passed before commit `f666492`.
-- Current audit found the point-read blob path decodes the whole blob file even
-  though `BlobIndex` stores a record offset.
-- Pre-tuning benchmark after adding large-value rows:
-  - `blob point read`: 1140632 us for 256 reads.
-  - `blob range scan`: 1128654 us for 32 scans.
-  - `blob GC rewrite`: 148488 us.
-- Post-tuning benchmark:
-  - `blob point read`: 13976 us for 256 reads.
-  - `blob range scan`: 13719 us for 32 scans.
-  - `blob GC rewrite`: 153518 us.
-- `cargo test blob::tests --all-features` passes.
+- `blob_level_merge_enabled` defaults to false and is persisted in manifest v6;
+  v5 manifests decode the option as false.
+- `range_lazy` and `prefix_lazy` return keys plus `LazyValue`; blob bytes are
+  read only by `LazyValue::read` or `LazyKeyValue::into_key_value`.
+- Lazy blob rows share the iterator read pin through `Arc<Snapshot>`, so each
+  returned row does not re-pin the global snapshot tracker.
+- GC candidate selection reads blob footer/properties metadata without
+  decoding every blob record payload.
+- GC rewrite reads live records by exact `BlobIndex` and internal key.
+- Release benchmark rows from `cargo bench --bench v1_bench`:
+  - `blob range scan`: 17705 us for 32 scans.
+  - `blob range lazy keys`: 174 us for 32 scans.
+  - `blob GC rewrite`: 154265 us.
+  - `blob level merge`: 143299 us.
 - `cargo test --all-targets --all-features` passes.
 - `cargo clippy --all-targets --all-features` passes.
 - `cargo fmt --all --check` passes.
@@ -81,5 +89,7 @@ task125 [x] goal:run full verification and record evidence | scope:repo .phrase 
 
 ## Next Recommendation
 
-- Commit Phase 37 once the user wants a checkpoint. The next meaningful work is
-  a new phase, not a Phase 37 correctness tail.
+- Commit Phase 38. After CI push, the next large-value work should be
+  benchmark-driven policy tuning: when to enable Level Merge, whether GC should
+  batch multiple candidates, and how lazy value APIs should expose key-only or
+  value-caching ergonomics.

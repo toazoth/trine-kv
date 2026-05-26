@@ -226,6 +226,28 @@ pub(crate) fn write_large_values(
     Ok(rewritten)
 }
 
+pub(crate) fn inline_blob_values(
+    db_path: &Path,
+    records: &[(InternalKey, Option<ValueRef>)],
+) -> Result<Vec<(InternalKey, Option<ValueRef>)>> {
+    let mut rewritten = Vec::with_capacity(records.len());
+    for (internal_key, value) in records {
+        let value = match value {
+            Some(ValueRef::Inline(bytes)) => Some(ValueRef::Inline(bytes.clone())),
+            Some(value @ (ValueRef::BlobIndex(_) | ValueRef::Blob { .. })) => {
+                Some(ValueRef::Inline(read_value_for_internal_key(
+                    db_path,
+                    value,
+                    Some(internal_key),
+                )?))
+            }
+            None => None,
+        };
+        rewritten.push((internal_key.clone(), value));
+    }
+    Ok(rewritten)
+}
+
 pub(crate) fn read_value_for_internal_key(
     db_path: &Path,
     value: &ValueRef,
@@ -266,6 +288,49 @@ pub(crate) fn read_value_for_internal_key(
 pub(crate) fn validate_blob_file(db_path: &Path, file_id: u64) -> Result<BlobFileProperties> {
     let blob_file = read_blob_file(db_path, file_id)?;
     Ok(blob_file.properties)
+}
+
+pub(crate) fn read_blob_file_properties(
+    db_path: &Path,
+    file_id: u64,
+) -> Result<BlobFileProperties> {
+    // GC candidate selection needs byte estimates, not value payloads. Recovery
+    // still uses `read_blob_file` so every referenced record is fully checked.
+    let mut file = File::open(blob_path(db_path, file_id)).map_err(|error| Error::Corruption {
+        message: format!("referenced blob file cannot be opened: {error}"),
+    })?;
+    let file_len = file
+        .metadata()
+        .map_err(|error| Error::Corruption {
+            message: format!("referenced blob file metadata cannot be read: {error}"),
+        })?
+        .len();
+    if file_len < (BLOB_HEADER_LEN + BLOB_FOOTER_LEN) as u64 {
+        return Err(invalid_blob("file is too short"));
+    }
+
+    validate_indexed_blob_header(&mut file, file_id)?;
+    let footer_start = file_len - BLOB_FOOTER_LEN as u64;
+    file.seek(SeekFrom::Start(footer_start))?;
+    let mut footer = [0_u8; BLOB_FOOTER_LEN];
+    file.read_exact(&mut footer)
+        .map_err(|error| Error::Corruption {
+            message: format!("referenced blob footer cannot be read: {error}"),
+        })?;
+    let (properties_offset, properties_len) = decode_footer(&footer)?;
+    let properties_end =
+        checked_blob_offset_add(properties_offset, properties_len, "blob properties bounds")?;
+    if properties_offset < BLOB_HEADER_LEN as u64 || properties_end > footer_start {
+        return Err(invalid_blob("properties bounds are outside the blob file"));
+    }
+
+    file.seek(SeekFrom::Start(properties_offset))?;
+    let mut properties_bytes = vec![0_u8; u64_to_usize(properties_len, "blob properties length")?];
+    file.read_exact(&mut properties_bytes)
+        .map_err(|error| Error::Corruption {
+            message: format!("referenced blob properties cannot be read: {error}"),
+        })?;
+    decode_properties(&properties_bytes)
 }
 
 pub(crate) fn read_blob_file(db_path: &Path, file_id: u64) -> Result<BlobFile> {
@@ -419,6 +484,18 @@ fn read_indexed_value(
     index: &BlobIndex,
     expected_internal_key: Option<&InternalKey>,
 ) -> Result<Vec<u8>> {
+    Ok(
+        read_record_for_index(db_path, index, expected_internal_key)?
+            .record
+            .value,
+    )
+}
+
+pub(crate) fn read_record_for_index(
+    db_path: &Path,
+    index: &BlobIndex,
+    expected_internal_key: Option<&InternalKey>,
+) -> Result<BlobFileRecord> {
     let mut file =
         File::open(blob_path(db_path, index.file_id)).map_err(|error| Error::Corruption {
             message: format!("referenced blob file cannot be opened: {error}"),
@@ -442,7 +519,7 @@ fn read_indexed_value(
             message: "blob record internal key mismatch".to_owned(),
         });
     }
-    Ok(record.record.value)
+    Ok(record)
 }
 
 fn validate_indexed_blob_header(file: &mut File, expected_file_id: u64) -> Result<()> {
@@ -1138,6 +1215,37 @@ mod tests {
         let value = read_indexed_value(&temp, &indexes[0], None)
             .expect("targeted indexed read skips unrelated corrupt record");
         assert_eq!(value, b"value-a");
+
+        std::fs::remove_dir_all(temp).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn properties_read_skips_record_payload_decode() {
+        let temp = temp_blob_dir("properties-read");
+
+        let header = BlobFileHeader::new(14, Sequence::new(1), 8, CodecId::None);
+        let records = vec![
+            blob_record("key-a", 1, 0, b"value-a".to_vec(), CodecId::None),
+            blob_record("key-b", 1, 0, b"value-b".to_vec(), CodecId::None),
+        ];
+        let (mut bytes, indexes) = encode_blob_file(header, &records).expect("blob encodes");
+        let expected = decode_blob_file(&bytes)
+            .expect("blob decodes before corruption")
+            .properties;
+        let corrupt_second_body = usize::try_from(indexes[1].offset)
+            .expect("offset fits usize")
+            .saturating_add(super::MIN_BLOB_RECORD_FRAME_BYTES);
+        bytes[corrupt_second_body] ^= 0xff;
+        std::fs::write(super::blob_path(&temp, 14), bytes).expect("blob writes");
+
+        assert_eq!(
+            super::read_blob_file_properties(&temp, 14).expect("properties read succeeds"),
+            expected
+        );
+        assert!(
+            super::read_blob_file(&temp, 14).is_err(),
+            "full validation should still decode and verify blob records"
+        );
 
         std::fs::remove_dir_all(temp).expect("cleanup temp dir");
     }

@@ -1,9 +1,21 @@
-use trine_kv::{BucketOptions, Db, DbOptions, Error, Iter, KeyRange, KeyValue, PrefixExtractor};
+use trine_kv::{
+    BucketOptions, Db, DbOptions, Error, Iter, KeyRange, KeyValue, LazyIter, PrefixExtractor,
+};
 
 fn collect(iter: Iter) -> Vec<(Vec<u8>, Vec<u8>)> {
     iter.map(|item| {
         let KeyValue { key, value } = item.expect("iterator item is readable");
         (key, value)
+    })
+    .collect()
+}
+
+fn collect_lazy(iter: LazyIter) -> Vec<(Vec<u8>, Vec<u8>, bool)> {
+    iter.map(|item| {
+        let item = item.expect("iterator item is readable");
+        let is_inline = item.value.is_inline();
+        let value = item.value.read().expect("lazy value reads");
+        (item.key, value, is_inline)
     })
     .collect()
 }
@@ -101,6 +113,40 @@ fn prefix_iteration_uses_snapshot_visibility() {
     assert_eq!(
         collect(bucket.prefix_reverse(b"user:").expect("reverse prefix")),
         vec![(b"user:2".to_vec(), b"new".to_vec())]
+    );
+}
+
+#[test]
+fn value_lazy_iteration_works_in_memory_without_blob_files() {
+    let db = Db::memory(DbOptions::memory()).expect("memory db opens");
+    let bucket = db.default_bucket().expect("bucket opens");
+
+    bucket.put(b"a", b"a1").expect("write a1");
+    bucket.put(b"b", b"b1").expect("write b1");
+    let snapshot = db.snapshot();
+    bucket.put(b"b", b"b2").expect("write b2");
+
+    assert_eq!(
+        collect_lazy(
+            bucket
+                .range_lazy(&KeyRange::all())
+                .expect("current lazy range")
+        ),
+        vec![
+            (b"a".to_vec(), b"a1".to_vec(), true),
+            (b"b".to_vec(), b"b2".to_vec(), true),
+        ]
+    );
+    assert_eq!(
+        collect_lazy(
+            snapshot
+                .range_lazy(&bucket, &KeyRange::all())
+                .expect("snapshot lazy range")
+        ),
+        vec![
+            (b"a".to_vec(), b"a1".to_vec(), true),
+            (b"b".to_vec(), b"b1".to_vec(), true),
+        ]
     );
 }
 

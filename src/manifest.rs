@@ -20,7 +20,7 @@ use crate::{
 
 pub const MANIFEST_FILE_NAME: &str = "MANIFEST";
 const MANIFEST_MAGIC: u32 = 0x5452_4d46;
-const MANIFEST_VERSION: u16 = 5;
+const MANIFEST_VERSION: u16 = 6;
 const MIN_SUPPORTED_MANIFEST_VERSION: u16 = 4;
 const HEADER_LEN: usize = 14;
 // The lower bound for one table entry: fixed fields plus two empty byte fields.
@@ -401,7 +401,7 @@ fn decode_state(payload: &[u8], version: u16) -> Result<ManifestState> {
             String::from_utf8(cursor.read_bytes()?.to_vec()).map_err(|_| Error::InvalidFormat {
                 message: "manifest bucket name is not valid UTF-8".to_owned(),
             })?;
-        let options = cursor.read_bucket_options()?;
+        let options = cursor.read_bucket_options(version)?;
         buckets.insert(name, options);
     }
     let tables = cursor.read_tables()?;
@@ -432,6 +432,7 @@ fn put_bucket_options(bytes: &mut Vec<u8>, options: &BucketOptions) -> Result<()
     put_prefix_filter_policy(bytes, options.prefix_filter_policy);
     put_index_search_policy(bytes, options.index_search_policy);
     put_usize(bytes, options.blob_threshold_bytes)?;
+    put_bool(bytes, options.blob_level_merge_enabled);
     Ok(())
 }
 
@@ -707,7 +708,7 @@ impl<'payload> Cursor<'payload> {
         Ok(value)
     }
 
-    fn read_bucket_options(&mut self) -> Result<BucketOptions> {
+    fn read_bucket_options(&mut self, version: u16) -> Result<BucketOptions> {
         Ok(BucketOptions {
             allow_empty_keys: self.read_bool()?,
             compression: self.read_compression_profile()?,
@@ -717,6 +718,11 @@ impl<'payload> Cursor<'payload> {
             prefix_filter_policy: self.read_prefix_filter_policy()?,
             index_search_policy: self.read_index_search_policy()?,
             blob_threshold_bytes: self.read_usize()?,
+            blob_level_merge_enabled: if version >= 6 {
+                self.read_bool()?
+            } else {
+                false
+            },
         })
     }
 
@@ -945,7 +951,12 @@ mod tests {
     };
 
     use super::{MANIFEST_VERSION, ManifestStore, decode_state, manifest_path};
-    use crate::options::BucketOptions;
+    use crate::{
+        options::{
+            BucketOptions, CompressionProfile, FilterPolicy, IndexSearchPolicy, PrefixFilterPolicy,
+        },
+        prefix::PrefixExtractor,
+    };
 
     #[test]
     fn manifest_decode_rejects_table_count_before_large_allocation() {
@@ -977,6 +988,33 @@ mod tests {
         assert!(state.buckets().is_empty());
         assert!(state.tables().is_empty());
         assert!(state.pending_blob_deletions().is_empty());
+    }
+
+    #[test]
+    fn manifest_decode_v5_bucket_options_default_blob_level_merge() {
+        let mut payload = Vec::new();
+        super::put_u64(&mut payload, 0);
+        super::put_u32(&mut payload, 1);
+        super::put_bytes(&mut payload, b"users").expect("bucket name encodes");
+        super::put_bool(&mut payload, true);
+        super::put_compression_profile(&mut payload, CompressionProfile::Fast);
+        super::put_usize(&mut payload, 4096).expect("block size encodes");
+        super::put_filter_policy(&mut payload, FilterPolicy::Bloom { bits_per_key: 12 });
+        super::put_prefix_extractor(&mut payload, &PrefixExtractor::Separator(b':'))
+            .expect("prefix extractor encodes");
+        super::put_prefix_filter_policy(
+            &mut payload,
+            PrefixFilterPolicy::Bloom { bits_per_prefix: 8 },
+        );
+        super::put_index_search_policy(&mut payload, IndexSearchPolicy::Binary);
+        super::put_usize(&mut payload, 128 * 1024).expect("threshold encodes");
+        super::put_u32(&mut payload, 0);
+        super::put_u32(&mut payload, 0);
+
+        let state = decode_state(&payload, 5).expect("v5 manifest decodes");
+        let options = state.buckets().get("users").expect("bucket options exist");
+        assert!(!options.blob_level_merge_enabled);
+        assert_eq!(options.blob_threshold_bytes, 128 * 1024);
     }
 
     #[test]

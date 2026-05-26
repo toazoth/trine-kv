@@ -13,7 +13,7 @@ use crate::{
     snapshot::Snapshot,
     stats::BlobReadMetrics,
     table::TablePointCursor,
-    types::{KeyRange, KeyValue, Sequence},
+    types::{KeyRange, KeyValue, Sequence, Value},
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -27,6 +27,35 @@ pub enum Direction {
 pub struct Iter {
     direction: Direction,
     inner: IterInner,
+}
+
+#[derive(Debug, Clone)]
+pub struct LazyIter {
+    direction: Direction,
+    scan: LazyScan,
+}
+
+#[derive(Debug, Clone)]
+pub struct LazyKeyValue {
+    pub key: Vec<u8>,
+    pub value: LazyValue,
+}
+
+#[derive(Debug, Clone)]
+pub struct LazyValue {
+    inner: LazyValueInner,
+}
+
+#[derive(Debug, Clone)]
+enum LazyValueInner {
+    Inline(Vec<u8>),
+    Blob {
+        db_path: PathBuf,
+        internal_key: InternalKey,
+        value: ValueRef,
+        blob_reads: Option<Arc<BlobReadMetrics>>,
+        _read_pin: Arc<Snapshot>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -67,7 +96,7 @@ impl Iter {
             inner: IterInner::Lazy(LazyScan {
                 direction,
                 read_sequence,
-                _read_pin: read_pin,
+                read_pin: Arc::new(read_pin),
                 db_path,
                 blob_reads,
                 range_tombstones: RangeTombstoneIndex::new(range_tombstones),
@@ -84,6 +113,94 @@ impl Iter {
     }
 }
 
+impl LazyIter {
+    pub(crate) fn from_sources(
+        direction: Direction,
+        read_sequence: Sequence,
+        read_pin: Snapshot,
+        db_path: Option<PathBuf>,
+        blob_reads: Option<Arc<BlobReadMetrics>>,
+        range_tombstones: Vec<ScanRangeTombstone>,
+        sources: Vec<RecordSource>,
+    ) -> Self {
+        Self {
+            direction,
+            scan: LazyScan {
+                direction,
+                read_sequence,
+                read_pin: Arc::new(read_pin),
+                db_path,
+                blob_reads,
+                range_tombstones: RangeTombstoneIndex::new(range_tombstones),
+                sources,
+                source_heap: BinaryHeap::new(),
+                source_heap_initialized: false,
+            },
+        }
+    }
+
+    #[must_use]
+    pub const fn direction(&self) -> Direction {
+        self.direction
+    }
+}
+
+impl LazyKeyValue {
+    pub fn into_key_value(self) -> Result<KeyValue> {
+        Ok(KeyValue::new(self.key, self.value.into_value()?))
+    }
+}
+
+impl LazyValue {
+    #[must_use]
+    pub fn is_inline(&self) -> bool {
+        matches!(self.inner, LazyValueInner::Inline(_))
+    }
+
+    pub fn read(&self) -> Result<Value> {
+        match &self.inner {
+            LazyValueInner::Inline(bytes) => Ok(bytes.clone()),
+            LazyValueInner::Blob {
+                db_path,
+                internal_key,
+                value,
+                blob_reads,
+                _read_pin: _,
+            } => {
+                let bytes =
+                    crate::blob::read_value_for_internal_key(db_path, value, Some(internal_key))?;
+                if let Some(blob_reads) = blob_reads {
+                    blob_reads.record(bytes.len() as u64);
+                }
+                Ok(bytes)
+            }
+        }
+    }
+
+    pub fn into_value(self) -> Result<Value> {
+        match self.inner {
+            LazyValueInner::Inline(bytes) => Ok(bytes),
+            LazyValueInner::Blob {
+                db_path,
+                internal_key,
+                value,
+                blob_reads,
+                _read_pin: _,
+            } => {
+                let bytes = crate::blob::read_value_for_internal_key(
+                    &db_path,
+                    &value,
+                    Some(&internal_key),
+                )?;
+                if let Some(blob_reads) = blob_reads {
+                    blob_reads.record(bytes.len() as u64);
+                }
+                Ok(bytes)
+            }
+        }
+    }
+}
+
 impl Iterator for Iter {
     type Item = Result<KeyValue>;
 
@@ -95,11 +212,19 @@ impl Iterator for Iter {
     }
 }
 
+impl Iterator for LazyIter {
+    type Item = Result<LazyKeyValue>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.scan.next_lazy()
+    }
+}
+
 #[derive(Debug, Clone)]
 struct LazyScan {
     direction: Direction,
     read_sequence: Sequence,
-    _read_pin: Snapshot,
+    read_pin: Arc<Snapshot>,
     db_path: Option<PathBuf>,
     blob_reads: Option<Arc<BlobReadMetrics>>,
     range_tombstones: RangeTombstoneIndex<ScanRangeTombstone>,
@@ -110,6 +235,11 @@ struct LazyScan {
 
 impl LazyScan {
     fn next(&mut self) -> Option<Result<KeyValue>> {
+        self.next_lazy()
+            .map(|item| item.and_then(LazyKeyValue::into_key_value))
+    }
+
+    fn next_lazy(&mut self) -> Option<Result<LazyKeyValue>> {
         if !self.source_heap_initialized {
             if let Err(error) = self.initialize_source_heap() {
                 return Some(Err(error));
@@ -151,7 +281,7 @@ impl LazyScan {
             let Some(first_record) = first_record else {
                 continue;
             };
-            match self.visible_item_from_records(first_record, rest_records) {
+            match self.visible_lazy_item_from_records(first_record, rest_records) {
                 Ok(Some(item)) => return Some(Ok(item)),
                 Ok(None) => {}
                 Err(error) => return Some(Err(error)),
@@ -182,25 +312,25 @@ impl LazyScan {
         Ok(())
     }
 
-    fn visible_item_from_records(
+    fn visible_lazy_item_from_records(
         &self,
         first_record: ScanRecord,
         mut rest_records: Vec<ScanRecord>,
-    ) -> Result<Option<KeyValue>> {
+    ) -> Result<Option<LazyKeyValue>> {
         if rest_records.is_empty() {
-            return self.visible_item_from_sorted_records(std::iter::once(first_record));
+            return self.visible_lazy_item_from_sorted_records(std::iter::once(first_record));
         }
 
         rest_records.push(first_record);
         rest_records.sort_by(|left, right| left.0.cmp(&right.0));
 
-        self.visible_item_from_sorted_records(rest_records)
+        self.visible_lazy_item_from_sorted_records(rest_records)
     }
 
-    fn visible_item_from_sorted_records(
+    fn visible_lazy_item_from_sorted_records(
         &self,
         records: impl IntoIterator<Item = ScanRecord>,
-    ) -> Result<Option<KeyValue>> {
+    ) -> Result<Option<LazyKeyValue>> {
         for (internal_key, value) in records {
             if internal_key.sequence() > self.read_sequence {
                 continue;
@@ -218,15 +348,15 @@ impl LazyScan {
                         return Ok(None);
                     }
 
-                    return Ok(Some(KeyValue::new(
-                        internal_key.user_key().to_vec(),
-                        value_bytes(
-                            value.as_ref(),
-                            &internal_key,
-                            self.db_path.as_deref(),
-                            self.blob_reads.as_deref(),
-                        )?,
-                    )));
+                    let key = internal_key.user_key().to_vec();
+                    let value = lazy_value(
+                        value,
+                        internal_key,
+                        self.db_path.as_deref(),
+                        self.blob_reads.clone(),
+                        Arc::clone(&self.read_pin),
+                    )?;
+                    return Ok(Some(LazyKeyValue { key, value }));
                 }
                 ValueKind::PointDelete => return Ok(None),
                 ValueKind::RangeDelete => {}
@@ -661,28 +791,34 @@ fn lock_poisoned(lock_name: &'static str) -> Error {
     }
 }
 
-fn value_bytes(
-    value: Option<&ValueRef>,
-    internal_key: &InternalKey,
+fn lazy_value(
+    value: Option<ValueRef>,
+    internal_key: InternalKey,
     db_path: Option<&std::path::Path>,
-    blob_reads: Option<&BlobReadMetrics>,
-) -> Result<Vec<u8>> {
+    blob_reads: Option<Arc<BlobReadMetrics>>,
+    read_pin: Arc<Snapshot>,
+) -> Result<LazyValue> {
     let value = value.ok_or_else(|| Error::Corruption {
         message: "put record is missing value bytes".to_owned(),
     })?;
 
     match value {
-        ValueRef::Inline(bytes) => Ok(bytes.clone()),
+        ValueRef::Inline(bytes) => Ok(LazyValue {
+            inner: LazyValueInner::Inline(bytes),
+        }),
         ValueRef::BlobIndex(_) | ValueRef::Blob { .. } => {
             let db_path = db_path.ok_or_else(|| Error::Corruption {
                 message: "in-memory database cannot read blob value references".to_owned(),
             })?;
-            let bytes =
-                crate::blob::read_value_for_internal_key(db_path, value, Some(internal_key))?;
-            if let Some(blob_reads) = blob_reads {
-                blob_reads.record(bytes.len() as u64);
-            }
-            Ok(bytes)
+            Ok(LazyValue {
+                inner: LazyValueInner::Blob {
+                    db_path: db_path.to_path_buf(),
+                    internal_key,
+                    value,
+                    blob_reads,
+                    _read_pin: read_pin,
+                },
+            })
         }
     }
 }

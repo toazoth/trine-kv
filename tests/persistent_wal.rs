@@ -298,6 +298,7 @@ fn persistent_manifest_keeps_bucket_options_across_reopen() {
         prefix_filter_policy: PrefixFilterPolicy::Bloom { bits_per_prefix: 8 },
         index_search_policy: IndexSearchPolicy::Binary,
         blob_threshold_bytes: 128 * 1024,
+        blob_level_merge_enabled: true,
     };
 
     {
@@ -654,6 +655,82 @@ fn persistent_recovery_does_not_delete_referenced_pending_blob_deletion() {
     }
 
     fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_recovery_fault_injection_matrix_fails_closed() {
+    #[derive(Debug, Clone, Copy)]
+    enum Fault {
+        ManifestTempPublish,
+        MissingReferencedTable,
+        MissingReferencedBlob,
+        CorruptReferencedBlob,
+        UnreferencedFormalBlob,
+    }
+
+    for fault in [
+        Fault::ManifestTempPublish,
+        Fault::MissingReferencedTable,
+        Fault::MissingReferencedBlob,
+        Fault::CorruptReferencedBlob,
+        Fault::UnreferencedFormalBlob,
+    ] {
+        let path = temp_db_path(&format!("recovery-fault-{fault:?}"));
+        let mut options = DbOptions::persistent(&path);
+        options.default_bucket_options = BucketOptions {
+            blob_threshold_bytes: 8,
+            ..BucketOptions::default()
+        };
+
+        {
+            let db = Db::open(options.clone()).expect("persistent db opens");
+            db.put(b"a", b"large-value-a-large-value-a".to_vec())
+                .expect("write large value");
+            db.flush().expect("flush table and blob file");
+        }
+
+        match fault {
+            Fault::ManifestTempPublish => {
+                write_file(
+                    &manifest::manifest_path(&path).with_extension("tmp"),
+                    b"partial manifest publish",
+                );
+            }
+            Fault::MissingReferencedTable => {
+                let table_id = default_table_ids(&path)
+                    .into_iter()
+                    .next()
+                    .expect("manifest table id exists");
+                fs::remove_file(table::table_path(&path, table::TableId(table_id)))
+                    .expect("remove referenced table");
+            }
+            Fault::MissingReferencedBlob => {
+                let blob_path = blob_file_paths(&path)
+                    .into_iter()
+                    .next()
+                    .expect("referenced blob exists");
+                fs::remove_file(blob_path).expect("remove referenced blob");
+            }
+            Fault::CorruptReferencedBlob => {
+                let blob_path = blob_file_paths(&path)
+                    .into_iter()
+                    .next()
+                    .expect("referenced blob exists");
+                let mut bytes = fs::read(&blob_path).expect("read referenced blob");
+                bytes[8] ^= 0xff;
+                fs::write(blob_path, bytes).expect("write corrupt referenced blob");
+            }
+            Fault::UnreferencedFormalBlob => {
+                write_file(&blob::blob_path(&path, 999), b"unreferenced blob bytes");
+            }
+        }
+
+        assert!(
+            Db::open(options).is_err(),
+            "recovery fault {fault:?} should fail closed"
+        );
+        fs::remove_dir_all(path).expect("cleanup test db");
+    }
 }
 
 #[test]
@@ -2138,6 +2215,110 @@ fn persistent_blob_values_survive_flush_reopen_and_compaction() {
             Some(b"small".to_vec())
         );
         assert_eq!(bucket.get(b"c").expect("blob c reopens"), Some(large_c));
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_blob_level_merge_rewrites_retained_blob_indexes() {
+    let path = temp_db_path("blob-level-merge");
+    let mut options = DbOptions::persistent(&path);
+    options.blob_gc_enabled = false;
+    options.default_bucket_options = BucketOptions {
+        blob_threshold_bytes: 8,
+        blob_level_merge_enabled: true,
+        ..BucketOptions::default()
+    };
+    let old_b = b"large-value-b-old-large-value-b-old".to_vec();
+    let new_a = b"large-value-a-new-large-value-a-new".to_vec();
+
+    {
+        let db = Db::open(options.clone()).expect("persistent db opens");
+        let bucket = db.default_bucket().expect("bucket opens");
+
+        bucket
+            .put(b"a", b"large-value-a-old-large-value-a-old".to_vec())
+            .expect("write old a");
+        bucket.put(b"b", old_b.clone()).expect("write old b");
+        db.flush().expect("flush shared old blob file");
+        bucket.put(b"a", new_a.clone()).expect("write new a");
+        db.flush().expect("flush new a blob file");
+        assert_eq!(blob_file_paths(&path).len(), 2);
+
+        db.compact_range(KeyRange::all())
+            .expect("level merge compaction rewrites retained blob refs");
+
+        assert_eq!(bucket.get(b"a").expect("new a reads"), Some(new_a.clone()));
+        assert_eq!(bucket.get(b"b").expect("old b reads"), Some(old_b.clone()));
+        assert_eq!(
+            blob_file_paths(&path).len(),
+            1,
+            "Level Merge should rewrite retained large values into the output blob file"
+        );
+        let stats = db.stats();
+        assert_eq!(stats.live_blob_files, 1);
+        assert_eq!(
+            stats.live_blob_bytes,
+            new_a.len().saturating_add(old_b.len()) as u64
+        );
+    }
+
+    fs::remove_file(wal::wal_path(&path)).expect("remove WAL after level merge");
+
+    {
+        let db = Db::open(options).expect("persistent db reopens after level merge");
+        let bucket = db.default_bucket().expect("bucket reopens");
+        assert_eq!(bucket.get(b"a").expect("new a reopens"), Some(new_a));
+        assert_eq!(bucket.get(b"b").expect("old b reopens"), Some(old_b));
+        assert_eq!(blob_file_paths(&path).len(), 1);
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_value_lazy_iterator_defers_blob_reads_until_value_access() {
+    let path = temp_db_path("value-lazy-iterator");
+    let mut options = DbOptions::persistent(&path);
+    options.default_bucket_options = BucketOptions {
+        blob_threshold_bytes: 8,
+        ..BucketOptions::default()
+    };
+    let large_value = b"large-value-a-large-value-a".to_vec();
+
+    {
+        let db = Db::open(options).expect("persistent db opens");
+        let bucket = db.default_bucket().expect("bucket opens");
+        bucket
+            .put(b"a", large_value.clone())
+            .expect("write large value");
+        db.flush().expect("flush blob-backed table");
+
+        let mut iter = bucket
+            .range_lazy(&KeyRange::all())
+            .expect("value-lazy range opens");
+        assert_eq!(db.stats().blob_read_count, 0);
+
+        let row = iter
+            .next()
+            .expect("first row exists")
+            .expect("first lazy row reads");
+        assert_eq!(row.key, b"a".to_vec());
+        assert!(!row.value.is_inline());
+        assert_eq!(
+            db.stats().blob_read_count,
+            0,
+            "reading only the key should not load blob bytes"
+        );
+
+        assert_eq!(row.value.read().expect("lazy value reads"), large_value);
+        let stats = db.stats();
+        assert_eq!(stats.blob_read_count, 1);
+        assert_eq!(
+            stats.blob_read_bytes,
+            b"large-value-a-large-value-a".len() as u64
+        );
     }
 
     fs::remove_dir_all(path).expect("cleanup test db");

@@ -531,6 +531,7 @@ mod tests {
             prefix_extractor: PrefixExtractor::Disabled,
             prefix_filter_policy: PrefixFilterPolicy::Disabled,
             blob_threshold_bytes: usize::MAX,
+            rewrite_blob_indexes: false,
         }
     }
 
@@ -542,6 +543,7 @@ mod tests {
             prefix_extractor: PrefixExtractor::Disabled,
             prefix_filter_policy: PrefixFilterPolicy::Disabled,
             blob_threshold_bytes: usize::MAX,
+            rewrite_blob_indexes: false,
         }
     }
 }

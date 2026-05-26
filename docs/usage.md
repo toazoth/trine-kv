@@ -316,10 +316,25 @@ let db = Db::open(
     DbOptions::persistent("./trine-data").with_default_bucket_options(
         BucketOptions {
             blob_threshold_bytes: 64 * 1024,
+            blob_level_merge_enabled: true,
             ..BucketOptions::default()
         },
     ),
 )?;
+```
+
+When range or prefix scans mostly need keys first, use the value-lazy iterator
+variants. They keep the same MVCC and range-delete semantics, but blob bytes
+are read only when you call `LazyValue::read` or convert the row into a full
+`KeyValue`:
+
+```rust
+for row in db.range_lazy(&trine_kv::KeyRange::all())? {
+    let row = row?;
+    println!("key={:?}", row.key);
+    let value = row.value.read()?;
+    println!("value bytes={}", value.len());
+}
 ```
 
 Blob GC is enabled for persistent databases by default. It runs from the
