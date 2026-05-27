@@ -74,6 +74,36 @@ impl LsmVersion {
         tables
     }
 
+    pub(crate) fn for_each_point_lookup_table(
+        &self,
+        key: &[u8],
+        mut should_probe: impl FnMut(&Table) -> bool,
+        mut visit: impl FnMut(&Table) -> Result<()>,
+    ) -> Result<()> {
+        for level in &self.levels {
+            if level.level == TableLevel::ZERO {
+                for table in &level.tables {
+                    if !should_probe(table) {
+                        continue;
+                    }
+                    table.record_point_table_probe();
+                    if table.may_contain_key(key) {
+                        visit(table)?;
+                    }
+                }
+            } else if let Some(table) = level.table_for_key(key) {
+                if !should_probe(table) {
+                    continue;
+                }
+                table.record_point_table_probe();
+                if table.may_contain_key(key) {
+                    visit(table)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub(crate) fn range_tombstone_tables_for_key(&self, key: &[u8]) -> Vec<Arc<Table>> {
         let mut tables = Vec::new();
@@ -83,11 +113,14 @@ impl LsmVersion {
                     level
                         .tables
                         .iter()
-                        .filter(|table| table.key_bounds_may_contain_key(key))
+                        .filter(|table| {
+                            table.may_have_range_tombstones()
+                                && table.key_bounds_may_contain_key(key)
+                        })
                         .cloned(),
                 );
             } else if let Some(table) = level.table_for_key(key) {
-                if table.key_bounds_may_contain_key(key) {
+                if table.may_have_range_tombstones() && table.key_bounds_may_contain_key(key) {
                     tables.push(Arc::clone(table));
                 }
             }
@@ -109,6 +142,14 @@ impl LsmVersion {
             .iter()
             .find(|level| level.level == TableLevel::ZERO)
             .map_or(0, LevelState::table_count)
+    }
+
+    #[must_use]
+    pub(crate) fn l0_has_overlapping_tables(&self) -> bool {
+        self.levels
+            .iter()
+            .find(|level| level.level == TableLevel::ZERO)
+            .is_some_and(LevelState::has_overlapping_tables)
     }
 
     pub(crate) fn with_added_l0_table(&self, table: Arc<Table>) -> Result<Self> {
@@ -193,6 +234,17 @@ impl LevelState {
             .cloned()
             .collect()
     }
+
+    fn has_overlapping_tables(&self) -> bool {
+        for (index, left) in self.tables.iter().enumerate() {
+            for right in &self.tables[index + 1..] {
+                if table_key_bounds_overlap(left, right) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
 }
 
 fn compare_l0_tables_for_reads(left: &Arc<Table>, right: &Arc<Table>) -> Ordering {
@@ -272,6 +324,17 @@ fn validate_table_key_bounds(table: &Arc<Table>) -> Result<()> {
 
 fn table_has_key_bounds(table: &Arc<Table>) -> bool {
     table.has_key_bounds()
+}
+
+fn table_key_bounds_overlap(left: &Arc<Table>, right: &Arc<Table>) -> bool {
+    if !table_has_key_bounds(left) || !table_has_key_bounds(right) {
+        return true;
+    }
+
+    let left = left.properties();
+    let right = right.properties();
+    left.smallest_user_key <= right.largest_user_key
+        && right.smallest_user_key <= left.largest_user_key
 }
 
 #[cfg(test)]
@@ -380,12 +443,26 @@ mod tests {
     }
 
     #[test]
+    fn l0_overlap_pressure_uses_key_bounds() {
+        let l0_left = Arc::new(test_table(37, TableLevel::ZERO, b"a", 10));
+        let l0_right = Arc::new(test_table(38, TableLevel::ZERO, b"z", 11));
+        let disjoint = LsmVersion::new(vec![Arc::clone(&l0_left), Arc::clone(&l0_right)])
+            .expect("disjoint L0 is valid");
+        assert!(!disjoint.l0_has_overlapping_tables());
+
+        let l0_newer_left = Arc::new(test_table(39, TableLevel::ZERO, b"a", 12));
+        let overlapping = LsmVersion::new(vec![l0_left, l0_right, l0_newer_left])
+            .expect("overlapping L0 is valid");
+        assert!(overlapping.l0_has_overlapping_tables());
+    }
+
+    #[test]
     fn range_scan_tables_skip_unrelated_non_overlapping_tables() {
-        let l0_hit = Arc::new(test_table(37, TableLevel::ZERO, b"c", 10));
-        let l0_miss = Arc::new(test_table(38, TableLevel::ZERO, b"z", 10));
-        let l1_left = Arc::new(test_table(39, TableLevel(1), b"a", 5));
-        let l1_hit = Arc::new(test_table(40, TableLevel(1), b"c", 5));
-        let l1_right = Arc::new(test_table(41, TableLevel(1), b"z", 5));
+        let l0_hit = Arc::new(test_table(40, TableLevel::ZERO, b"c", 10));
+        let l0_miss = Arc::new(test_table(41, TableLevel::ZERO, b"z", 10));
+        let l1_left = Arc::new(test_table(42, TableLevel(1), b"a", 5));
+        let l1_hit = Arc::new(test_table(43, TableLevel(1), b"c", 5));
+        let l1_right = Arc::new(test_table(44, TableLevel(1), b"z", 5));
         let version = LsmVersion::new(vec![
             Arc::clone(&l0_hit),
             Arc::clone(&l0_miss),
@@ -403,7 +480,7 @@ mod tests {
     #[test]
     fn range_tombstone_lookup_uses_key_bounds_without_table_filter() {
         let tombstone_table = Arc::new(test_table_with_tombstone(
-            43,
+            45,
             TableLevel(2),
             b"a",
             KeyRange::half_open(b"a", b"z"),
@@ -423,9 +500,9 @@ mod tests {
 
     #[test]
     fn replace_tables_installs_outputs_and_removes_inputs() {
-        let old_l0 = Arc::new(test_table(40, TableLevel::ZERO, b"a", 10));
-        let old_l1 = Arc::new(test_table(41, TableLevel(1), b"z", 10));
-        let output = Arc::new(test_table(42, TableLevel(1), b"a", 20));
+        let old_l0 = Arc::new(test_table(46, TableLevel::ZERO, b"a", 10));
+        let old_l1 = Arc::new(test_table(47, TableLevel(1), b"z", 10));
+        let output = Arc::new(test_table(48, TableLevel(1), b"a", 20));
         let version =
             LsmVersion::new(vec![Arc::clone(&old_l0), Arc::clone(&old_l1)]).expect("valid version");
 

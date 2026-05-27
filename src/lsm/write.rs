@@ -96,16 +96,12 @@ impl LsmTree {
         Ok(bytes)
     }
 
-    pub(crate) fn immutable_memtable_count(&self) -> Result<usize> {
-        self.immutable_memtables
-            .read()
-            .map_err(|_| lock_poisoned("immutable memtable queue"))
-            .map(|immutable_memtables| immutable_memtables.len())
+    pub(crate) fn immutable_memtable_count(&self) -> usize {
+        self.immutable_memtable_count.load(Ordering::Acquire)
     }
 
-    pub(crate) fn has_immutable_memtables(&self) -> Result<bool> {
-        self.immutable_memtable_count()
-            .map(|immutable_memtables| immutable_memtables != 0)
+    pub(crate) fn has_immutable_memtables(&self) -> bool {
+        self.has_immutable_memtable_fast()
     }
 
     pub(crate) fn has_immutable_memtables_at_or_below(
@@ -155,6 +151,8 @@ impl LsmTree {
             .write()
             .map_err(|_| lock_poisoned("immutable memtable queue"))?
             .push(immutable);
+        self.immutable_memtable_count
+            .fetch_add(1, Ordering::Release);
 
         *active_memtable = Arc::new(Memtable::default());
         range_tombstones.clear();

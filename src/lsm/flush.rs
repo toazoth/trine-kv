@@ -97,6 +97,8 @@ impl LsmTree {
             });
         };
         immutable_memtables.remove(position);
+        self.immutable_memtable_count
+            .fetch_sub(1, std::sync::atomic::Ordering::Release);
 
         Ok(())
     }

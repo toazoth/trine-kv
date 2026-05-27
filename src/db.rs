@@ -13,19 +13,21 @@ use std::{
 
 use crate::{
     blob::{self, ValueRef},
-    bucket::{Bucket, BucketName, DEFAULT_BUCKET_NAME},
+    bucket::{Bucket, BucketName, BucketReader, DEFAULT_BUCKET_NAME},
     cache, compaction, durability,
     error::{Error, Result},
     iterator::{Direction, Iter, LazyIter, ScanSelector},
     lsm::{
         CompactionInput as LsmCompactionInput, CompactionOutput as LsmCompactionOutput,
-        CompactionTablePayload as LsmCompactionTablePayload, FlushInput as LsmFlushInput, LsmTree,
+        CompactionTablePayload as LsmCompactionTablePayload, FlushInput as LsmFlushInput,
+        LsmPointReadSnapshot, LsmTree,
     },
     manifest::{self, ManifestState, ManifestStore},
     options::{
         BlobLevelMergePolicy, BucketOptions, DbOptions, DurabilityMode, FailOnCorruptionPolicy,
         FilterPolicy, PrefixFilterPolicy, StorageMode, WriteOptions,
     },
+    point_value::PointValue,
     recovery,
     snapshot::{Snapshot, SnapshotTracker},
     stats::{BlobReadMetrics, DbStats, LevelStats},
@@ -671,15 +673,13 @@ impl Db {
     /// Direct helpers such as `Db::put` and `Db::get` use this bucket without
     /// requiring callers to open it explicitly.
     pub fn default_bucket(&self) -> Result<Bucket> {
-        let options = self
-            .existing_bucket_options(DEFAULT_BUCKET_NAME)?
-            .ok_or_else(|| Error::BucketMissing {
-                name: DEFAULT_BUCKET_NAME.to_owned(),
-            })?;
+        let state = self.bucket_state(DEFAULT_BUCKET_NAME)?;
+        let options = state.options.clone();
         Ok(Bucket::new(
             self.clone(),
             BucketName::new(DEFAULT_BUCKET_NAME),
             options,
+            state,
         ))
     }
 
@@ -717,13 +717,19 @@ impl Db {
 
         validate_bucket_options(&options)?;
 
-        if let Some(existing_options) = self.existing_bucket_options(name.as_str())? {
+        if let Some(existing_state) = self.bucket_state_if_exists(name.as_str())? {
+            let existing_options = existing_state.options.clone();
             if existing_options != options {
                 return Err(Error::invalid_options(
                     "existing bucket options do not match requested options",
                 ));
             }
-            return Ok(Bucket::new(self.clone(), name, existing_options));
+            return Ok(Bucket::new(
+                self.clone(),
+                name,
+                existing_options,
+                existing_state,
+            ));
         }
 
         if self.inner.options.read_only {
@@ -732,7 +738,7 @@ impl Db {
 
         self.persist_bucket_creation(name.as_str(), &options)?;
 
-        let bucket_options = {
+        let (bucket_options, state) = {
             let mut buckets = self
                 .inner
                 .buckets
@@ -745,18 +751,16 @@ impl Db {
                         "existing bucket options do not match requested options",
                     ));
                 }
-                state.options.clone()
+                (state.options.clone(), Arc::clone(state))
             } else {
                 let bucket_options = options.clone();
-                buckets.insert(
-                    name.as_str().to_owned(),
-                    Arc::new(LsmTree::new(options, Vec::new())?),
-                );
-                bucket_options
+                let state = Arc::new(LsmTree::new(options, Vec::new())?);
+                buckets.insert(name.as_str().to_owned(), Arc::clone(&state));
+                (bucket_options, state)
             }
         };
 
-        Ok(Bucket::new(self.clone(), name, bucket_options))
+        Ok(Bucket::new(self.clone(), name, bucket_options, state))
     }
 
     /// Reads the newest committed value for `key` from the default bucket.
@@ -1061,7 +1065,10 @@ impl Db {
             self.inner.maintenance.wait_until_flush_idle();
         }
 
-        if should_compact || self.l0_pressure_exceeded()? {
+        if should_compact
+            || self.l0_pressure_exceeded()?
+            || self.foreground_l0_overlap_pressure_exceeded()?
+        {
             self.run_compaction_barrier(&db_path, &KeyRange::all(), true)?;
         }
         self.cleanup_pending_obsolete_table_files(&db_path)?;
@@ -1142,11 +1149,9 @@ impl Db {
             if let Ok(memtable_bytes) = state.memtable_bytes() {
                 stats.memtable_bytes = stats.memtable_bytes.saturating_add(memtable_bytes);
             }
-            if let Ok(immutable_memtables) = state.immutable_memtable_count() {
-                stats.immutable_memtables = stats
-                    .immutable_memtables
-                    .saturating_add(immutable_memtables);
-            }
+            stats.immutable_memtables = stats
+                .immutable_memtables
+                .saturating_add(state.immutable_memtable_count());
             let Ok(version) = state.current_version() else {
                 continue;
             };
@@ -1352,6 +1357,17 @@ impl Db {
         read_sequence: Sequence,
         read_pin_held: bool,
     ) -> Result<Option<Vec<u8>>> {
+        let state = self.bucket_state(bucket)?;
+        self.get_at_state_with_pin_state(&state, key, read_sequence, read_pin_held)
+    }
+
+    pub(crate) fn get_at_state_with_pin_state(
+        &self,
+        state: &LsmTree,
+        key: &[u8],
+        read_sequence: Sequence,
+        read_pin_held: bool,
+    ) -> Result<Option<Vec<u8>>> {
         self.ensure_open()?;
         let _read_pin = if read_pin_held {
             None
@@ -1359,7 +1375,6 @@ impl Db {
             Some(self.inner.snapshots.pinned_snapshot(read_sequence))
         };
 
-        let state = self.bucket_state(bucket)?;
         state.read_visible_point(
             key,
             read_sequence,
@@ -1367,6 +1382,50 @@ impl Db {
             Some(self.inner.block_cache.as_ref()),
             Some(self.inner.blob_reads.as_ref()),
         )
+    }
+
+    pub(crate) fn get_value_at_state_snapshot_with_pin_state(
+        &self,
+        state: &LsmTree,
+        read_snapshot: &LsmPointReadSnapshot,
+        key: &[u8],
+        read_sequence: Sequence,
+        read_pin_held: bool,
+    ) -> Result<Option<PointValue>> {
+        self.ensure_open()?;
+        let _read_pin = if read_pin_held {
+            None
+        } else {
+            Some(self.inner.snapshots.pinned_snapshot(read_sequence))
+        };
+
+        state.read_visible_point_value_in_snapshot(
+            read_snapshot,
+            key,
+            read_sequence,
+            self.persistent_path(),
+            Some(self.inner.block_cache.as_ref()),
+            Some(self.inner.blob_reads.as_ref()),
+        )
+    }
+
+    pub(crate) fn reader_for_state<'snapshot>(
+        &self,
+        state: &Arc<LsmTree>,
+        snapshot: &'snapshot Snapshot,
+    ) -> Result<BucketReader<'snapshot>> {
+        self.ensure_open()?;
+        let read_sequence = snapshot.read_sequence();
+        let read_pin =
+            (!snapshot.is_pinned()).then(|| self.inner.snapshots.pinned_snapshot(read_sequence));
+        let read_snapshot = state.point_read_snapshot()?;
+        Ok(BucketReader::new(
+            self.clone(),
+            Arc::clone(state),
+            read_snapshot,
+            read_sequence,
+            read_pin,
+        ))
     }
 
     pub(crate) fn range_at_sequence(
@@ -1474,28 +1533,20 @@ impl Db {
     }
 
     fn bucket_state(&self, bucket: &str) -> Result<Arc<LsmTree>> {
-        let buckets = self
-            .inner
-            .buckets
-            .read()
-            .map_err(|_| lock_poisoned("bucket registry"))?;
-
-        buckets
-            .get(bucket)
-            .cloned()
+        self.bucket_state_if_exists(bucket)?
             .ok_or_else(|| Error::BucketMissing {
                 name: bucket.to_owned(),
             })
     }
 
-    fn existing_bucket_options(&self, bucket: &str) -> Result<Option<BucketOptions>> {
+    fn bucket_state_if_exists(&self, bucket: &str) -> Result<Option<Arc<LsmTree>>> {
         let buckets = self
             .inner
             .buckets
             .read()
             .map_err(|_| lock_poisoned("bucket registry"))?;
 
-        Ok(buckets.get(bucket).map(|state| state.options.clone()))
+        Ok(buckets.get(bucket).cloned())
     }
 
     fn persistent_path(&self) -> Option<&Path> {
@@ -1579,7 +1630,7 @@ impl Db {
         let mut pressure = WritePressure::default();
 
         for state in buckets.values() {
-            if state.immutable_memtable_count()? >= self.inner.options.max_immutable_memtables {
+            if state.immutable_memtable_count() >= self.inner.options.max_immutable_memtables {
                 pressure.flush = true;
             }
             if state.l0_table_count()? > self.inner.options.max_l0_files {
@@ -1671,7 +1722,7 @@ impl Db {
             .map_err(|_| lock_poisoned("bucket registry"))?;
 
         for state in buckets.values() {
-            if state.has_immutable_memtables()? {
+            if state.has_immutable_memtables() {
                 return Ok(true);
             }
         }
@@ -1776,7 +1827,7 @@ impl Db {
         let mut inputs = Vec::new();
 
         for (name, state) in buckets.iter() {
-            if state.immutable_memtable_count()? < max_immutable_memtables {
+            if state.immutable_memtable_count() < max_immutable_memtables {
                 continue;
             }
             for input in state.prepare_flush_inputs(&mut next_table_id)? {
@@ -2485,6 +2536,30 @@ impl Db {
 
         for state in buckets.values() {
             if state.l0_table_count()? > self.inner.options.max_l0_files {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    fn foreground_l0_overlap_pressure_exceeded(&self) -> Result<bool> {
+        if self.background_workers_enabled() {
+            return Ok(false);
+        }
+
+        let buckets = self
+            .inner
+            .buckets
+            .read()
+            .map_err(|_| lock_poisoned("bucket registry"))?;
+
+        for state in buckets.values() {
+            // Overlapping L0 files force point reads to test newer misses before
+            // reaching older hits. When background workers are disabled, public
+            // flush is also the foreground maintenance boundary, so close that
+            // overlap before read-heavy work starts.
+            if state.l0_has_overlapping_tables()? {
                 return Ok(true);
             }
         }

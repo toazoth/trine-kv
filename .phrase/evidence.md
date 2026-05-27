@@ -4107,3 +4107,178 @@ Record only evidence that can change planning or durable decisions.
 ### Recommended Next Action
 
 - Commit Phase 43, then use remote CI as the external release signal.
+
+## 2026-05-27: Point-Read Source Diagnosis
+
+### Observation
+
+- Stable threaded reads with background workers disabled still showed a
+  4-thread to 32-thread plateau after smaller hot-path fixes.
+- `BucketReader::get_value` now returns `PointValue`, so inline SSTable values
+  can be read from decoded block bytes without allocating an owned `Vec<u8>`
+  for the benchmark result.
+- The Azoth benchmark adapter now uses `BucketReader::get_value`.
+- Benchmark after the value-handle path: random reads were about 3989ms,
+  3416ms, 4203ms, and 4191ms for 4, 8, 16, and 32 threads.
+- An experiment that pinned decoded L0 data blocks with per-block `OnceLock`
+  removed global block-cache hits and improved 4/8-thread reads to about
+  3081ms/3083ms, but regressed 16/32-thread reads to about 5473ms/5387ms.
+  That experiment was rejected and not kept.
+
+### Interpretation
+
+- Returning owned values was a real API problem, but it is not the dominant
+  cause of the 16/32-thread plateau.
+- Unbounded table-local decoded block pinning is not an acceptable replacement
+  for the global cache.
+- The next source-level blocker is the shared block-cache hit path plus L0
+  read amplification under CPU oversubscription.
+
+### Verification
+
+- `cargo check --manifest-path /Users/poria/Developer/Work/Azoth/trine-kv/Cargo.toml`
+- `cargo check --manifest-path benchmark-crates/azoth-kv-bench/Cargo.toml --benches`
+- `cargo clippy --manifest-path /Users/poria/Developer/Work/Azoth/trine-kv/Cargo.toml --all-targets -- -D warnings`
+- `cargo test --manifest-path /Users/poria/Developer/Work/Azoth/trine-kv/Cargo.toml`
+- `env BENCH_DIAGNOSTICS=1 TRINE_BENCH_BACKGROUND_WORKERS=0 BENCH_ONLY=threaded-reads cargo bench --manifest-path benchmark-crates/azoth-kv-bench/Cargo.toml --bench trine_benchmark`
+
+### Remaining Blockers
+
+- Need a bounded block-cache design with cheaper concurrent hit reads.
+- Need a read-amplification decision for L0-heavy states: compact before
+  read-heavy workloads, or make overlapping L0 lookup cheaper.
+
+### Recommended Next Action
+
+- Design the block cache replacement as a bounded shared read structure before
+  implementation. Avoid more edge tuning until the cache hit path has a clear
+  concurrency model and benchmark gate.
+
+## 2026-05-27: Block-Cache Hit Path Contention
+
+### Observation
+
+- The kept block-cache change uses per-thread counter shards for cache hits and
+  misses, with each counter shard aligned to avoid false sharing.
+- Cache hit recency remains best effort: readers update queue order only when
+  the shard write lock is immediately available.
+- The block-cache shard count was calibrated with the Azoth threaded-read
+  workload. `128` shards gave the best balanced result after the counter fix.
+- Final kept benchmark with background workers disabled:
+  3694ms, 3348ms, 4139ms, and 4169ms for 4, 8, 16, and 32 threads.
+- Previous value-handle baseline was about 3989ms, 3416ms, 4203ms, and 4191ms.
+- A second-chance/CLOCK-style recent bit improved 4/8 threads but regressed
+  16/32 threads, so it was rejected.
+- Larger cache shard counts helped 4/8 threads but regressed 16/32 threads:
+  `256` measured about 3524ms, 3212ms, 4288ms, and 4202ms; `512` was worse at
+  high thread counts.
+
+### Interpretation
+
+- One global cache hit counter was real shared-state contention in point reads.
+- Updating a per-entry recent bit on every hit is still too expensive for this
+  workload; the non-blocking queue update is the better current shape.
+- Block-cache sharing is improved but not the remaining dominant source.
+- Diagnostics still show two L0 tables and about 10.15M table probes for about
+  5.15M data-block reads, so overlapping L0 lookup is now the next source
+  problem.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo test cache`
+- `cargo clippy --all-targets -- -D warnings`
+- `cargo test`
+- `cargo check --manifest-path benchmark-crates/azoth-kv-bench/Cargo.toml --benches`
+- `env BENCH_DIAGNOSTICS=1 TRINE_BENCH_BACKGROUND_WORKERS=0 BENCH_ONLY=threaded-reads cargo bench --manifest-path benchmark-crates/azoth-kv-bench/Cargo.toml --bench trine_benchmark`
+
+### Remaining Blockers
+
+- L0 overlap still doubles point-read table probes in the measured state. This
+  is addressed by the following evidence entry.
+
+### Recommended Next Action
+
+- Keep the cache counter/shard fix.
+- Next, solve the L0 overlap source problem without adding unbounded decoded
+  block pinning or changing MVCC/recovery semantics.
+
+## 2026-05-27: Overlapping L0 Read Amplification
+
+### Observation
+
+- The benchmark state had two overlapping L0 tables. The newer L0 table missed
+  most random point reads by table filter, then the older table served the hit.
+- Before the L0 overlap fix, diagnostics showed about 10.15M table probes for
+  about 5.15M data-block reads.
+- L0 pressure now triggers at foreground `flush()` when background workers are
+  disabled and L0 table key spans overlap, even if the raw L0 file count is
+  below `max_l0_files`.
+- Disjoint L0 tables below the file-count limit are not treated as overlap
+  pressure.
+- Final threaded-read benchmark with background workers disabled:
+  3494ms, 2416ms, 1996ms, and 2019ms for 4, 8, 16, and 32 threads.
+- Final diagnostics show `l0=0`, `levels=L1:16`, and table probes matching
+  data-block reads instead of doubling them.
+
+### Interpretation
+
+- The main source of the read explosion was overlapping L0 read amplification,
+  not returned-value allocation or decoded-block ownership alone.
+- Earlier local compaction of overlapping L0 files is the right source fix for
+  this measured state.
+- This preserves MVCC, WAL, recovery, and table format semantics; it only
+  changes when maintenance is requested.
+
+### Verification
+
+- `cargo test l0_overlap_pressure_uses_key_bounds`
+- `cargo test persistent_flush_auto_compacts_overlapping_l0_below_file_limit`
+- `cargo fmt --check`
+- `cargo clippy --all-targets -- -D warnings`
+- `cargo test`
+- `env BENCH_DIAGNOSTICS=1 TRINE_BENCH_BACKGROUND_WORKERS=0 BENCH_ONLY=threaded-reads cargo bench --manifest-path benchmark-crates/azoth-kv-bench/Cargo.toml --bench trine_benchmark`
+
+### Remaining Blockers
+
+- The broad benchmark suite should be run to check the write/read tradeoff.
+
+### Recommended Next Action
+
+- Keep overlapping-L0 compaction pressure.
+- Run the broad benchmark suite before making broader tuning decisions.
+
+## 2026-05-27: Point-Reader Source Snapshot Review
+
+### Observation
+
+- Pre-commit review found that pinning only an `LsmVersion` in `BucketReader`
+  was not enough. If a reader was created while a committed value lived in the
+  active memtable, a later flush could remove that memtable source and publish
+  the value into a newer table version not held by the reader.
+
+### Interpretation
+
+- A repeated point-read handle must keep the memtable sources and table version
+  together. It is acceptable for the snapshot to see a record twice during a
+  flush race, because MVCC ordering chooses the newest visible candidate, but it
+  must never miss a committed source.
+
+### Verification
+
+- `cargo test --test persistent_wal persistent_bucket_reader_keeps_memtable_source_after_flush --all-features`
+- `cargo test --all-targets --all-features`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo fmt --all --check`
+- `git diff --check`
+- forbidden-term scan over `.phrase`, `src`, `tests`, `benches`, `examples`,
+  `docs`, `README.md`, `CHANGELOG.md`, and `Cargo.toml`
+
+### Remaining Blockers
+
+- Remote CI still has to run after push.
+
+### Recommended Next Action
+
+- Commit the point-read source fix and use remote CI as the external release
+  signal.

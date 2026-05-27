@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -23,6 +23,7 @@ use crate::{
         prefix_successor, sort_group_records,
     },
     options::{FilterPolicy, IndexSearchPolicy, PrefixFilterPolicy},
+    point_value::PointValueSource,
     prefix::PrefixExtractor,
     range_tombstone::{self, RangeTombstoneIndex, RangeTombstoneLike},
     search,
@@ -64,6 +65,14 @@ const PREFIX_EXTRACTOR_DISABLED: u8 = 0;
 const PREFIX_EXTRACTOR_FIXED_LEN: u8 = 1;
 const PREFIX_EXTRACTOR_SEPARATOR: u8 = 2;
 const PREFIX_EXTRACTOR_CUSTOM: u8 = 3;
+const TABLE_STAT_SHARDS: usize = 32;
+
+static NEXT_TABLE_STAT_SHARD: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    static TABLE_STAT_SHARD: usize =
+        NEXT_TABLE_STAT_SHARD.fetch_add(1, Ordering::Relaxed) % TABLE_STAT_SHARDS;
+}
 
 // These are on-disk lower bounds. Decoders use them to reject impossible
 // record counts before reserving memory; real entries may be larger because
@@ -174,6 +183,12 @@ pub(crate) struct TableWriteOptions {
 pub(crate) struct TablePointRecord {
     pub(crate) internal_key: InternalKey,
     pub(crate) value: Option<ValueRef>,
+}
+
+#[derive(Debug)]
+pub(crate) struct TablePointValueRecord {
+    pub(crate) internal_key: InternalKey,
+    pub(crate) value: Option<PointValueSource>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -291,6 +306,34 @@ impl DecodedDataBlock {
 
     fn record_owned(&self, index: usize) -> Result<TablePointRecord> {
         self.record_view(index).map(DataBlockRecordView::to_owned)
+    }
+
+    fn point_value_record(&self, index: usize) -> Result<TablePointValueRecord> {
+        let header = self
+            .record_headers
+            .get(index)
+            .ok_or_else(|| invalid_table("record index outside data block"))?;
+        let record = header.view(&self.bytes)?;
+        let value = match header.value {
+            Some(ValueRefHeader::Inline { offset, len }) => Some(PointValueSource::from_shared(
+                Arc::clone(&self.bytes),
+                inline_value_range(offset, len, self.bytes.len())?,
+            )?),
+            Some(value) => Some(PointValueSource::from_value_ref(
+                value.view(&self.bytes)?.to_owned(),
+            )),
+            None => None,
+        };
+
+        Ok(TablePointValueRecord {
+            internal_key: InternalKey::new(
+                record.user_key.to_vec(),
+                record.sequence,
+                record.kind,
+                record.batch_index,
+            ),
+            value,
+        })
     }
 
     fn records_owned(&self) -> Result<Vec<TablePointRecord>> {
@@ -462,6 +505,17 @@ impl ValueRefHeader {
     }
 }
 
+fn inline_value_range(offset: u32, len: u32, block_len: usize) -> Result<Range<usize>> {
+    let start = u32_to_usize(offset);
+    let end = start
+        .checked_add(u32_to_usize(len))
+        .ok_or_else(|| invalid_table("inline value length overflows"))?;
+    if end > block_len {
+        return Err(invalid_table("inline value points outside data block"));
+    }
+    Ok(start..end)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct DataBlockRecordView<'block> {
     user_key: &'block [u8],
@@ -517,8 +571,29 @@ impl ValueRefView<'_> {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct TableFilterStats {
+    shards: Box<[TableFilterStatsShard; TABLE_STAT_SHARDS]>,
+}
+
+#[derive(Debug)]
+struct TableReadPathStats {
+    shards: Box<[TableReadPathStatsShard; TABLE_STAT_SHARDS]>,
+}
+
+#[derive(Debug, Default)]
+#[repr(align(64))]
+struct TableReadPathStatsShard {
+    table_probes: AtomicU64,
+    index_partition_probes: AtomicU64,
+    block_metadata_probes: AtomicU64,
+    data_block_reads: AtomicU64,
+    filter_misses: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+#[repr(align(64))]
+struct TableFilterStatsShard {
     table_point_hits: AtomicU64,
     table_point_misses: AtomicU64,
     table_point_false_positives: AtomicU64,
@@ -533,102 +608,180 @@ struct TableFilterStats {
     block_prefix_false_positives: AtomicU64,
 }
 
-#[derive(Debug, Default)]
-struct TableReadPathStats {
-    table_probes: AtomicU64,
-    index_partition_probes: AtomicU64,
-    block_metadata_probes: AtomicU64,
-    data_block_reads: AtomicU64,
-    filter_misses: AtomicU64,
+impl Default for TableReadPathStats {
+    fn default() -> Self {
+        Self {
+            shards: Box::new(std::array::from_fn(|_| TableReadPathStatsShard::default())),
+        }
+    }
+}
+
+impl Default for TableFilterStats {
+    fn default() -> Self {
+        Self {
+            shards: Box::new(std::array::from_fn(|_| TableFilterStatsShard::default())),
+        }
+    }
 }
 
 impl TableReadPathStats {
     fn snapshot(&self) -> ReadPathStats {
-        ReadPathStats {
-            point_table_probes: self.table_probes.load(Ordering::Acquire),
-            point_index_partition_probes: self.index_partition_probes.load(Ordering::Acquire),
-            point_block_metadata_probes: self.block_metadata_probes.load(Ordering::Acquire),
-            point_data_block_reads: self.data_block_reads.load(Ordering::Acquire),
-            point_filter_misses: self.filter_misses.load(Ordering::Acquire),
+        let mut stats = ReadPathStats::default();
+        for shard in self.shards.iter() {
+            stats.point_table_probes = stats
+                .point_table_probes
+                .saturating_add(shard.table_probes.load(Ordering::Acquire));
+            stats.point_index_partition_probes = stats
+                .point_index_partition_probes
+                .saturating_add(shard.index_partition_probes.load(Ordering::Acquire));
+            stats.point_block_metadata_probes = stats
+                .point_block_metadata_probes
+                .saturating_add(shard.block_metadata_probes.load(Ordering::Acquire));
+            stats.point_data_block_reads = stats
+                .point_data_block_reads
+                .saturating_add(shard.data_block_reads.load(Ordering::Acquire));
+            stats.point_filter_misses = stats
+                .point_filter_misses
+                .saturating_add(shard.filter_misses.load(Ordering::Acquire));
         }
+        stats
     }
 
     fn record_point_table_probe(&self) {
-        self.table_probes.fetch_add(1, Ordering::AcqRel);
+        self.shard().table_probes.fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_point_index_partition_probe(&self) {
-        self.index_partition_probes.fetch_add(1, Ordering::AcqRel);
+        self.shard()
+            .index_partition_probes
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_point_block_metadata_probe(&self) {
-        self.block_metadata_probes.fetch_add(1, Ordering::AcqRel);
+        self.shard()
+            .block_metadata_probes
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_point_data_block_read(&self) {
-        self.data_block_reads.fetch_add(1, Ordering::AcqRel);
+        self.shard()
+            .data_block_reads
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_point_filter_miss(&self) {
-        self.filter_misses.fetch_add(1, Ordering::AcqRel);
+        self.shard().filter_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn shard(&self) -> &TableReadPathStatsShard {
+        &self.shards[table_stat_shard_index()]
     }
 }
 
 impl TableFilterStats {
     fn snapshot(&self) -> FilterStats {
-        FilterStats {
-            table_point_hits: self.table_point_hits.load(Ordering::Acquire),
-            table_point_misses: self.table_point_misses.load(Ordering::Acquire),
-            table_point_false_positives: self.table_point_false_positives.load(Ordering::Acquire),
-            table_prefix_hits: self.table_prefix_hits.load(Ordering::Acquire),
-            table_prefix_misses: self.table_prefix_misses.load(Ordering::Acquire),
-            table_prefix_false_positives: self.table_prefix_false_positives.load(Ordering::Acquire),
-            block_point_hits: self.block_point_hits.load(Ordering::Acquire),
-            block_point_misses: self.block_point_misses.load(Ordering::Acquire),
-            block_point_false_positives: self.block_point_false_positives.load(Ordering::Acquire),
-            block_prefix_hits: self.block_prefix_hits.load(Ordering::Acquire),
-            block_prefix_misses: self.block_prefix_misses.load(Ordering::Acquire),
-            block_prefix_false_positives: self.block_prefix_false_positives.load(Ordering::Acquire),
+        let mut stats = FilterStats::default();
+        for shard in self.shards.iter() {
+            stats.table_point_hits = stats
+                .table_point_hits
+                .saturating_add(shard.table_point_hits.load(Ordering::Acquire));
+            stats.table_point_misses = stats
+                .table_point_misses
+                .saturating_add(shard.table_point_misses.load(Ordering::Acquire));
+            stats.table_point_false_positives = stats
+                .table_point_false_positives
+                .saturating_add(shard.table_point_false_positives.load(Ordering::Acquire));
+            stats.table_prefix_hits = stats
+                .table_prefix_hits
+                .saturating_add(shard.table_prefix_hits.load(Ordering::Acquire));
+            stats.table_prefix_misses = stats
+                .table_prefix_misses
+                .saturating_add(shard.table_prefix_misses.load(Ordering::Acquire));
+            stats.table_prefix_false_positives = stats
+                .table_prefix_false_positives
+                .saturating_add(shard.table_prefix_false_positives.load(Ordering::Acquire));
+            stats.block_point_hits = stats
+                .block_point_hits
+                .saturating_add(shard.block_point_hits.load(Ordering::Acquire));
+            stats.block_point_misses = stats
+                .block_point_misses
+                .saturating_add(shard.block_point_misses.load(Ordering::Acquire));
+            stats.block_point_false_positives = stats
+                .block_point_false_positives
+                .saturating_add(shard.block_point_false_positives.load(Ordering::Acquire));
+            stats.block_prefix_hits = stats
+                .block_prefix_hits
+                .saturating_add(shard.block_prefix_hits.load(Ordering::Acquire));
+            stats.block_prefix_misses = stats
+                .block_prefix_misses
+                .saturating_add(shard.block_prefix_misses.load(Ordering::Acquire));
+            stats.block_prefix_false_positives = stats
+                .block_prefix_false_positives
+                .saturating_add(shard.block_prefix_false_positives.load(Ordering::Acquire));
         }
+        stats
     }
 
     fn record_table_point(&self, allowed: bool) {
-        record_filter_result(&self.table_point_hits, &self.table_point_misses, allowed);
+        let shard = self.shard();
+        record_filter_result(&shard.table_point_hits, &shard.table_point_misses, allowed);
     }
 
     fn record_table_prefix(&self, allowed: bool) {
-        record_filter_result(&self.table_prefix_hits, &self.table_prefix_misses, allowed);
+        let shard = self.shard();
+        record_filter_result(
+            &shard.table_prefix_hits,
+            &shard.table_prefix_misses,
+            allowed,
+        );
     }
 
     fn record_block_point(&self, allowed: bool) {
-        record_filter_result(&self.block_point_hits, &self.block_point_misses, allowed);
+        let shard = self.shard();
+        record_filter_result(&shard.block_point_hits, &shard.block_point_misses, allowed);
     }
 
     fn record_block_prefix(&self, allowed: bool) {
-        record_filter_result(&self.block_prefix_hits, &self.block_prefix_misses, allowed);
+        let shard = self.shard();
+        record_filter_result(
+            &shard.block_prefix_hits,
+            &shard.block_prefix_misses,
+            allowed,
+        );
     }
 
     fn record_table_point_false_positive(&self) {
-        self.table_point_false_positives
-            .fetch_add(1, Ordering::AcqRel);
+        self.shard()
+            .table_point_false_positives
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_block_point_false_positive(&self) {
-        self.block_point_false_positives
-            .fetch_add(1, Ordering::AcqRel);
+        self.shard()
+            .block_point_false_positives
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_block_prefix_false_positive(&self) {
-        self.block_prefix_false_positives
-            .fetch_add(1, Ordering::AcqRel);
+        self.shard()
+            .block_prefix_false_positives
+            .fetch_add(1, Ordering::Relaxed);
     }
+
+    fn shard(&self) -> &TableFilterStatsShard {
+        &self.shards[table_stat_shard_index()]
+    }
+}
+
+fn table_stat_shard_index() -> usize {
+    TABLE_STAT_SHARD.with(|index| *index)
 }
 
 fn record_filter_result(hits: &AtomicU64, misses: &AtomicU64, allowed: bool) {
     if allowed {
-        hits.fetch_add(1, Ordering::AcqRel);
+        hits.fetch_add(1, Ordering::Relaxed);
     } else {
-        misses.fetch_add(1, Ordering::AcqRel);
+        misses.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -801,6 +954,7 @@ pub(crate) struct Table {
     index_partitions: Vec<IndexPartitionEntry>,
     index_partition_cache: Arc<RwLock<BTreeMap<usize, Arc<Vec<TableDataBlock>>>>>,
     range_tombstones: Arc<RwLock<Option<Arc<RangeTombstoneIndex<TableRangeTombstone>>>>>,
+    may_have_range_tombstones: bool,
     point_key_filter: Option<PointKeyFilter>,
     prefix_filter: Option<PrefixFilter>,
     filter_stats: Arc<TableFilterStats>,
@@ -843,6 +997,10 @@ impl Table {
         point_batch_index: u32,
         read_sequence: Sequence,
     ) -> Result<bool> {
+        if !self.may_have_range_tombstones {
+            return Ok(false);
+        }
+
         let tombstones = self.range_tombstones()?;
         Ok(tombstones.covering_key(key).any(|tombstone| {
             tombstone.sequence <= read_sequence
@@ -856,12 +1014,20 @@ impl Table {
         &self,
         range: &KeyRange,
     ) -> Result<Vec<TableRangeTombstone>> {
+        if !self.may_have_range_tombstones {
+            return Ok(Vec::new());
+        }
+
         let tombstones = self.range_tombstones()?;
         Ok(tombstones.overlapping_range(range).cloned().collect())
     }
 
     pub(crate) fn blob_file_ids(&self) -> Vec<u64> {
         self.properties.blob_file_ids.clone()
+    }
+
+    pub(crate) const fn may_have_range_tombstones(&self) -> bool {
+        self.may_have_range_tombstones
     }
 
     pub(crate) fn estimated_file_bytes(&self) -> u64 {
@@ -913,6 +1079,7 @@ impl Table {
             index_partitions: self.index_partitions.clone(),
             index_partition_cache: Arc::clone(&self.index_partition_cache),
             range_tombstones: Arc::clone(&self.range_tombstones),
+            may_have_range_tombstones: self.may_have_range_tombstones,
             point_key_filter: self.point_key_filter.clone(),
             prefix_filter: self.prefix_filter.clone(),
             filter_stats: Arc::clone(&self.filter_stats),
@@ -985,6 +1152,7 @@ impl Table {
         Ok(records)
     }
 
+    #[cfg(test)]
     pub(crate) fn newest_visible_point_record_for_key_with_cache(
         &self,
         key: &[u8],
@@ -1024,6 +1192,69 @@ impl Table {
             let block = self.load_data_block(block_index, block_cache)?;
             let (block_has_key, record) =
                 data_block_newest_visible_point_record_for_key(&block, key, read_sequence, policy)?;
+            if !block_has_key {
+                if had_filter {
+                    self.filter_stats.record_block_point_false_positive();
+                }
+                block_index += 1;
+                continue;
+            }
+            saw_point_key = true;
+            if let Some(record) = record {
+                return Ok(Some(record));
+            }
+            block_index += 1;
+        }
+
+        if self.point_key_filter.is_some() && !saw_point_key {
+            self.filter_stats.record_table_point_false_positive();
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn newest_visible_point_value_record_for_key_with_cache(
+        &self,
+        key: &[u8],
+        read_sequence: Sequence,
+        policy: IndexSearchPolicy,
+        block_cache: Option<&BlockCache>,
+    ) -> Result<Option<TablePointValueRecord>> {
+        let Some(start) = self.first_block_for_key(key, policy, block_cache)? else {
+            return Ok(None);
+        };
+
+        let mut saw_point_key = false;
+        let mut block_index = start;
+        while block_index < self.data_block_count {
+            self.read_path_stats.record_point_block_metadata_probe();
+            let decision = self.with_data_block_metadata(block_index, block_cache, |block| {
+                if block.smallest_internal_key.user_key() > key {
+                    return Ok(PointBlockDecision::Done);
+                }
+                let had_filter = block.point_key_filter.is_some();
+                if !self.block_point_filter_allows(block, key) {
+                    if had_filter {
+                        self.read_path_stats.record_point_filter_miss();
+                    }
+                    return Ok(PointBlockDecision::Skip);
+                }
+                Ok(PointBlockDecision::Read { had_filter })
+            })?;
+            let PointBlockDecision::Read { had_filter } = decision else {
+                if decision == PointBlockDecision::Done {
+                    break;
+                }
+                block_index += 1;
+                continue;
+            };
+            self.read_path_stats.record_point_data_block_read();
+            let block = self.load_data_block(block_index, block_cache)?;
+            let (block_has_key, record) = data_block_newest_visible_point_value_record_for_key(
+                &block,
+                key,
+                read_sequence,
+                policy,
+            )?;
             if !block_has_key {
                 if had_filter {
                     self.filter_stats.record_block_point_false_positive();
@@ -2022,6 +2253,7 @@ fn data_block_point_records_for_key(
         .collect()
 }
 
+#[cfg(test)]
 fn data_block_newest_visible_point_record_for_key(
     block: &DecodedDataBlock,
     key: &[u8],
@@ -2045,6 +2277,36 @@ fn data_block_newest_visible_point_record_for_key(
             let record = block.record_view(record_index)?;
             if record.sequence <= read_sequence {
                 return Ok((true, Some(record.to_owned())));
+            }
+        }
+        return Ok((true, None));
+    }
+    Ok((false, None))
+}
+
+fn data_block_newest_visible_point_value_record_for_key(
+    block: &DecodedDataBlock,
+    key: &[u8],
+    read_sequence: Sequence,
+    _policy: IndexSearchPolicy,
+) -> Result<(bool, Option<TablePointValueRecord>)> {
+    for entry in block
+        .point_lookup_index
+        .matching_entries(user_key_hash(key))
+    {
+        let start = u32_to_usize(entry.start_record);
+        let end = u32_to_usize(entry.end_record);
+        let first_record = block.record_view(start)?;
+        if first_record.user_key != key {
+            continue;
+        }
+        if first_record.sequence <= read_sequence {
+            return Ok((true, Some(block.point_value_record(start)?)));
+        }
+        for record_index in start + 1..end {
+            let record = block.record_view(record_index)?;
+            if record.sequence <= read_sequence {
+                return Ok((true, Some(block.point_value_record(record_index)?)));
             }
         }
         return Ok((true, None));
@@ -2308,6 +2570,7 @@ pub(crate) fn write_table(
         range_tombstones: Arc::new(RwLock::new(Some(Arc::new(RangeTombstoneIndex::new(
             range_tombstones.to_vec(),
         ))))),
+        may_have_range_tombstones: !range_tombstones.is_empty(),
     };
     let payload = encode_table(&table)?;
     let payload_len = u32::try_from(payload.len())
@@ -2417,7 +2680,6 @@ pub(crate) fn read_table(path: &Path) -> Result<Table> {
         properties.codec,
         properties.level,
     )?));
-
     Ok(Table {
         path: Some(path.to_path_buf()),
         file: Some(table_file),
@@ -2430,6 +2692,7 @@ pub(crate) fn read_table(path: &Path) -> Result<Table> {
         index_partitions,
         index_partition_cache,
         range_tombstones: Arc::new(RwLock::new(None)),
+        may_have_range_tombstones: true,
         point_key_filter,
         prefix_filter,
         filter_stats: Arc::new(TableFilterStats::default()),
@@ -2839,6 +3102,8 @@ fn decode_table(bytes: &[u8]) -> Result<Table> {
         });
     }
 
+    let may_have_range_tombstones = !range_tombstones.is_empty();
+
     Ok(Table {
         path: None,
         file: None,
@@ -2853,6 +3118,7 @@ fn decode_table(bytes: &[u8]) -> Result<Table> {
         range_tombstones: Arc::new(RwLock::new(Some(Arc::new(RangeTombstoneIndex::new(
             range_tombstones,
         ))))),
+        may_have_range_tombstones,
         point_key_filter,
         prefix_filter,
         filter_stats: Arc::new(TableFilterStats::default()),
@@ -5412,6 +5678,7 @@ mod tests {
             range_tombstones: Arc::new(RwLock::new(Some(Arc::new(RangeTombstoneIndex::new(
                 Vec::new(),
             ))))),
+            may_have_range_tombstones: false,
         }
     }
 

@@ -1401,6 +1401,63 @@ fn persistent_flush_auto_compacts_when_l0_pressure_exceeds_limit() {
 }
 
 #[test]
+fn persistent_flush_auto_compacts_overlapping_l0_below_file_limit() {
+    let path = temp_db_path("auto-compact-overlapping-l0");
+    let mut options = DbOptions::persistent(&path);
+    options.background_worker_count = 0;
+
+    {
+        let db = Db::open(options.clone()).expect("persistent db opens");
+        let bucket = db.default_bucket().expect("bucket opens");
+
+        bucket.put(b"a", b"a1").expect("write a1");
+        db.flush().expect("first flush stays L0");
+        assert_eq!(default_table_levels(&path), vec![0]);
+
+        bucket.put(b"a", b"a2").expect("write a2");
+        db.flush()
+            .expect("second overlapping flush triggers compaction");
+        assert_eq!(default_table_levels(&path), vec![1]);
+        assert_eq!(
+            bucket.get(b"a").expect("newer a reads after compaction"),
+            Some(b"a2".to_vec())
+        );
+        assert!(db.stats().compaction_runs > 0);
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_bucket_reader_keeps_memtable_source_after_flush() {
+    let path = temp_db_path("bucket-reader-keeps-memtable-source");
+    let mut options = DbOptions::persistent(&path);
+    options.background_worker_count = 0;
+
+    {
+        let db = Db::open(options).expect("persistent db opens");
+        let bucket = db.default_bucket().expect("bucket opens");
+        bucket.put(b"a", b"a1").expect("write a1");
+
+        let snapshot = db.snapshot();
+        let reader = bucket.reader(&snapshot).expect("reader opens");
+        db.flush().expect("flush after reader creation");
+
+        assert_eq!(
+            reader.get(b"a").expect("reader sees pre-flush memtable"),
+            Some(b"a1".to_vec())
+        );
+        let value = reader
+            .get_value(b"a")
+            .expect("reader value lookup")
+            .expect("value is visible");
+        assert_eq!(value.as_ref(), b"a1");
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
 fn persistent_background_workers_flush_and_compact_pressure() {
     let path = temp_db_path("background-maintenance");
     let mut options = DbOptions::persistent(&path);

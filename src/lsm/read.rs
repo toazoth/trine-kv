@@ -1,27 +1,78 @@
-use std::{ops::Bound, path::Path};
+use std::{
+    cell::Cell,
+    ops::Bound,
+    path::Path,
+    sync::{Arc, atomic::Ordering},
+};
 
 use crate::{
-    blob::{self, ValueRef},
     cache,
     error::{Error, Result},
     internal_key::{
         InternalKey, ValueKind, first_internal_key_for_user, last_internal_key_for_user,
     },
     memtable::Memtable,
+    point_value::{PointValue, PointValueSource},
     range_tombstone::RangeTombstoneIndex,
     stats::BlobReadMetrics,
     types::Sequence,
 };
 
-use super::tree::{LsmTree, RangeTombstone, lock_poisoned};
+use super::{
+    LsmVersion,
+    tree::{ImmutableMemtable, LsmTree, RangeTombstone, lock_poisoned},
+};
 
 #[derive(Debug, Clone)]
 struct PointRecordCandidate {
     internal_key: InternalKey,
-    value: Option<ValueRef>,
+    value: Option<PointValueSource>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LsmPointReadSnapshot {
+    version: Arc<LsmVersion>,
+    active_memtable: Arc<Memtable>,
+    active_range_tombstones: Vec<RangeTombstone>,
+    immutable_memtables: Vec<ImmutableMemtable>,
 }
 
 impl LsmTree {
+    pub(crate) fn point_read_snapshot(&self) -> Result<LsmPointReadSnapshot> {
+        // Capture memtable sources before the version. Flush publishes the new
+        // table version before removing the immutable memtable, so this order
+        // can see a duplicate source but cannot miss a committed record.
+        let active_memtable = self
+            .active_memtable
+            .read()
+            .map_err(|_| lock_poisoned("active memtable"))?
+            .clone();
+        let active_range_tombstones = if self.range_tombstone_bytes.load(Ordering::Acquire) == 0 {
+            Vec::new()
+        } else {
+            self.range_tombstones
+                .read()
+                .map_err(|_| lock_poisoned("range tombstones"))?
+                .clone()
+        };
+        let immutable_memtables = if self.has_immutable_memtable_fast() {
+            self.immutable_memtables
+                .read()
+                .map_err(|_| lock_poisoned("immutable memtable queue"))?
+                .clone()
+        } else {
+            Vec::new()
+        };
+        let version = self.current_version()?;
+
+        Ok(LsmPointReadSnapshot {
+            version,
+            active_memtable,
+            active_range_tombstones,
+            immutable_memtables,
+        })
+    }
+
     pub(crate) fn read_visible_point(
         &self,
         key: &[u8],
@@ -30,47 +81,102 @@ impl LsmTree {
         block_cache: Option<&cache::BlockCache>,
         blob_reads: Option<&BlobReadMetrics>,
     ) -> Result<Option<Vec<u8>>> {
+        self.read_visible_point_value(key, read_sequence, db_path, block_cache, blob_reads)?
+            .map(|value| Ok(value.into_value()))
+            .transpose()
+    }
+
+    pub(crate) fn read_visible_point_value(
+        &self,
+        key: &[u8],
+        read_sequence: Sequence,
+        db_path: Option<&Path>,
+        block_cache: Option<&cache::BlockCache>,
+        blob_reads: Option<&BlobReadMetrics>,
+    ) -> Result<Option<PointValue>> {
+        let snapshot = self.point_read_snapshot()?;
+        self.read_visible_point_value_in_snapshot(
+            &snapshot,
+            key,
+            read_sequence,
+            db_path,
+            block_cache,
+            blob_reads,
+        )
+    }
+
+    pub(crate) fn read_visible_point_value_in_snapshot(
+        &self,
+        snapshot: &LsmPointReadSnapshot,
+        key: &[u8],
+        read_sequence: Sequence,
+        db_path: Option<&Path>,
+        block_cache: Option<&cache::BlockCache>,
+        blob_reads: Option<&BlobReadMetrics>,
+    ) -> Result<Option<PointValue>> {
         // A point read needs exactly one newest visible internal record for the
         // user key, then a tombstone coverage check for that candidate.
-        let mut candidate = self.newest_visible_memtable_point_candidate(key, read_sequence)?;
-        let memtable_range_tombstones = self.memtable_range_tombstones()?;
-        let version = self.current_version()?;
+        let mut candidate = Self::newest_visible_memtable_point_candidate_in_snapshot(
+            snapshot,
+            key,
+            read_sequence,
+        )?;
+        let memtable_range_tombstones = memtable_range_tombstones_in_snapshot(snapshot);
+        let newest_candidate_sequence = Cell::new(
+            candidate
+                .as_ref()
+                .map(|candidate| candidate.internal_key.sequence()),
+        );
 
-        for table in version.point_lookup_tables(key) {
-            if let Some(record) = table.newest_visible_point_record_for_key_with_cache(
-                key,
-                read_sequence,
-                self.options.index_search_policy,
-                block_cache,
-            )? {
-                keep_newer_point_candidate(
-                    &mut candidate,
-                    &record.internal_key,
-                    record.value.as_ref(),
-                );
-            }
-        }
+        snapshot.version.for_each_point_lookup_table(
+            key,
+            |table| table_may_have_newer_point_record(table, newest_candidate_sequence.get()),
+            |table| {
+                if let Some(record) = table.newest_visible_point_value_record_for_key_with_cache(
+                    key,
+                    read_sequence,
+                    self.options.index_search_policy,
+                    block_cache,
+                )? {
+                    keep_newer_point_candidate_owned(
+                        &mut candidate,
+                        record.internal_key,
+                        record.value,
+                    );
+                    newest_candidate_sequence.set(
+                        candidate
+                            .as_ref()
+                            .map(|candidate| candidate.internal_key.sequence()),
+                    );
+                }
+                Ok(())
+            },
+        )?;
 
         let Some(candidate) = candidate else {
             return Ok(None);
         };
+        let PointRecordCandidate {
+            internal_key,
+            value,
+        } = candidate;
 
-        match candidate.internal_key.kind() {
+        match internal_key.kind() {
             ValueKind::Put => {
                 let covered_by_memtable_tombstone = range_tombstones_cover(
                     &memtable_range_tombstones,
                     key,
-                    candidate.internal_key.sequence(),
-                    candidate.internal_key.batch_index(),
+                    internal_key.sequence(),
+                    internal_key.batch_index(),
                     read_sequence,
                 );
                 let mut covered_by_table_tombstone = false;
                 if !covered_by_memtable_tombstone {
-                    for table in version.range_tombstone_tables_for_key(key) {
+                    for table in snapshot.version.range_tombstone_tables_for_key(key) {
                         covered_by_table_tombstone = table.range_tombstone_covers_visible_point(
                             key,
-                            candidate.internal_key.sequence(),
-                            candidate.internal_key.batch_index(),
+                            internal_key.sequence(),
+                            internal_key.batch_index(),
                             read_sequence,
                         )?;
                         if covered_by_table_tombstone {
@@ -81,13 +187,7 @@ impl LsmTree {
                 if covered_by_memtable_tombstone || covered_by_table_tombstone {
                     Ok(None)
                 } else {
-                    value_bytes(
-                        candidate.value.as_ref(),
-                        &candidate.internal_key,
-                        db_path,
-                        blob_reads,
-                    )
-                    .map(Some)
+                    point_value(value, &internal_key, db_path, blob_reads).map(Some)
                 }
             }
             ValueKind::PointDelete | ValueKind::RangeDelete => Ok(None),
@@ -95,12 +195,19 @@ impl LsmTree {
     }
 
     pub(crate) fn memtable_range_tombstones(&self) -> Result<RangeTombstoneIndex<RangeTombstone>> {
-        let active_tombstones = self
-            .range_tombstones
-            .read()
-            .map_err(|_| lock_poisoned("range tombstones"))?;
-        let mut tombstones = active_tombstones.clone();
-        drop(active_tombstones);
+        let mut tombstones = Vec::new();
+
+        if self.range_tombstone_bytes.load(Ordering::Acquire) != 0 {
+            let active_tombstones = self
+                .range_tombstones
+                .read()
+                .map_err(|_| lock_poisoned("range tombstones"))?;
+            tombstones.extend(active_tombstones.iter().cloned());
+        }
+
+        if !self.has_immutable_memtable_fast() {
+            return Ok(RangeTombstoneIndex::new(tombstones));
+        }
 
         let immutable_memtables = self
             .immutable_memtables
@@ -114,30 +221,20 @@ impl LsmTree {
         Ok(RangeTombstoneIndex::new(tombstones))
     }
 
-    fn newest_visible_memtable_point_candidate(
-        &self,
+    fn newest_visible_memtable_point_candidate_in_snapshot(
+        snapshot: &LsmPointReadSnapshot,
         key: &[u8],
         read_sequence: Sequence,
     ) -> Result<Option<PointRecordCandidate>> {
-        let active_memtable = self
-            .active_memtable
-            .read()
-            .map_err(|_| lock_poisoned("active memtable"))?
-            .clone();
         let mut candidate = None;
         keep_newest_visible_memtable_point_candidate(
             &mut candidate,
-            &active_memtable,
+            &snapshot.active_memtable,
             key,
             read_sequence,
         )?;
 
-        let immutable_memtables = self
-            .immutable_memtables
-            .read()
-            .map_err(|_| lock_poisoned("immutable memtable queue"))?
-            .clone();
-        for immutable in immutable_memtables {
+        for immutable in &snapshot.immutable_memtables {
             keep_newest_visible_memtable_point_candidate(
                 &mut candidate,
                 &immutable.memtable,
@@ -150,12 +247,26 @@ impl LsmTree {
     }
 }
 
+fn memtable_range_tombstones_in_snapshot(
+    snapshot: &LsmPointReadSnapshot,
+) -> RangeTombstoneIndex<RangeTombstone> {
+    let mut tombstones = snapshot.active_range_tombstones.clone();
+    for immutable in &snapshot.immutable_memtables {
+        tombstones.extend(immutable.range_tombstones.iter().cloned());
+    }
+    RangeTombstoneIndex::new(tombstones)
+}
+
 fn keep_newest_visible_memtable_point_candidate(
     candidate: &mut Option<PointRecordCandidate>,
     memtable: &Memtable,
     key: &[u8],
     read_sequence: Sequence,
 ) -> Result<()> {
+    if memtable.estimated_bytes() == 0 {
+        return Ok(());
+    }
+
     let entries = memtable
         .read_entries()
         .map_err(|_| lock_poisoned("memtable entries"))?;
@@ -176,7 +287,7 @@ fn keep_newest_visible_memtable_point_candidate(
 fn keep_newer_point_candidate(
     candidate: &mut Option<PointRecordCandidate>,
     internal_key: &InternalKey,
-    value: Option<&ValueRef>,
+    value: Option<&crate::blob::ValueRef>,
 ) {
     let replace = candidate
         .as_ref()
@@ -184,9 +295,32 @@ fn keep_newer_point_candidate(
     if replace {
         *candidate = Some(PointRecordCandidate {
             internal_key: internal_key.clone(),
-            value: value.cloned(),
+            value: value.cloned().map(PointValueSource::from_value_ref),
         });
     }
+}
+
+fn keep_newer_point_candidate_owned(
+    candidate: &mut Option<PointRecordCandidate>,
+    internal_key: InternalKey,
+    value: Option<PointValueSource>,
+) {
+    let replace = candidate
+        .as_ref()
+        .is_none_or(|current| internal_key < current.internal_key);
+    if replace {
+        *candidate = Some(PointRecordCandidate {
+            internal_key,
+            value,
+        });
+    }
+}
+
+fn table_may_have_newer_point_record(
+    table: &crate::table::Table,
+    newest_candidate_sequence: Option<Sequence>,
+) -> bool {
+    newest_candidate_sequence.is_none_or(|sequence| table.properties().largest_sequence >= sequence)
 }
 
 fn range_tombstones_cover(
@@ -201,27 +335,15 @@ fn range_tombstones_cover(
     })
 }
 
-fn value_bytes(
-    value: Option<&ValueRef>,
+fn point_value(
+    value: Option<PointValueSource>,
     internal_key: &InternalKey,
     db_path: Option<&Path>,
     blob_reads: Option<&BlobReadMetrics>,
-) -> Result<Vec<u8>> {
+) -> Result<PointValue> {
     let value = value.ok_or_else(|| Error::Corruption {
         message: "put record is missing value bytes".to_owned(),
     })?;
 
-    match value {
-        ValueRef::Inline(bytes) => Ok(bytes.clone()),
-        ValueRef::BlobIndex(_) | ValueRef::Blob { .. } => {
-            let db_path = db_path.ok_or_else(|| Error::Corruption {
-                message: "in-memory database cannot read blob value references".to_owned(),
-            })?;
-            let bytes = blob::read_value_for_internal_key(db_path, value, Some(internal_key))?;
-            if let Some(blob_reads) = blob_reads {
-                blob_reads.record(bytes.len() as u64);
-            }
-            Ok(bytes)
-        }
-    }
+    value.into_point_value(internal_key, db_path, blob_reads)
 }

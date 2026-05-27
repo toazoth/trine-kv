@@ -1,10 +1,14 @@
+use std::{marker::PhantomData, sync::Arc};
+
 use crate::{
     db::Db,
     error::Result,
     iterator::{Direction, Iter, LazyIter},
+    lsm::{LsmPointReadSnapshot, LsmTree},
     options::{BucketOptions, WriteOptions},
+    point_value::PointValue,
     snapshot::Snapshot,
-    types::{CommitInfo, KeyRange, Value},
+    types::{CommitInfo, KeyRange, Sequence, Value},
     write_batch::WriteBatch,
 };
 
@@ -51,11 +55,36 @@ pub struct Bucket {
     db: Db,
     name: BucketName,
     options: BucketOptions,
+    state: Arc<LsmTree>,
+}
+
+/// Point-read handle bound to one bucket and one snapshot.
+///
+/// The handle pins the current memtable and table sources once, so repeated
+/// `get` calls do not reacquire the bucket's version lock.
+#[derive(Debug)]
+pub struct BucketReader<'snapshot> {
+    db: Db,
+    state: Arc<LsmTree>,
+    read_snapshot: LsmPointReadSnapshot,
+    read_sequence: Sequence,
+    _read_pin: Option<Snapshot>,
+    _snapshot: PhantomData<&'snapshot Snapshot>,
 }
 
 impl Bucket {
-    pub(crate) const fn new(db: Db, name: BucketName, options: BucketOptions) -> Self {
-        Self { db, name, options }
+    pub(crate) fn new(
+        db: Db,
+        name: BucketName,
+        options: BucketOptions,
+        state: Arc<LsmTree>,
+    ) -> Self {
+        Self {
+            db,
+            name,
+            options,
+            state,
+        }
     }
 
     /// Returns the bucket name used in WAL and manifest metadata.
@@ -72,18 +101,30 @@ impl Bucket {
 
     /// Reads the newest committed value for `key` from this bucket.
     pub fn get(&self, key: &[u8]) -> Result<Option<Value>> {
-        self.db
-            .get_at_sequence(self.name.as_str(), key, self.db.last_committed_sequence())
+        self.db.get_at_state_with_pin_state(
+            &self.state,
+            key,
+            self.db.last_committed_sequence(),
+            false,
+        )
     }
 
     /// Reads `key` at the sequence pinned by `snapshot`.
     pub fn get_at(&self, snapshot: &Snapshot, key: &[u8]) -> Result<Option<Value>> {
-        self.db.get_at_with_pin_state(
-            self.name.as_str(),
+        self.db.get_at_state_with_pin_state(
+            &self.state,
             key,
             snapshot.read_sequence(),
             snapshot.is_pinned(),
         )
+    }
+
+    /// Creates a point-read handle for repeated reads under `snapshot`.
+    pub fn reader<'snapshot>(
+        &self,
+        snapshot: &'snapshot Snapshot,
+    ) -> Result<BucketReader<'snapshot>> {
+        self.db.reader_for_state(&self.state, snapshot)
     }
 
     /// Writes one key/value pair to this bucket using default write options.
@@ -310,5 +351,42 @@ impl Bucket {
     ) -> Result<LazyIter> {
         self.db
             .prefix_lazy_at_sequence(self.name.as_str(), prefix, read_sequence, direction)
+    }
+}
+
+impl BucketReader<'_> {
+    pub(crate) fn new(
+        db: Db,
+        state: Arc<LsmTree>,
+        read_snapshot: LsmPointReadSnapshot,
+        read_sequence: Sequence,
+        read_pin: Option<Snapshot>,
+    ) -> Self {
+        Self {
+            db,
+            state,
+            read_snapshot,
+            read_sequence,
+            _read_pin: read_pin,
+            _snapshot: PhantomData,
+        }
+    }
+
+    /// Reads `key` using the version pinned when this reader was created.
+    pub fn get(&self, key: &[u8]) -> Result<Option<Value>> {
+        self.get_value(key)?
+            .map(|value| Ok(value.into_value()))
+            .transpose()
+    }
+
+    /// Reads `key` without copying inline table values out of cached data blocks.
+    pub fn get_value(&self, key: &[u8]) -> Result<Option<PointValue>> {
+        self.db.get_value_at_state_snapshot_with_pin_state(
+            &self.state,
+            &self.read_snapshot,
+            key,
+            self.read_sequence,
+            true,
+        )
     }
 }

@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, VecDeque},
     sync::{
         Arc, RwLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -11,7 +11,17 @@ use crate::{
     table::{DecodedDataBlock, TableDataBlock, TableId},
 };
 
-const BLOCK_CACHE_SHARD_COUNT: usize = 64;
+// Calibrated against the threaded point-read workload: 64 keeps high-thread
+// reads stable but hurts 4-thread reads, while 256/512 regress high threads.
+const BLOCK_CACHE_SHARD_COUNT: usize = 128;
+const CACHE_COUNTER_SHARD_COUNT: usize = 128;
+
+static NEXT_CACHE_COUNTER_SHARD: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    static CACHE_COUNTER_SHARD_INDEX: usize =
+        NEXT_CACHE_COUNTER_SHARD.fetch_add(1, Ordering::Relaxed) % CACHE_COUNTER_SHARD_COUNT;
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CacheKind {
@@ -68,8 +78,8 @@ impl BlockCacheKey {
 pub(crate) struct BlockCache {
     capacity_bytes: u64,
     shard_capacity_bytes: u64,
-    hits: AtomicU64,
-    misses: AtomicU64,
+    hits: CacheCounter,
+    misses: CacheCounter,
     shards: Vec<RwLock<BlockCacheState>>,
 }
 
@@ -87,8 +97,8 @@ impl BlockCache {
         Self {
             capacity_bytes,
             shard_capacity_bytes,
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
+            hits: CacheCounter::new(),
+            misses: CacheCounter::new(),
             shards,
         }
     }
@@ -135,23 +145,25 @@ impl BlockCache {
         load: impl FnOnce() -> Result<(CacheValue, u64)>,
     ) -> Result<CacheValue> {
         if self.capacity_bytes == 0 {
-            self.misses.fetch_add(1, Ordering::AcqRel);
+            self.misses.increment();
             return load().map(|(value, _)| value);
         }
 
         // Hits are the hot path, so split cache metadata across shards and let
-        // concurrent readers share each shard. Misses load the block outside
-        // the shard write lock; another reader may race and insert the same
-        // block first, which is harmless and keeps file I/O out of the lock.
+        // concurrent readers share each shard. Hit recency is best effort:
+        // readers only update queue order when the shard write lock is
+        // immediately available. Misses load the block outside the shard write
+        // lock; another reader may race and insert the same block first, which
+        // is harmless and keeps file I/O out of the lock.
         let shard = &self.shards[block_cache_shard_index(key)];
         if let Ok(state) = shard.read() {
             if let Some(entry) = state.entries.get(&key) {
                 let value = entry.value.clone();
                 drop(state);
-                if let Ok(mut state) = shard.write() {
+                if let Ok(mut state) = shard.try_write() {
                     state.promote(key);
                 }
-                self.hits.fetch_add(1, Ordering::AcqRel);
+                self.hits.increment();
                 return Ok(value);
             }
         }
@@ -159,17 +171,17 @@ impl BlockCache {
         let (loaded, loaded_bytes) = load()?;
         let loaded_bytes = loaded_bytes.max(1);
         let Ok(mut state) = shard.write() else {
-            self.misses.fetch_add(1, Ordering::AcqRel);
+            self.misses.increment();
             return Ok(loaded);
         };
         if let Some(entry) = state.entries.get(&key) {
             let value = entry.value.clone();
             state.promote(key);
-            self.hits.fetch_add(1, Ordering::AcqRel);
+            self.hits.increment();
             return Ok(value);
         }
 
-        self.misses.fetch_add(1, Ordering::AcqRel);
+        self.misses.increment();
         if loaded_bytes <= self.capacity_bytes {
             state.insert(key, loaded_bytes, loaded.clone());
             state.evict_to(self.shard_capacity_bytes);
@@ -180,10 +192,49 @@ impl BlockCache {
 
     pub(crate) fn stats(&self) -> CacheStats {
         CacheStats {
-            hits: self.hits.load(Ordering::Acquire),
-            misses: self.misses.load(Ordering::Acquire),
+            hits: self.hits.load(),
+            misses: self.misses.load(),
         }
     }
+}
+
+#[derive(Debug)]
+struct CacheCounter {
+    shards: Vec<CacheCounterShard>,
+}
+
+#[derive(Debug)]
+#[repr(align(64))]
+struct CacheCounterShard {
+    value: AtomicU64,
+}
+
+impl CacheCounter {
+    fn new() -> Self {
+        let shards = (0..CACHE_COUNTER_SHARD_COUNT)
+            .map(|_| CacheCounterShard {
+                value: AtomicU64::new(0),
+            })
+            .collect();
+        Self { shards }
+    }
+
+    fn increment(&self) {
+        self.shards[cache_counter_shard_index()]
+            .value
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn load(&self) -> u64 {
+        self.shards
+            .iter()
+            .map(|shard| shard.value.load(Ordering::Acquire))
+            .fold(0_u64, u64::saturating_add)
+    }
+}
+
+fn cache_counter_shard_index() -> usize {
+    CACHE_COUNTER_SHARD_INDEX.with(|index| *index)
 }
 
 fn cache_value_kind_mismatch(key: BlockCacheKey) -> Error {
@@ -277,6 +328,8 @@ impl BlockCacheState {
                 .or_else(|| self.high_order.pop_front())
             else {
                 self.entries.clear();
+                self.high_order.clear();
+                self.low_order.clear();
                 self.high_bytes = 0;
                 self.low_bytes = 0;
                 return;
@@ -288,7 +341,11 @@ impl BlockCacheState {
     }
 
     fn push_order(&mut self, key: BlockCacheKey) {
-        match key.kind.priority() {
+        self.push_order_for(key.kind.priority(), key);
+    }
+
+    fn push_order_for(&mut self, priority: CachePriority, key: BlockCacheKey) {
+        match priority {
             CachePriority::High => self.high_order.push_back(key),
             CachePriority::Low => self.low_order.push_back(key),
         }

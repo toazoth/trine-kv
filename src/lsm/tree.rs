@@ -1,5 +1,5 @@
 use std::{
-    sync::atomic::AtomicU64,
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
     sync::{Arc, RwLock},
 };
 
@@ -21,6 +21,7 @@ pub(crate) struct LsmTree {
     pub(crate) range_tombstones: RwLock<Vec<RangeTombstone>>,
     pub(crate) range_tombstone_bytes: AtomicU64,
     pub(crate) immutable_memtables: RwLock<Vec<ImmutableMemtable>>,
+    pub(crate) immutable_memtable_count: AtomicUsize,
     pub(crate) current_version: RwLock<Arc<LsmVersion>>,
 }
 
@@ -33,6 +34,7 @@ impl LsmTree {
             range_tombstones: RwLock::new(Vec::new()),
             range_tombstone_bytes: AtomicU64::new(0),
             immutable_memtables: RwLock::new(Vec::new()),
+            immutable_memtable_count: AtomicUsize::new(0),
             current_version: RwLock::new(current_version),
         })
     }
@@ -58,6 +60,14 @@ impl LsmTree {
 
     pub(crate) fn l0_table_count(&self) -> Result<usize> {
         Ok(self.current_version()?.l0_table_count())
+    }
+
+    pub(crate) fn l0_has_overlapping_tables(&self) -> Result<bool> {
+        Ok(self.current_version()?.l0_has_overlapping_tables())
+    }
+
+    pub(crate) fn has_immutable_memtable_fast(&self) -> bool {
+        self.immutable_memtable_count.load(Ordering::Acquire) != 0
     }
 }
 
