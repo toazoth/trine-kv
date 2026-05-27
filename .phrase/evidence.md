@@ -3998,3 +3998,69 @@ Record only evidence that can change planning or durable decisions.
 ### Recommended Next Action
 
 - Commit Phase 41, then use remote CI as the external release signal.
+
+## 2026-05-27: Phase 42 Persistent Read-Path Resource Policy Completed
+
+### Observation
+
+- Rust skill, performance skill, concurrency skill, SPEC-AGENTS current
+  context, and coding guidelines were read before implementation.
+- Baseline release-profile `cargo bench --bench v1_bench` reported `random get`
+  at 907 us, `missing get` at 457 us, `block cache warm read` at 1539 us,
+  `cold table read` at 176052 us, and `index seek policy auto large` at
+  3739 us.
+- Persistent tables previously held an `Arc<File>` but cloned the handle before
+  every block seek/read. They now hold a shared table file handle and read blocks
+  through a table-local locked seek/read path.
+- L0/L1 table writes now include table filters. Persistent open pins table
+  filters and index partitions for L0/L1 tables, while deeper levels keep
+  partition metadata lazy.
+- Deeper-level lazy index partitions use the global block cache when the read
+  path supplies it.
+- Block cache entries now have high/low priority queues. Index, filter, and
+  range-tombstone metadata are high priority; data and blob blocks are low
+  priority.
+- The benchmark harness now reports `long shared-prefix get`.
+- Post-change release-profile `cargo bench --bench v1_bench` reported `random
+  get` at 1032 us, `missing get` at 497 us, `block cache warm read` at 1764 us,
+  `cold table read` at 154176 us, `index seek policy auto large` at 3341 us,
+  and `long shared-prefix get` at 2867 us.
+
+### Interpretation
+
+- The file-handle path now avoids per-block descriptor clone/open work and keeps
+  block reads safe behind one table-local cursor lock.
+- L0/L1 metadata pinning moves the hottest table/index/filter checks out of the
+  lazy-load path, while deeper levels stay bounded through global cache policy.
+- High-priority cache eviction gives metadata a protected path under data-block
+  churn without adding public tuning knobs.
+- Shared-prefix keys are measurably slower than the normal benchmark key shape,
+  but a tighter data-block key encoding would require an SSTable record-format
+  change. That belongs in a dedicated storage-format phase instead of this cache
+  resource slice.
+
+### Verification
+
+- `cargo test --lib cache::tests --all-features`
+- `cargo test --lib table::tests --all-features`
+- `cargo test --test persistent_wal persistent_block_cache_records_hits_and_misses --all-features`
+- `cargo test --test persistent_wal persistent_prefix_filter_stats_skip_nonmatching_tables --all-features`
+- `cargo bench --bench v1_bench`
+- `cargo test --all-targets --all-features`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo fmt --all --check`
+- `git diff --check`
+- forbidden-term scan over `.phrase`, `src`, `tests`, `benches`, `examples`,
+  `docs`, `README.md`, `CHANGELOG.md`, and `Cargo.toml`
+
+### Remaining Blockers
+
+- Remote CI cannot be executed locally; it must run after push.
+- Shared-prefix key encoding has benchmark evidence but remains a storage-format
+  follow-up, not a cache-policy patch.
+
+### Recommended Next Action
+
+- Commit Phase 42, then use remote CI as the external release signal. If
+  shared-prefix workloads remain important, start a focused data-block key
+  encoding phase with explicit compatibility tests.

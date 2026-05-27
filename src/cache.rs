@@ -7,8 +7,8 @@ use std::{
 };
 
 use crate::{
-    Result,
-    table::{DecodedDataBlock, TableId},
+    Error, Result,
+    table::{DecodedDataBlock, TableDataBlock, TableId},
 };
 
 const BLOCK_CACHE_SHARD_COUNT: usize = 64;
@@ -20,6 +20,21 @@ pub enum CacheKind {
     FilterBlock,
     RangeTombstoneBlock,
     BlobBlock,
+}
+
+impl CacheKind {
+    const fn priority(self) -> CachePriority {
+        match self {
+            Self::IndexBlock | Self::FilterBlock | Self::RangeTombstoneBlock => CachePriority::High,
+            Self::DataBlock | Self::BlobBlock => CachePriority::Low,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CachePriority {
+    High,
+    Low,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -78,14 +93,50 @@ impl BlockCache {
         }
     }
 
-    pub(crate) fn get_or_insert_with(
+    pub(crate) fn get_or_insert_data_block_with(
         &self,
         key: BlockCacheKey,
         load: impl FnOnce() -> Result<DecodedDataBlock>,
     ) -> Result<Arc<DecodedDataBlock>> {
+        let value = self.get_or_insert_value_with(key, || {
+            let block = Arc::new(load()?);
+            Ok((
+                CacheValue::DataBlock(Arc::clone(&block)),
+                block.estimated_bytes(),
+            ))
+        })?;
+        match value {
+            CacheValue::DataBlock(block) => Ok(block),
+            CacheValue::IndexPartition(_) => Err(cache_value_kind_mismatch(key)),
+        }
+    }
+
+    pub(crate) fn get_or_insert_index_partition_with(
+        &self,
+        key: BlockCacheKey,
+        load: impl FnOnce() -> Result<Vec<TableDataBlock>>,
+    ) -> Result<Arc<Vec<TableDataBlock>>> {
+        let value = self.get_or_insert_value_with(key, || {
+            let partition = Arc::new(load()?);
+            Ok((
+                CacheValue::IndexPartition(Arc::clone(&partition)),
+                estimate_index_partition_bytes(&partition),
+            ))
+        })?;
+        match value {
+            CacheValue::IndexPartition(partition) => Ok(partition),
+            CacheValue::DataBlock(_) => Err(cache_value_kind_mismatch(key)),
+        }
+    }
+
+    fn get_or_insert_value_with(
+        &self,
+        key: BlockCacheKey,
+        load: impl FnOnce() -> Result<(CacheValue, u64)>,
+    ) -> Result<CacheValue> {
         if self.capacity_bytes == 0 {
             self.misses.fetch_add(1, Ordering::AcqRel);
-            return load().map(Arc::new);
+            return load().map(|(value, _)| value);
         }
 
         // Hits are the hot path, so split cache metadata across shards and let
@@ -95,32 +146,32 @@ impl BlockCache {
         let shard = &self.shards[block_cache_shard_index(key)];
         if let Ok(state) = shard.read() {
             if let Some(entry) = state.entries.get(&key) {
-                let bytes = Arc::clone(&entry.bytes);
+                let value = entry.value.clone();
                 drop(state);
                 if let Ok(mut state) = shard.write() {
                     state.promote(key);
                 }
                 self.hits.fetch_add(1, Ordering::AcqRel);
-                return Ok(bytes);
+                return Ok(value);
             }
         }
 
-        let loaded = Arc::new(load()?);
-        let loaded_bytes = loaded.estimated_bytes().max(1);
+        let (loaded, loaded_bytes) = load()?;
+        let loaded_bytes = loaded_bytes.max(1);
         let Ok(mut state) = shard.write() else {
             self.misses.fetch_add(1, Ordering::AcqRel);
             return Ok(loaded);
         };
         if let Some(entry) = state.entries.get(&key) {
-            let bytes = Arc::clone(&entry.bytes);
+            let value = entry.value.clone();
             state.promote(key);
             self.hits.fetch_add(1, Ordering::AcqRel);
-            return Ok(bytes);
+            return Ok(value);
         }
 
         self.misses.fetch_add(1, Ordering::AcqRel);
         if loaded_bytes <= self.capacity_bytes {
-            state.insert(key, loaded_bytes, Arc::clone(&loaded));
+            state.insert(key, loaded_bytes, loaded.clone());
             state.evict_to(self.shard_capacity_bytes);
         }
 
@@ -133,6 +184,19 @@ impl BlockCache {
             misses: self.misses.load(Ordering::Acquire),
         }
     }
+}
+
+fn cache_value_kind_mismatch(key: BlockCacheKey) -> Error {
+    Error::Corruption {
+        message: format!("block cache key {key:?} reused for a different value kind"),
+    }
+}
+
+fn estimate_index_partition_bytes(partition: &[TableDataBlock]) -> u64 {
+    partition
+        .iter()
+        .map(TableDataBlock::estimated_bytes)
+        .fold(1_u64, u64::saturating_add)
 }
 
 fn shard_capacity_bytes(capacity_bytes: u64, shard_count: usize) -> u64 {
@@ -158,48 +222,103 @@ fn usize_to_u64_saturating(value: usize) -> u64 {
 #[derive(Debug, Default)]
 struct BlockCacheState {
     entries: BTreeMap<BlockCacheKey, BlockCacheEntry>,
-    order: VecDeque<BlockCacheKey>,
-    bytes: u64,
+    high_order: VecDeque<BlockCacheKey>,
+    low_order: VecDeque<BlockCacheKey>,
+    high_bytes: u64,
+    low_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
+enum CacheValue {
+    DataBlock(Arc<DecodedDataBlock>),
+    IndexPartition(Arc<Vec<TableDataBlock>>),
+}
+
+#[derive(Debug)]
 struct BlockCacheEntry {
-    bytes: Arc<DecodedDataBlock>,
+    value: CacheValue,
     size: u64,
+    priority: CachePriority,
 }
 
 impl BlockCacheState {
-    fn insert(&mut self, key: BlockCacheKey, size: u64, bytes: Arc<DecodedDataBlock>) {
+    fn insert(&mut self, key: BlockCacheKey, size: u64, value: CacheValue) {
         if self
             .entries
-            .insert(key, BlockCacheEntry { bytes, size })
+            .insert(
+                key,
+                BlockCacheEntry {
+                    value,
+                    size,
+                    priority: key.kind.priority(),
+                },
+            )
             .is_none()
         {
-            self.order.push_back(key);
-            self.bytes = self.bytes.saturating_add(size);
+            self.push_order(key);
+            self.add_bytes(key.kind.priority(), size);
         }
     }
 
     fn promote(&mut self, key: BlockCacheKey) {
-        let Some(position) = self.order.iter().position(|candidate| *candidate == key) else {
-            return;
-        };
-        self.order.remove(position);
-        self.order.push_back(key);
+        match key.kind.priority() {
+            CachePriority::High => promote_order(&mut self.high_order, key),
+            CachePriority::Low => promote_order(&mut self.low_order, key),
+        }
     }
 
     fn evict_to(&mut self, capacity_bytes: u64) {
-        while self.bytes > capacity_bytes {
-            let Some(key) = self.order.pop_front() else {
+        while self.total_bytes() > capacity_bytes {
+            // Metadata entries are cheap and prevent extra table I/O, so data
+            // churn gives up low-priority entries before touching metadata.
+            let Some(key) = self
+                .low_order
+                .pop_front()
+                .or_else(|| self.high_order.pop_front())
+            else {
                 self.entries.clear();
-                self.bytes = 0;
+                self.high_bytes = 0;
+                self.low_bytes = 0;
                 return;
             };
             if let Some(entry) = self.entries.remove(&key) {
-                self.bytes = self.bytes.saturating_sub(entry.size);
+                self.subtract_bytes(entry.priority, entry.size);
             }
         }
     }
+
+    fn push_order(&mut self, key: BlockCacheKey) {
+        match key.kind.priority() {
+            CachePriority::High => self.high_order.push_back(key),
+            CachePriority::Low => self.low_order.push_back(key),
+        }
+    }
+
+    fn add_bytes(&mut self, priority: CachePriority, size: u64) {
+        match priority {
+            CachePriority::High => self.high_bytes = self.high_bytes.saturating_add(size),
+            CachePriority::Low => self.low_bytes = self.low_bytes.saturating_add(size),
+        }
+    }
+
+    fn subtract_bytes(&mut self, priority: CachePriority, size: u64) {
+        match priority {
+            CachePriority::High => self.high_bytes = self.high_bytes.saturating_sub(size),
+            CachePriority::Low => self.low_bytes = self.low_bytes.saturating_sub(size),
+        }
+    }
+
+    const fn total_bytes(&self) -> u64 {
+        self.high_bytes.saturating_add(self.low_bytes)
+    }
+}
+
+fn promote_order(order: &mut VecDeque<BlockCacheKey>, key: BlockCacheKey) {
+    let Some(position) = order.iter().position(|candidate| *candidate == key) else {
+        return;
+    };
+    order.remove(position);
+    order.push_back(key);
 }
 
 #[cfg(test)]
@@ -231,28 +350,63 @@ mod tests {
         let loads = AtomicUsize::new(0);
 
         cache
-            .get_or_insert_with(keys[0], || Ok(load_counted_block(&loads)))
+            .get_or_insert_data_block_with(keys[0], || Ok(load_counted_block(&loads)))
             .expect("first block loads");
         cache
-            .get_or_insert_with(keys[1], || Ok(load_counted_block(&loads)))
+            .get_or_insert_data_block_with(keys[1], || Ok(load_counted_block(&loads)))
             .expect("second block loads");
         cache
-            .get_or_insert_with(keys[0], || Ok(load_counted_block(&loads)))
+            .get_or_insert_data_block_with(keys[0], || Ok(load_counted_block(&loads)))
             .expect("first block hits and promotes");
         cache
-            .get_or_insert_with(keys[2], || Ok(load_counted_block(&loads)))
+            .get_or_insert_data_block_with(keys[2], || Ok(load_counted_block(&loads)))
             .expect("third block loads and evicts one entry");
         let loads_after_eviction = loads.load(Ordering::Acquire);
 
         cache
-            .get_or_insert_with(keys[0], || Ok(load_counted_block(&loads)))
+            .get_or_insert_data_block_with(keys[0], || Ok(load_counted_block(&loads)))
             .expect("promoted first block stays cached");
         assert_eq!(loads.load(Ordering::Acquire), loads_after_eviction);
 
         cache
-            .get_or_insert_with(keys[1], || Ok(load_counted_block(&loads)))
+            .get_or_insert_data_block_with(keys[1], || Ok(load_counted_block(&loads)))
             .expect("least recently used second block reloads");
         assert_eq!(loads.load(Ordering::Acquire), loads_after_eviction + 1);
+    }
+
+    #[test]
+    fn high_priority_entries_survive_low_priority_churn() {
+        let target_shard = 0;
+        let high_key = key_in_shard(CacheKind::IndexBlock, target_shard, 1);
+        let low_a = key_in_shard(
+            CacheKind::DataBlock,
+            target_shard,
+            high_key.table_id.get() + 1,
+        );
+        let low_b = key_in_shard(CacheKind::DataBlock, target_shard, low_a.table_id.get() + 1);
+        let cache = BlockCache::new(BLOCK_CACHE_SHARD_COUNT * 2);
+        let high_loads = AtomicUsize::new(0);
+        let low_loads = AtomicUsize::new(0);
+
+        cache
+            .get_or_insert_data_block_with(high_key, || Ok(load_counted_block(&high_loads)))
+            .expect("high-priority block loads");
+        cache
+            .get_or_insert_data_block_with(low_a, || Ok(load_counted_block(&low_loads)))
+            .expect("first low-priority block loads");
+        cache
+            .get_or_insert_data_block_with(low_b, || Ok(load_counted_block(&low_loads)))
+            .expect("second low-priority block loads and evicts low-priority first");
+
+        cache
+            .get_or_insert_data_block_with(high_key, || Ok(load_counted_block(&high_loads)))
+            .expect("high-priority block hits");
+        assert_eq!(high_loads.load(Ordering::Acquire), 1);
+
+        cache
+            .get_or_insert_data_block_with(low_a, || Ok(load_counted_block(&low_loads)))
+            .expect("low-priority block reloads");
+        assert_eq!(low_loads.load(Ordering::Acquire), 3);
     }
 
     fn load_counted_block(loads: &AtomicUsize) -> DecodedDataBlock {
@@ -274,5 +428,16 @@ mod tests {
             table_id += 1;
         }
         keys
+    }
+
+    fn key_in_shard(kind: CacheKind, shard: usize, start_table_id: u64) -> BlockCacheKey {
+        let mut table_id = start_table_id.max(1);
+        loop {
+            let key = BlockCacheKey::with_kind(kind, TableId(table_id), 0);
+            if block_cache_shard_index(key) == shard {
+                return key;
+            }
+            table_id += 1;
+        }
     }
 }

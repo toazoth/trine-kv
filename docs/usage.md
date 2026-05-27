@@ -391,6 +391,11 @@ Writes apply pressure handling when immutable memtables or L0 files exceed
 configured limits. The write may wait briefly for the background worker or help
 with one foreground maintenance pass before accepting more work.
 
+Persistent reads keep one cached file handle per table and reuse it for block
+reads. L0/L1 tables keep their table filters and index partitions resident;
+deeper levels load partition metadata lazily and let the global block cache
+protect metadata entries ahead of data blocks under cache pressure.
+
 Inspect live state with `Db::stats`:
 
 ```rust

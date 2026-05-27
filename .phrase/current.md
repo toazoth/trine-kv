@@ -6,67 +6,58 @@ Complete
 
 ## Goal
 
-Make persistent background maintenance the normal path and give writes clear
-pressure behavior when immutable memtables, L0 files, or compaction debt build
-up.
+Tighten persistent read-path resource management by avoiding per-block file
+handle clone/open work, pinning hot L0/L1 index/filter metadata, and giving the
+block cache a real priority policy.
 
 ## Entry Condition
 
-- Phase 40 completed table read-path index hardening.
-- User identified background flush/compaction scheduling, write backpressure,
-  writer-lock scope, compaction picker locality, concurrent compaction bounds,
-  and long-running compaction validation as the next risks.
+- Phase 41 completed background maintenance scheduling and backpressure.
+- User identified descriptor/file-handle cache, per-level index/filter pinning,
+  block-cache priority policy, and benchmark-gated key encoding as the next
+  release risks.
 
 ## Scope
 
-- Start persistent databases with a default background maintenance worker while
-  keeping `background_worker_count == 0` as an explicit manual-maintenance mode.
-- Replace the single maintenance request bit with flush/compaction requests,
-  in-flight state, progress notification, and error propagation.
-- Make writes wait or help maintenance when immutable memtables or L0 files are
-  over configured limits.
-- Keep writer coordinator work focused on sequence/WAL/memtable commit and
-  short publish cutovers; table building and compaction merge work should run
-  outside that lock.
-- Pick compaction inputs by local key span, especially for L0 pressure, instead
-  of rewriting every overlapping table when a narrower span is enough.
-- Prevent concurrent compactions of overlapping ranges in the same bucket while
-  allowing non-overlapping ranges to proceed.
-- Add tests for level non-overlap, MVCC retention, range-delete preservation,
-  default workers, and backpressure behavior.
+- Replace per-block table file cloning/opening with a shared table file handle
+  that performs seek/read under one table-local lock.
+- Pin table-level filters and index partitions for L0/L1 tables; keep deeper
+  levels lazy.
+- Route lazy index partitions through the global block cache when available.
+- Split block-cache eviction into low-priority data/blob entries and
+  high-priority metadata entries so data pressure does not evict hot
+  index/filter/range metadata first.
+- Add a shared-prefix key benchmark and decide from evidence whether prefix
+  truncation or a tighter key encoding belongs in this phase.
+- Update protocol, docs, roadmap, evidence, and focused tests.
 
 ## Out Of Scope
 
-- Changing public read/write APIs.
-- Adding async runtime dependencies.
-- Rewriting blob GC scheduling beyond keeping existing safety.
-- New user-facing tuning knobs unless evidence shows the derived thresholds are
-  insufficient.
+- Changing the SSTable file version or existing record encoding unless the new
+  benchmark proves it is worth the added format complexity.
+- Adding async I/O or platform-specific positional-read APIs.
+- Adding public cache tuning knobs before benchmark evidence justifies them.
 
 ## Acceptance Gate
 
-- Persistent default options start one background worker; in-memory and read-only
-  databases still do not start workers.
-- Writes do not perform table flush or compaction build work while holding the
-  writer coordinator.
-- Writes apply bounded pressure handling before accepting more work when
-  immutable memtables or L0 tables exceed configured limits.
-- Background maintenance failures surface through later writes, `flush()`, or
-  `compact_range()`.
-- L0 compaction can select a local overlapping group and leave unrelated L0
-  files for later passes.
-- Concurrent compaction reservations reject overlapping same-bucket key ranges
-  and allow non-overlapping ranges.
+- Persistent block reads reuse the table's cached file handle without cloning or
+  reopening it per block.
+- L0/L1 tables pin table filters and index partitions; deeper levels keep
+  partition metadata lazy and cacheable.
+- Block-cache eviction protects high-priority metadata entries from low-priority
+  data churn.
+- Benchmark evidence exists for shared-prefix keys and justifies either
+  deferring or implementing key encoding changes.
 - Full local Rust verification passes.
 
 ## Active Task Slice
 
 ```text
-task139 [x] goal:maintenance coordinator queue/progress/errors | scope:src/db.rs | verify:background maintenance tests
-task140 [x] goal:writer backpressure and shorter lock scope | scope:src/db.rs src/db/commit.rs | verify:pressure tests
-task141 [x] goal:local compaction picker spans | scope:src/compaction.rs src/lsm/compact.rs | verify:picker tests
-task142 [x] goal:compaction reservation boundaries | scope:src/db.rs tests | verify:concurrent compaction tests
-task143 [x] goal:protocol/docs/evidence update | scope:.phrase docs README | verify:full Rust verification
+task144 [x] goal:shared table file handle | scope:src/table.rs | verify:cached-handle test
+task145 [x] goal:L0/L1 metadata pinning | scope:src/table.rs tests | verify:pinning/lazy tests
+task146 [x] goal:block cache priority and index partition caching | scope:src/cache.rs src/table.rs | verify:cache policy tests
+task147 [x] goal:shared-prefix key benchmark decision | scope:benches/v1_bench.rs .phrase/evidence.md | verify:cargo bench row
+task148 [x] goal:protocol/docs/evidence update | scope:.phrase docs README | verify:full Rust verification
 ```
 
 ## Known Blockers
@@ -75,33 +66,41 @@ task143 [x] goal:protocol/docs/evidence update | scope:.phrase docs README | ver
 
 ## Evidence
 
-- Rust skill, concurrency skill, SPEC-AGENTS context, and the coding module
-  were read before implementation.
-- Initial code audit found that persistent background workers exist but are
-  disabled by default, maintenance requests are a single coalesced bit, writes
-  can flush immutable memtables while holding the writer coordinator, and
-  compaction holds the writer coordinator across input selection and output
-  table construction.
-- Persistent default options now start one maintenance worker, while
-  `background_worker_count == 0`, in-memory open, and read-only open keep
-  maintenance manual.
-- Maintenance coordination now tracks separate flush/compaction requests,
-  in-flight flush state, in-flight compaction key ranges, progress, shutdown,
-  and the last background error.
-- Writes apply pressure handling before taking the writer coordinator. They can
-  wait for background progress or help with one foreground flush/compaction
-  pass, and pressure flush remains bucket-local.
-- Flush table writing and compaction output construction now run outside the
-  writer coordinator; the lock is kept for commit sequencing, freeze cutovers,
-  manifest publish, state install, and WAL replay-floor rewrite.
-- Automatic L0 compaction can choose a local seed span; explicit
-  `compact_range` keeps requested-range behavior.
-- Compaction reservations reject overlapping ranges in the same bucket and
-  allow non-overlapping ranges or different buckets to proceed.
+- Rust skill, performance skill, concurrency skill, SPEC-AGENTS context, and
+  coding guidelines were read before implementation.
+- Baseline `cargo bench --bench v1_bench` on 2026-05-27 reported `random get`
+  at 907 us, `missing get` at 457 us, `block cache warm read` at 1539 us,
+  `cold table read` at 176052 us, and `index seek policy auto large` at 3739 us.
+- Initial code audit found persistent tables hold an `Arc<File>`, but each
+  block read clones the handle before seek/read. Only L0 table filters are
+  pinned, and lazy index partitions stay in an unbounded table-local cache.
+- Block cache keys already carry a block kind, but eviction does not yet use
+  kind-specific priority.
+- Persistent tables now hold a shared table file handle and read blocks through
+  table-local locked seek/read instead of cloning or opening a file per block.
+- L0/L1 table writes now include table filters; persistent open pins table
+  filters and all index partitions for L0/L1 tables. Deeper levels keep index
+  partitions lazy.
+- Deeper-level lazy index partitions use the global block cache when a read path
+  supplies it.
+- Block cache entries now have high/low priority queues. Index, filter, and
+  range-tombstone metadata are high priority; data and blob blocks are low
+  priority.
+- Release-profile `cargo bench --bench v1_bench` after implementation reported
+  `random get` at 1032 us, `missing get` at 497 us, `block cache warm read` at
+  1764 us, `cold table read` at 154176 us, `index seek policy auto large` at
+  3341 us, and new `long shared-prefix get` at 2867 us.
+- Shared-prefix keys are measurably slower than the normal key shape, but a
+  tighter key encoding would change SSTable record layout. This phase records
+  the benchmark and defers the format change to a dedicated storage-format
+  slice instead of bundling it into cache work.
 - Verification passed: `cargo test --all-targets --all-features`,
   `cargo clippy --all-targets --all-features -- -D warnings`,
-  `cargo fmt --all --check`, `git diff --check`, and the forbidden-term scan.
+  `cargo fmt --all --check`, `cargo bench --bench v1_bench`,
+  `git diff --check`, and the forbidden-term scan.
 
 ## Next Recommendation
 
-- Commit Phase 41, then use remote CI as the external release signal.
+- Commit Phase 42, then use remote CI as the external release signal. If
+  shared-prefix workloads remain important, open a dedicated data-block key
+  encoding phase with a file-format compatibility gate.

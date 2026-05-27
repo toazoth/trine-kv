@@ -849,3 +849,27 @@ next release risks.
   non-overlapping compactions may proceed.
 - Tests cover level non-overlap, MVCC retention, range-delete preservation,
   default worker behavior, and backpressure.
+
+### Phase 42: Persistent Read-Path Resource Policy
+
+**Status**: Complete
+
+**Goal**: Reduce persistent read-path overhead by caching table file handles,
+pinning hot L0/L1 index/filter metadata, and adding a high-priority block-cache
+policy for metadata.
+
+**Entry Condition**: Phase 41 complete and user identifies descriptor/file
+handle churn, per-level index/filter pinning, block-cache priority, and
+benchmark-gated key encoding as the next release risks.
+
+**Acceptance Gate**:
+
+- Persistent block reads reuse the table's cached file handle without cloning or
+  reopening it per block.
+- L0/L1 tables pin table filters and index partitions, while deeper levels keep
+  partition metadata lazy.
+- Lazy index partitions use the global block cache when available.
+- Block-cache eviction protects high-priority metadata entries from
+  low-priority data churn.
+- Shared-prefix key benchmark evidence exists before any key-encoding change.
+- Full local Rust verification passes.

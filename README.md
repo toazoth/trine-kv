@@ -32,8 +32,8 @@ Release packaging notes live in [docs/release.md](docs/release.md).
   default background maintenance, backpressure, flush, compaction, and
   read-only open.
 - Block-based SSTables with partitioned index/filter blocks, data-block hash
-  lookup for point reads, block cache, compression, and linear/binary/auto
-  index seek policies.
+  lookup for point reads, high-priority metadata caching, compression, and
+  linear/binary/auto index seek policies.
 - Large values can be separated into Titan-like blob files with `BlobIndex`
   records in SSTables.
 - Automatic blob Level Merge can rewrite retained large values into output blob

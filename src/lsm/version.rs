@@ -404,7 +404,7 @@ mod tests {
     fn range_tombstone_lookup_uses_key_bounds_without_table_filter() {
         let tombstone_table = Arc::new(test_table_with_tombstone(
             43,
-            TableLevel(1),
+            TableLevel(2),
             b"a",
             KeyRange::half_open(b"a", b"z"),
         ));

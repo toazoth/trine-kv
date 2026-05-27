@@ -168,6 +168,12 @@ pressure handling before taking the writer coordinator. They may wait for the
 background worker or help with one maintenance pass, while table building and
 compaction output construction stay outside the short publish lock.
 
+Persistent table readers reuse a cached table file handle for block reads. The
+handle is only a resource optimization; manifest versions and snapshot/read pins
+still decide whether a table file remains live. L0/L1 tables pin hot
+index/filter metadata, while deeper tables keep partition metadata lazy and
+cacheable.
+
 ## Recovery And Repair Policy
 
 Persistent startup is conservative:

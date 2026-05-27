@@ -454,8 +454,12 @@ Footer rules:
 Persistent read rule:
 
 - opening a table reads only footer, properties, and the small top-level index;
-- partition index/filter blocks are read lazily before their covered data
-  blocks;
+- L0/L1 tables pin table filters and index partitions because they are checked
+  frequently by point reads and compaction pressure;
+- deeper levels read partition index/filter blocks lazily before their covered
+  data blocks and may keep those partitions in the global block cache;
+- persistent block reads reuse the table's cached file handle; implementations
+  must not clone or reopen the table file for every block read;
 - data blocks are read on demand and must verify checksum, codec, and index
   bounds before decoded records affect a read;
 - corrupt data blocks fail the read that touches them, while unrelated filter
@@ -800,6 +804,9 @@ Rules:
 
 - caches are advisory and can be cleared without changing correctness;
 - cache memory is bounded by options;
+- block cache keys include block kind, table id, and block index;
+- block cache eviction protects high-priority metadata entries such as index,
+  filter, and range-tombstone blocks before low-priority data/blob blocks;
 - snapshots never depend on cache entries for correctness;
 - returned value guards may keep cached blocks alive until dropped.
 
@@ -956,6 +963,7 @@ Benchmarks must cover persistent and in-memory modes where relevant:
 - block cache warm read;
 - cold table read.
 - index seek policy comparison over small, medium, and large index arrays;
+- long shared-prefix point reads before changing key encoding;
 - iterator `advance_to` with near, far, and random targets.
 - codec comparison for `none` and fast block compression over
   Trine data blocks, index blocks, and range tombstone blocks.

@@ -49,6 +49,7 @@ fn main() {
     results.push(bench_block_cache_warm_read());
     results.push(bench_cold_table_read());
     results.extend(bench_index_seek_policies());
+    results.push(bench_long_shared_prefix_get());
     results.extend(bench_iterator_advance_to());
     results.extend(bench_codec_comparison());
 
@@ -614,6 +615,42 @@ fn bench_index_seek_policy(
     result
 }
 
+fn bench_long_shared_prefix_get() -> BenchResult {
+    let dir = temp_dir("long-shared-prefix");
+    let bucket_options = BucketOptions {
+        block_bytes: 512,
+        ..BucketOptions::default()
+    };
+    let mut options = DbOptions::persistent(&dir);
+    options.default_bucket_options = bucket_options;
+    let db = Db::open(options).expect("persistent db opens");
+    let bucket = db.default_bucket().expect("bucket opens");
+    let keys = (0..ROWS).map(long_shared_prefix_key).collect::<Vec<_>>();
+
+    for (index, key) in keys.iter().enumerate() {
+        bucket
+            .put(key.as_slice(), value(index))
+            .expect("put succeeds");
+    }
+    db.flush().expect("flush succeeds");
+
+    let result = measure("long shared-prefix get", OPS, || {
+        let mut checksum = 0;
+        for index in 0..OPS {
+            let row = (index * 17) % ROWS;
+            checksum += bucket
+                .get(&keys[row])
+                .expect("get succeeds")
+                .map_or(0, |value| value.len() as u64);
+        }
+        black_box(&keys);
+        checksum
+    });
+    drop(db);
+    cleanup_dir(&dir);
+    result
+}
+
 fn bench_iterator_advance_to() -> Vec<BenchResult> {
     let items = (0..8192).map(|index| index * 2).collect::<Vec<usize>>();
     vec![
@@ -774,6 +811,11 @@ fn key(index: usize) -> Vec<u8> {
 
 fn prefix_key(index: usize) -> Vec<u8> {
     format!("tenant:{:02}:key-{index:08}", index % 16).into_bytes()
+}
+
+fn long_shared_prefix_key(index: usize) -> Vec<u8> {
+    format!("tenant:analytics:region:us-west-2:dataset:events:shard:000000:key-{index:08}")
+        .into_bytes()
 }
 
 fn value(index: usize) -> Vec<u8> {
